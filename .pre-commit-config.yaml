@@ -1,0 +1,35 @@
+default_stages: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: backend-format
+        name: backend format
+        entry: uv run --directory backend --locked ruff format --check .
+        language: system
+        pass_filenames: false
+      - id: backend-lint
+        name: backend lint
+        entry: uv run --directory backend --locked ruff check .
+        language: system
+        pass_filenames: false
+      - id: backend-typecheck
+        name: backend typecheck
+        entry: uv run --directory backend --locked mypy
+        language: system
+        pass_filenames: false
+      - id: frontend-lint
+        name: frontend lint
+        entry: npm --prefix frontend run lint
+        language: system
+        pass_filenames: false
+      - id: frontend-typecheck
+        name: frontend typecheck
+        entry: npm --prefix frontend run typecheck
+        language: system
+        pass_filenames: false
+      - id: secret-scan
+        name: secret scan
+        entry: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/secret-scan.ps1
+        language: system
+        pass_filenames: false

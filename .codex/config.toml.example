@@ -1,0 +1,5 @@
+[mcp_servers.openaiDeveloperDocs]
+url = "https://developers.openai.com/mcp"
+
+# Add only reviewed MCP servers that unlock a required workflow.
+# Never add an MCP server that receives Binance credentials or can place orders.

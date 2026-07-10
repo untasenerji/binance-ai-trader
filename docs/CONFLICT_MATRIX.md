@@ -1,0 +1,15 @@
+# Conflict Matrix
+
+This matrix separates genuine document conflicts from intentionally stricter project policies. Source IDs refer to `docs/SOURCES.md`.
+
+| ID | Documents / sources | Finding | Resolution | Status |
+|---|---|---|---|---|
+| C-001 | `MASTER_SPEC.md` Sections 1 and 18; user security correction | The original pilot profile made 20 USDT values UI-confirmed but did not state a backend authority above the UI. | D-026 adds backend hard caps. The effective value is `min(UI/config, hard cap)` and an above-cap request is rejected, never silently clamped or used for an order. | Resolved |
+| C-002 | `MASTER_SPEC.md` Sections 3 and 11.3; O-01 | The model names `gpt-5.6-terra` and `gpt-5.6-luna` need current catalog verification, while catalog listing and account-level availability are different facts. | Both identifiers are verified in the official catalog. Phase 9 must still perform an API-account availability check and select a configured identifier; failure leaves AI unavailable and never affects risk/execution. | Resolved; runtime check deferred to Phase 9 |
+| C-003 | `MASTER_SPEC.md` D-008; B-02 | The normal New Order documentation lists conditional order types, while New Algo Order explicitly directs TP/SL and trailing stops to Algo Order. | V1 project policy is stricter: ordinary entry and fixed reduce-only TP limits use `POST /fapi/v1/order`; all STOP, conditional TP, and trailing protection use `POST /fapi/v1/algoOrder`. | Resolved |
+| C-004 | `MASTER_SPEC.md` Sections 7.1-7.2; B-02 | A close-all algo stop cannot also carry `quantity` or `reduceOnly`; partial TPs need exact quantities. | Protective stop is one `STOP_MARKET` Algo Order with `closePosition=true`, no quantity, no `reduceOnly`. Partial TPs are normal reduce-only LIMIT orders sized from the confirmed current position. | Resolved |
+| C-005 | `MASTER_SPEC.md` Sections 6 and 9; B-03 | Example precision fields can be mistaken for fixed exchange rules and minimums change per symbol. | Backend consumes current `exchangeInfo` filters and symbol status at plan/submit/recovery time. It never hard-codes decimal places, min notional, `triggerProtect`, or rate limits. | Resolved |
+| C-006 | `MASTER_SPEC.md` D-019; B-06 | Binance guarantees ordering only for same event type on one user-stream connection; local recovery sees reconnects, REST responses, and repeated deliveries. | Dedupe and out-of-order tolerance remain mandatory even when the nominal stream ordering guarantee holds. Binance reconciliation is authoritative after reconnect/restart. | Resolved |
+| C-007 | `MASTER_SPEC.md` Sections 7 and 10.6; B-02 | `countdownCancelAll` can cancel normal open orders but its interaction with all protective order roles must not be assumed. | Keep dead-man switch behind a disabled-by-default feature flag until Phase 8 contract tests prove it never removes the chosen protection path. | Deferred technical validation |
+
+There is no unresolved Phase 0 safety blocker. Deferred rows are explicitly gated to their implementation phase and do not authorize a live connection or Phase 1 work.

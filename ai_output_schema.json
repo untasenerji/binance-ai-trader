@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MarketRiskAssessment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "market_regime",
+    "risk_level",
+    "veto",
+    "veto_reason_codes",
+    "data_quality_flags",
+    "observations",
+    "valid_until_utc",
+    "model_version"
+  ],
+  "properties": {
+    "status": {"enum": ["OK", "INSUFFICIENT_DATA", "ERROR"]},
+    "market_regime": {"enum": ["TREND", "RANGE", "HIGH_VOLATILITY", "DISLOCATED", "UNKNOWN"]},
+    "risk_level": {"enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
+    "veto": {"type": "boolean"},
+    "veto_reason_codes": {
+      "type": "array",
+      "items": {"enum": ["STALE_DATA", "SPREAD_SPIKE", "VOLATILITY_SHOCK", "EVENT_RISK", "SIGNAL_CONTRADICTION", "INSUFFICIENT_DATA"]},
+      "uniqueItems": true
+    },
+    "data_quality_flags": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
+    "observations": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+    "valid_until_utc": {"type": "string", "format": "date-time"},
+    "model_version": {"type": "string", "minLength": 1}
+  }
+}
