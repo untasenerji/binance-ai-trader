@@ -62,3 +62,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1
 ## Outcome
 
 Phase 1 exit gate is satisfied. Phase 2 remains `NOT_STARTED` and requires explicit user approval.
+
+## Git Checkpoint
+
+The initial Phase 0 and Phase 1 foundation checkpoint was committed as `b1d2592` with message `chore: complete phases 0 and 1 foundation`.

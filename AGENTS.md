@@ -30,6 +30,7 @@ backend format: uv run --directory backend --locked ruff format --check .
 backend lint: uv run --directory backend --locked ruff check .
 backend typecheck: uv run --directory backend --locked mypy
 backend tests: uv run --directory backend --locked pytest
+public market smoke: uv run --directory backend --locked pytest -m live_public
 frontend format: npm --prefix frontend run format:check
 frontend lint: npm --prefix frontend run lint
 frontend typecheck: npm --prefix frontend run typecheck

@@ -20,3 +20,7 @@ All external integration decisions in Phase 0 use only official Binance or OpenA
 | O-05 | [OpenAI Docs MCP](https://developers.openai.com/learn/docs-mcp) | `https://developers.openai.com/mcp` is a read-only documentation MCP and does not call the OpenAI API on behalf of the user. | Project research only; never part of the runtime trading path. |
 
 No third-party SDK documentation, trading MCP, broker connector, market-news MCP, or unofficial Binance/OpenAI source is an authority for this project.
+
+## Phase 3 Revalidation
+
+On **2026-07-10**, Phase 3 revalidated B-03, B-07, and B-08 directly against the listed official Binance pages. The public REST base remains `https://fapi.binance.com`; `/fapi/v1/time`, `/fapi/v1/exchangeInfo`, `/fapi/v1/klines`, `/fapi/v1/premiumIndex`, `/fapi/v1/depth`, and `/fapi/v1/ticker/bookTicker` remain credential-free GET endpoints. Public stream routing remains `wss://fstream.binance.com/public`, connections are limited to 24 hours, and the snapshot/diff-depth `U`/`u`/`pu` procedure remains required. These contracts are implemented only in `backend/app/market` and verified without any authenticated request.

@@ -40,4 +40,14 @@ Phase 0 is complete as a documentation-only phase. The `gpt-5.6-terra` and `gpt-
 
 Phase 1 is complete as a tooling and skeleton-only phase. It provides the FastAPI `/api/health` route, a React/TypeScript locked workspace shell, Docker Compose, Windows fallback scripts, pinned dependency locks, lint/type-check/unit/E2E tooling, pre-commit configuration, Gitleaks scanning, and CI. Docker Compose was built and exercised locally against the health endpoint. No Binance credential, authenticated endpoint, test order, real order, or OpenAI execution tool was added.
 
-Phase 2 remains `NOT_STARTED` until the user explicitly authorizes it.
+## Phase 2 record
+
+Phase 2 is complete. The backend now has Decimal-only domain primitives, exact exchange filter helpers, an explicit trade-plan state machine, and D-026 backend hard-cap rejection. Property tests reject float literals in the domain and prove rounding stays within the requested value. No market or authenticated exchange integration was added.
+
+Phase 3 is active under the user's explicit 2026-07-10 authorization. It remains limited to public, unauthenticated market data.
+
+## Phase 3 record
+
+Phase 3 is complete. Official Binance public REST and WebSocket routing contracts were revalidated; the credential-free client, freshness clock, reconnect policy, and shadow order-book sequence procedure are covered by mock tests and a live public server-time smoke test. No authenticated endpoint or execution path was added.
+
+Phase 4 is active under the user's explicit authorization and is limited to local persistence, replay, audit, and reconciliation skeletons.
