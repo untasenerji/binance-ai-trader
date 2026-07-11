@@ -1,6 +1,15 @@
 # Binance AI Trader
 
-Phase 1 provides a local development skeleton only. It includes a health endpoint, a deliberately locked dashboard shell, quality checks, and Docker/Windows startup paths. No Binance credentials, authenticated Binance requests, order submission, test orders, or OpenAI tool access are implemented.
+Phase 13 provides a local pre-live acceptance workspace. It includes a deliberately locked operator UI, anonymous local status endpoints, a read-only backend risk-preview endpoint, quality checks, and Docker/Windows startup paths. No Binance credential entry, authenticated Binance request, order submission, test order, real order, or OpenAI tool access is implemented.
+
+## Local Safety Surface
+
+- `GET /api/health`: local service status only.
+- `GET /api/metrics`: label-free local metrics only.
+- `GET /api/risk-config-preview`: read-only D-026 hard-cap preview; it accepts no configuration.
+- `WS /api/ws/control-plane`: anonymous locked status stream only, not a Binance stream.
+
+The Connection Wizard can be viewed in the UI but is disabled through Phase 13. `LIVE_TRADING_ENABLED` remains false.
 
 ## Prerequisites
 
@@ -15,7 +24,7 @@ From the repository root:
 docker compose up --build
 ```
 
-The web shell is available at `http://localhost:5173` and the only active API route is `http://localhost:8000/api/health`.
+The web workspace is available at `http://localhost:5173` and the API is available at `http://localhost:8000/api/health`.
 
 Stop the stack with:
 
@@ -60,4 +69,4 @@ docker compose --profile storage run --rm -e DATABASE_URL=postgresql+psycopg://p
 .\scripts\check.ps1
 ```
 
-The exact individual commands are maintained in `AGENTS.md`. The Phase 1 scope and safety decisions remain governed by `PLAN.md`, `MASTER_SPEC.md`, and `docs/DECISIONS.md`.
+The exact individual commands are maintained in `AGENTS.md`. The Phase 13 acceptance boundary and safety decisions remain governed by `PLAN.md`, `MASTER_SPEC.md`, `docs/DECISIONS.md`, [the user guide](docs/USER_GUIDE.md), and [the final acceptance report](docs/FINAL_ACCEPTANCE_REPORT.md).

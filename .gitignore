@@ -15,6 +15,7 @@ coverage.xml
 *.db
 *.sqlite3
 data/
+backups/
 
 # Node and browser test artifacts
 frontend/node_modules/

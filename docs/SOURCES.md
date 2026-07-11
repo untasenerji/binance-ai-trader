@@ -24,3 +24,13 @@ No third-party SDK documentation, trading MCP, broker connector, market-news MCP
 ## Phase 3 Revalidation
 
 On **2026-07-10**, Phase 3 revalidated B-03, B-07, and B-08 directly against the listed official Binance pages. The public REST base remains `https://fapi.binance.com`; `/fapi/v1/time`, `/fapi/v1/exchangeInfo`, `/fapi/v1/klines`, `/fapi/v1/premiumIndex`, `/fapi/v1/depth`, and `/fapi/v1/ticker/bookTicker` remain credential-free GET endpoints. Public stream routing remains `wss://fstream.binance.com/public`, connections are limited to 24 hours, and the snapshot/diff-depth `U`/`u`/`pu` procedure remains required. These contracts are implemented only in `backend/app/market` and verified without any authenticated request.
+
+## Phase 9 Revalidation
+
+Access date: **2026-07-11**. The official OpenAI Developer Docs MCP was used for this revalidation; it is development research only and has no runtime role.
+
+| ID | Official URL | Verified decision | Project usage |
+|---|---|---|---|
+| O-06 | [OpenAI Responses create endpoint](https://api.openai.com/v1/responses) | `POST /v1/responses` accepts a model response request, exposes `tools`, `tool_choice`, `parallel_tool_calls`, `store`, and usage metadata. | `backend/app/ai/provider.py` serializes a no-tools, no-store contract only; no HTTP implementation exists. |
+| O-07 | [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs) | Responses structured output uses `text.format` with `type: "json_schema"`, `strict: true`, and an application schema; refusals need explicit handling and application-side validation remains appropriate. | `ai_output_schema.json`, `backend/app/ai/schema.py`, and Phase 9 parser/tests. |
+| O-08 | [OpenAI Tools Guide](https://developers.openai.com/api/docs/guides/tools) | Tools are optional. A model may be constrained not to call tools with `tool_choice: "none"`; an empty tool list carries no application function capability. | `backend/app/ai/provider.py` and no-tools authority-boundary tests. |

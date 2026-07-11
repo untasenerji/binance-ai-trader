@@ -1,7 +1,7 @@
 export type HealthResponse = {
   status: "ok";
   service: "binance-ai-trader";
-  phase: 1;
+  phase: 13;
   live_trading_enabled: false;
 };
 
@@ -16,7 +16,7 @@ function isHealthResponse(value: unknown): value is HealthResponse {
   return (
     payload.status === "ok" &&
     payload.service === "binance-ai-trader" &&
-    payload.phase === 1 &&
+    payload.phase === 13 &&
     payload.live_trading_enabled === false
   );
 }

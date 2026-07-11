@@ -11,7 +11,7 @@ class HealthResponse(BaseModel):
 
     status: Literal["ok"]
     service: Literal["binance-ai-trader"]
-    phase: Literal[1]
+    phase: Literal[13]
     live_trading_enabled: Literal[False]
 
 
@@ -20,6 +20,6 @@ def get_health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         service="binance-ai-trader",
-        phase=1,
+        phase=13,
         live_trading_enabled=False,
     )

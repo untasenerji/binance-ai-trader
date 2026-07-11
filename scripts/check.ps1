@@ -26,6 +26,7 @@ function Invoke-CheckedCommand {
 Push-Location $root
 try {
     & "$PSScriptRoot\secret-scan.ps1"
+    & "$PSScriptRoot\dependency-scan.ps1"
     Invoke-CheckedCommand -Description "Backend format check" -FilePath "uv" -Arguments @("run", "--directory", "backend", "--locked", "ruff", "format", "--check", ".")
     Invoke-CheckedCommand -Description "Backend lint" -FilePath "uv" -Arguments @("run", "--directory", "backend", "--locked", "ruff", "check", ".")
     Invoke-CheckedCommand -Description "Backend type check" -FilePath "uv" -Arguments @("run", "--directory", "backend", "--locked", "mypy")

@@ -81,3 +81,31 @@ Phase 8 is active under the user's explicit authorization and is limited to feat
 Phase 8 is complete. Binance normal/algo/user-stream/test-order/reconciliation contracts exist only behind an immutable runtime lock. No signer, transport, API key, secret, or network invocation is implemented or reachable before Phase 14.
 
 Phase 9 is active under the user's explicit authorization and remains advisory-only with no AI tool access.
+
+## Phase 9 record
+
+Phase 9 is complete. The AI layer is a local, no-tools Responses API contract with strict schema validation, a mock-only provider, model-availability evidence, Decimal usage accounting, and fail-safe outcome handling. No API key, SDK client, network request, account availability request, hosted tool, order capability, or risk mutation exists. Account model availability is intentionally unverified under the credential lock; the configured model remains unavailable until a future authorized local check proves access. Advisory output cannot affect a candidate, while `veto_only` is limited to an allowlisted one-way rejection.
+
+Phase 10 is active under the user's explicit 2026-07-11 authorization and remains a local locked-state UI. It must not request credentials, activate a connection, or expose any order path.
+
+## Phase 10 record
+
+Phase 10 is complete. The local operator workspace has ten navigable screens, desktop/tablet/mobile layouts, visual stale/disconnected/partial-fill/missing-stop/halt states, and a local control-plane WebSocket that reports only anonymous locked status. The Phase 14 connection wizard is display-only and disabled. No credential field, connection test, user stream, account call, test order, real order, or browser execution path exists.
+
+Phase 11 is active under the user's explicit 2026-07-11 authorization and remains limited to redacted observability, metrics, alerts, and backup/restore procedures. It must not add a trading transport or credential flow.
+
+## Phase 11 record
+
+Phase 11 is complete. Structured logs redact sensitive fields before their sink, local metrics are label-free, and the local alert contract includes deterministic deduplication without any network adapter. Database/disk/clock/restart uncertainty produces a no-new-entry recovery decision. Daily reports use Decimal values and backup/restore readiness requires the Phase 4 audit hash chain to validate. No credential, exchange, or execution capability was added.
+
+Phase 12 is active under the user's explicit 2026-07-11 authorization and remains limited to threat modeling, dependency/security scans, and local chaos recovery. The live adapter remains hard locked.
+
+## Phase 12 record
+
+Phase 12 is complete. The threat model documents the credential, execution, AI, persistence, network, and supply-chain boundaries. Full Python and Node dependency scans are enforced by `scripts/check.ps1`; an initial pytest vulnerability finding was upgraded and the final scans were clean. A durable, atomic local recovery checkpoint proves that a partial simulated position can be recovered only with valid audit/projection evidence and confirmed simulated stop evidence. Network partitions pause entries and require reconciliation plus stop re-verification; absent or unconfirmed protection hard-halts. The result never unlocks execution and does not claim a real Binance-side verification.
+
+Phase 13 is active under the user's explicit 2026-07-11 authorization and remains limited to pre-live acceptance documentation, a read-only risk profile preview, user guidance, and full validation. The Phase 14 connection flow remains inactive.
+
+## Phase 13 record
+
+Phase 13 is complete. `GET /api/risk-config-preview` returns a fixed, read-only serialization of D-026 backend caps and the UI renders it without any mutation or activation control. The user guide and final acceptance record document local operation and the remaining Phase 14 gates. Full acceptance passed with 70 backend tests, one deliberately deselected credential-free public smoke test, frontend format/lint/type-check/test/build, two Playwright scenarios, clean Python and Node dependency scans, a clean Gitleaks scan, pre-commit, and Docker Compose configuration. The Connection Wizard remains display-only, `LIVE_TRADING_ENABLED=false`, and no credential or order capability was introduced.

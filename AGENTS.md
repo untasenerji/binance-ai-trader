@@ -38,6 +38,7 @@ frontend typecheck: npm --prefix frontend run typecheck
 frontend tests: npm --prefix frontend run test
 E2E Playwright: npm --prefix frontend run test:e2e
 security scan: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\secret-scan.ps1
+dependency scan: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\dependency-scan.ps1
 full acceptance: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1
 ```
 
