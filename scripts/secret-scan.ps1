@@ -21,8 +21,10 @@ if ([string]::IsNullOrWhiteSpace($gitleaks)) {
     throw "Gitleaks is required. Install it with: winget install --id Gitleaks.Gitleaks --exact"
 }
 
-& $gitleaks dir --no-banner --redact --exit-code 1 $root
+$config = Join-Path $root ".gitleaks.toml"
+
+& $gitleaks dir --no-banner --redact --exit-code 1 --config $config $root
 
 if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+    throw "Secret scan failed."
 }

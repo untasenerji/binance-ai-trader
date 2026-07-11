@@ -38,6 +38,22 @@ Open a second PowerShell window in the repository and run:
 .\scripts\dev-frontend.ps1
 ```
 
+## Local storage profile
+
+The default Phase 1-13 stack does not require a database connection. Start the local PostgreSQL development profile only when persistence work needs it:
+
+```powershell
+docker compose --profile storage up -d db
+```
+
+It binds only to `127.0.0.1`. The local development container uses PostgreSQL trust authentication and must never be exposed beyond the machine.
+
+Apply the local schema after the database is healthy:
+
+```powershell
+docker compose --profile storage run --rm -e DATABASE_URL=postgresql+psycopg://postgres@db:5432/uta api uv run --no-sync alembic -c alembic.ini upgrade head
+```
+
 ## Verification
 
 ```powershell

@@ -51,3 +51,33 @@ Phase 3 is active under the user's explicit 2026-07-10 authorization. It remains
 Phase 3 is complete. Official Binance public REST and WebSocket routing contracts were revalidated; the credential-free client, freshness clock, reconnect policy, and shadow order-book sequence procedure are covered by mock tests and a live public server-time smoke test. No authenticated endpoint or execution path was added.
 
 Phase 4 is active under the user's explicit authorization and is limited to local persistence, replay, audit, and reconciliation skeletons.
+
+## Phase 4 record
+
+Phase 4 is complete. SQLAlchemy/Alembic persistence records append-only audit events, duplicate deliveries, projections, and reconciliation runs. SQLite tests and the local Docker PostgreSQL migration passed. A persistence write failure is a hard gate for new entries; no exchange adapter was introduced.
+
+Phase 5 is active under the user's explicit authorization and remains research-only. It must implement D-027 as a no-trade candidate gate rather than an order-frequency target.
+
+## Phase 5 record
+
+Phase 5 is complete. Research strategies emit only candidates, never orders. D-027 is enforced by a complete candidate gate and a no-trade baseline. Deterministic backtest and walk-forward workflows account for fees, slippage, and funding without look-ahead.
+
+Phase 6 is active under the user's explicit authorization and remains limited to Decimal ladder, position sizing, stop, and take-profit planning.
+
+## Phase 6 record
+
+Phase 6 is complete. The planner supports five ladder variants, exact costs, risk-budgeted quantities, and partial-fill exit refresh. Filter failures skip the plan rather than increase risk, and every test-confirmed TP allocation remains within confirmed position quantity.
+
+Phase 7 is active under the user's explicit authorization and is limited to a local simulator and controlled failure injection.
+
+## Phase 7 record
+
+Phase 7 is complete. The local simulator covers fills, duplicate/delayed delivery, UNKNOWN outcomes, rate limits, clock skew, disconnect, stop rejection, and slippage. Unsafe or uncertain outcomes pause, reconcile, reduce risk, or halt; they never create an automatic duplicate order.
+
+Phase 8 is active under the user's explicit authorization and is limited to feature-locked Binance adapter contracts and mocks.
+
+## Phase 8 record
+
+Phase 8 is complete. Binance normal/algo/user-stream/test-order/reconciliation contracts exist only behind an immutable runtime lock. No signer, transport, API key, secret, or network invocation is implemented or reachable before Phase 14.
+
+Phase 9 is active under the user's explicit authorization and remains advisory-only with no AI tool access.

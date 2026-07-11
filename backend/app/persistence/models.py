@@ -1,0 +1,68 @@
+"""SQLAlchemy models for append-only audit and replayable local state."""
+
+from datetime import UTC, datetime
+
+from sqlalchemy import JSON, DateTime, Integer, String, Text, event
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class AppendOnlyViolation(RuntimeError):
+    """Raised if code attempts to mutate or remove an immutable audit record."""
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(String(128), index=True)
+    source: Mapped[str] = mapped_column(String(32))
+    event_type: Mapped[str] = mapped_column(String(96))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[dict[str, object]] = mapped_column(JSON)
+    previous_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    record_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ProcessedEvent(Base):
+    __tablename__ = "processed_events"
+
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source: Mapped[str] = mapped_column(String(32))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class TradePlanProjection(Base):
+    __tablename__ = "trade_plan_projections"
+
+    plan_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    state: Mapped[str] = mapped_column(String(48))
+    last_event_id: Mapped[str] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ReconciliationRun(Base):
+    __tablename__ = "reconciliation_runs"
+
+    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+@event.listens_for(AuditEvent, "before_update")
+def _reject_audit_update(*_: object) -> None:
+    raise AppendOnlyViolation("audit_events are append-only")
+
+
+@event.listens_for(AuditEvent, "before_delete")
+def _reject_audit_delete(*_: object) -> None:
+    raise AppendOnlyViolation("audit_events are append-only")
