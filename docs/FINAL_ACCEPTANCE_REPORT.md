@@ -24,6 +24,7 @@
 - `pre-commit run --all-files`: PASS.
 - `docker compose config --quiet`: PASS.
 - Local safe smoke: `GET /api/health` returned phase 13 with `live_trading_enabled:false`; `GET /api/risk-config-preview` returned the fixed D-026 profile and no mutation route exists.
+- Implementation checkpoint: `308c6fd` (`feat: complete phases 9 through 13 pre-live acceptance`).
 
 ## Non-Negotiable Safety State
 

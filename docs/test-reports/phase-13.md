@@ -29,3 +29,7 @@
 ## Outcome
 
 Phase 13 exit gate is satisfied. Phases 0-13 are complete. Phase 14 remains locked and requires separate explicit user consent.
+
+## Git Checkpoint
+
+- Phases 9-13 implementation checkpoint: `308c6fd` (`feat: complete phases 9 through 13 pre-live acceptance`).

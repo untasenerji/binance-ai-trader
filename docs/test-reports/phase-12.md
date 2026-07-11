@@ -31,3 +31,7 @@
 ## Outcome
 
 Phase 12 exit gate is satisfied within the locked pre-live scope. Phase 13 is authorized by the user's 2026-07-11 instruction and remains a no-execution acceptance phase.
+
+## Git Checkpoint
+
+- Phases 9-13 implementation checkpoint: `308c6fd` (`feat: complete phases 9 through 13 pre-live acceptance`).

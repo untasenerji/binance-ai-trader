@@ -31,3 +31,7 @@
 ## Outcome
 
 Phase 10 exit gate is satisfied. Phase 11 is authorized by the user's 2026-07-11 instruction and remains limited to redacted observability, metrics, alerts, and backup/restore procedures.
+
+## Git Checkpoint
+
+- Phases 9-13 implementation checkpoint: `308c6fd` (`feat: complete phases 9 through 13 pre-live acceptance`).

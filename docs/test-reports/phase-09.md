@@ -34,3 +34,7 @@
 ## Outcome
 
 Phase 9 exit gate is satisfied. Phase 10 is authorized by the user's 2026-07-11 instruction and remains a local locked-state UI with no connection or order activation.
+
+## Git Checkpoint
+
+- Phases 9-13 implementation checkpoint: `308c6fd` (`feat: complete phases 9 through 13 pre-live acceptance`).
