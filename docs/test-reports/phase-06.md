@@ -31,3 +31,7 @@
 ## Outcome
 
 Phase 6 exit gate is satisfied. Phase 7 is authorized by the user's 2026-07-10 instruction and implements a fully local exchange simulator with controlled failure injection.
+
+## Git Checkpoint
+
+- Phase 4-8 implementation checkpoint: `66a34e8` (`feat: add persistence planning and safety simulation`).

@@ -29,3 +29,7 @@
 ## Outcome
 
 Phase 8 exit gate is satisfied. Phase 9 is authorized by the user's 2026-07-10 instruction and remains advisory-only with no tool access.
+
+## Git Checkpoint
+
+- Phase 4-8 implementation checkpoint: `66a34e8` (`feat: add persistence planning and safety simulation`).

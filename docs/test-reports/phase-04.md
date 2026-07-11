@@ -33,3 +33,7 @@
 ## Outcome
 
 Phase 4 exit gate is satisfied. Phase 5 is authorized by the user's 2026-07-10 instruction and implements research-only strategy evaluation, deterministic backtests, and D-027 no-trade behavior.
+
+## Git Checkpoint
+
+- Phase 4-8 implementation checkpoint: `66a34e8` (`feat: add persistence planning and safety simulation`).
