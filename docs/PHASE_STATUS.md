@@ -17,3 +17,8 @@
 | 12 | COMPLETED | `docs/test-reports/phase-12.md` | None. Recovery derives health from actual audit replay and typed reconciliation; no real exchange verification is claimed. |
 | 13 | COMPLETED | `docs/test-reports/phase-13.md` | None. Local audit remediation validation is complete; hosted CI execution remains NOT VERIFIED and Phase 14 remains locked. |
 | 14 | LOCKED | - | All prior phases + explicit user consent |
+
+## Audit Remediation Checkpoint
+
+- Remediation checkpoint: `f792a19` (`fix: remediate phase 4-8 independent audit findings`).
+- Local validation is recorded in `docs/AUDIT_REMEDIATION_REPORT.md`; Phase 14 remains **LOCKED**.

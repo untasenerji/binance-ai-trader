@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-12
 **Scope:** P0, P1, and P2 findings from the independent review of the Phase 4-8 foundation and its Phase 9-13 safety dependencies.
-**Workspace evidence:** Base Git revision `0efde0b`; the remediation remains intentionally uncommitted because the user prohibited commit and push creation.
+**Workspace evidence:** Base Git revision `0efde0b`; remediation checkpoint `f792a19` (`fix: remediate phase 4-8 independent audit findings`). No push was created.
 
 ## Completion Order
 
@@ -40,4 +40,4 @@ JUnit and coverage XML are generated under ignored test-artifact paths. The GitH
 - Phase 14 remains **LOCKED**.
 - `LIVE_TRADING_ENABLED=false` remains enforced by the fail-closed locked adapter, including when tests monkeypatch its module flag.
 - No API key, credential input, signer, transport implementation, authenticated Binance call, test order, or real order was added or invoked.
-- No Git commit or push was created.
+- Checkpoint commit `f792a19` was created locally; no push was created.
