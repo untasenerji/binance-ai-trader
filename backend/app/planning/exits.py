@@ -1,4 +1,4 @@
-"""Stop and take-profit planning from confirmed filled position quantity."""
+"""Stop and reduce-only take-profit planning from confirmed exchange position quantity."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -7,6 +7,7 @@ from decimal import Decimal
 from app.domain.decimal_math import ZERO
 from app.domain.filters import FilterViolation, SymbolFilters
 from app.domain.types import Direction
+from app.exchange.contracts import AlgoOrderType, NormalOrderType, OrderSide
 
 
 class ExitPlanningError(ValueError):
@@ -16,14 +17,27 @@ class ExitPlanningError(ValueError):
 @dataclass(frozen=True, slots=True)
 class StopPlan:
     trigger_price: Decimal
+    side: OrderSide
+    algo_type: AlgoOrderType = AlgoOrderType.STOP_MARKET
     close_position: bool = True
     quantity: None = None
+
+    def __post_init__(self) -> None:
+        if self.algo_type is not AlgoOrderType.STOP_MARKET or not self.close_position:
+            raise ExitPlanningError("protective stop must be a close-position STOP_MARKET")
 
 
 @dataclass(frozen=True, slots=True)
 class TakeProfitLeg:
     price: Decimal
     quantity: Decimal
+    side: OrderSide
+    reduce_only: bool = True
+    order_type: NormalOrderType = NormalOrderType.REDUCE_ONLY_LIMIT
+
+    def __post_init__(self) -> None:
+        if not self.reduce_only or self.order_type is not NormalOrderType.REDUCE_ONLY_LIMIT:
+            raise ExitPlanningError("take profits must be reduce-only LIMIT orders")
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,32 +68,57 @@ def build_exit_plan(
         raise ExitPlanningError("take-profit weights must be positive and sum to one")
     if filters.round_quantity_down(confirmed_position_quantity) != confirmed_position_quantity:
         raise ExitPlanningError("confirmed position quantity must align to the exchange step")
+    rounded_stop_price = filters.round_stop_price(direction, stop_price)
+    try:
+        filters.validate_price(rounded_stop_price)
+    except FilterViolation as error:
+        raise ExitPlanningError("stop violates an exchange filter") from error
+
+    rounded_prices = tuple(
+        filters.round_take_profit_price(direction, price) for price in take_profit_prices
+    )
+    for price in rounded_prices:
+        if direction is Direction.LONG and price <= rounded_stop_price:
+            raise ExitPlanningError("long take-profit must remain above stop")
+        if direction is Direction.SHORT and price >= rounded_stop_price:
+            raise ExitPlanningError("short take-profit must remain below stop")
+        try:
+            filters.validate_price(price)
+        except FilterViolation as error:
+            raise ExitPlanningError("take-profit price violates an exchange filter") from error
 
     raw_quantities = [
         filters.round_quantity_down(confirmed_position_quantity * weight)
         for weight in take_profit_weights
     ]
-    allocated_quantity = sum(raw_quantities, ZERO)
-    remainder = confirmed_position_quantity - allocated_quantity
-    raw_quantities[-1] += remainder
-
+    raw_quantities[-1] += confirmed_position_quantity - sum(raw_quantities, ZERO)
+    exit_side = OrderSide.SELL if direction is Direction.LONG else OrderSide.BUY
     take_profits: list[TakeProfitLeg] = []
-    for price, quantity in zip(take_profit_prices, raw_quantities, strict=True):
-        if direction is Direction.LONG and price <= stop_price:
-            raise ExitPlanningError("long take-profit must remain above stop")
-        if direction is Direction.SHORT and price >= stop_price:
-            raise ExitPlanningError("short take-profit must remain below stop")
+    dust_quantity = ZERO
+    for price, quantity in zip(rounded_prices, raw_quantities, strict=True):
+        candidate_quantity = quantity + dust_quantity
         try:
-            filters.validate_entry(price=price, quantity=quantity)
-        except FilterViolation as error:
-            raise ExitPlanningError("take-profit violates an exchange filter") from error
-        take_profits.append(TakeProfitLeg(price=price, quantity=quantity))
+            filters.validate_quantity(candidate_quantity)
+        except FilterViolation:
+            dust_quantity = candidate_quantity
+            continue
+        if price * candidate_quantity < filters.min_notional:
+            dust_quantity = candidate_quantity
+            continue
+        take_profits.append(
+            TakeProfitLeg(
+                price=price,
+                quantity=candidate_quantity,
+                side=exit_side,
+            )
+        )
+        dust_quantity = ZERO
 
     if sum((leg.quantity for leg in take_profits), ZERO) > confirmed_position_quantity:
         raise ExitPlanningError("reduce-only take-profit quantity exceeds confirmed position")
     return ExitPlan(
         direction=direction,
         confirmed_position_quantity=confirmed_position_quantity,
-        stop=StopPlan(trigger_price=stop_price),
+        stop=StopPlan(trigger_price=rounded_stop_price, side=exit_side),
         take_profits=tuple(take_profits),
     )

@@ -29,7 +29,7 @@ Codex must add and maintain exact commands here after scaffolding:
 backend format: uv run --directory backend --locked ruff format --check .
 backend lint: uv run --directory backend --locked ruff check .
 backend typecheck: uv run --directory backend --locked mypy
-backend tests: uv run --directory backend --locked pytest
+backend tests: uv run --directory backend --locked pytest --cov-fail-under=80
 public market smoke: uv run --directory backend --locked pytest -m live_public
 PostgreSQL migration: docker compose --profile storage run --rm -e DATABASE_URL=postgresql+psycopg://postgres@db:5432/uta api uv run --no-sync alembic -c alembic.ini upgrade head
 frontend format: npm --prefix frontend run format:check

@@ -19,9 +19,16 @@
 | All-fill risk | PASS | Planned total loss remains no greater than the supplied budget. |
 | Minimum notional | PASS | Restrictive filter returns `MIN_NOTIONAL_OR_FILTER_FAILURE` with no stages. |
 | Long/short | PASS | Price-loss projection is symmetric with zero costs; directional stop validation is separate. |
-| Rounding | PASS | Price/quantity values use existing exchange filter floor rules before risk recheck. |
+| Rounding | PASS | Directional price rounding uses long entry-up/stop-down/TP-down and short entry-down/stop-up/TP-up before risk recheck. |
 | Partial fill exits | PASS | Stop uses `closePosition`; reduce-only TP legs total exactly the confirmed position and never exceed it. |
 | Backend suite | PASS | pytest: 39 passed, 1 live-public test deliberately deselected. |
+
+## Independent Audit Remediation (2026-07-12)
+
+- `PlanningContext` and `RiskEnvelope` require verified equity, leverage, brackets, reserve, exposures, loss limits, position counts, margin mode, and stop capability; missing facts skip or halt.
+- Worst-case entry/stop slippage is tick-rounded conservatively and all-fill loss, notional, and required margin are rechecked after filters.
+- Unscheduled blueprints that collapse to the same rounded entry tick fail closed with `ROUNDED_STAGE_PRICE_COLLISION`; time-sliced stages retain their schedule identity.
+- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage.
 
 ## Safety Confirmation
 

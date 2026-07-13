@@ -25,6 +25,12 @@
 | Focused suite | PASS | `tests/test_observability.py` and `tests/test_health.py`: 8 passed. |
 | Full project suite | PASS | Backend pytest: 65 passed, 1 live-public test deliberately deselected; frontend format/lint/type-check/test/build and 2 Playwright tests passed; Gitleaks found no leaks. |
 
+## Independent Audit Remediation (2026-07-12)
+
+- Redaction now covers camelCase/PascalCase keys (`clientSecret`, `accessToken`, `refreshToken`, `secretKey`, `apiKey`), nested headers, query values, cookies, and passphrases before any structured sink receives data.
+- A static architecture test rejects production `print` calls, direct standard-library logging imports, and logger method calls outside the redacting structured logging module.
+- A synthetic non-secret history canary proves local Gitleaks `git --log-opts=--all` detects removed historical content. The scan script also performs a separate working-tree scan.
+
 ## Safety Confirmation
 
 - Observability modules have no exchange imports, signer, credential reader, network alert adapter, or order capability.

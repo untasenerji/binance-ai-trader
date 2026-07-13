@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from alembic.config import Config
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from alembic import command
 from app.persistence.database import create_database_engine
@@ -23,5 +23,26 @@ def test_initial_migration_creates_persistence_tables(tmp_path: Path) -> None:
         "processed_events",
         "trade_plan_projections",
         "reconciliation_runs",
+        "durable_order_intents",
     } <= table_names
+    durable_columns = {
+        column["name"] for column in inspect(engine).get_columns("durable_order_intents")
+    }
+    assert {
+        "economic_key",
+        "attempt_number",
+        "client_order_id",
+        "status",
+        "filled_quantity",
+    } <= durable_columns
+    with engine.connect() as connection:
+        trigger_names = set(
+            connection.scalars(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    "AND tbl_name = 'audit_events'"
+                )
+            )
+        )
+    assert {"prevent_audit_events_update", "prevent_audit_events_delete"} <= trigger_names
     engine.dispose()

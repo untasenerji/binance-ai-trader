@@ -3,6 +3,7 @@ from decimal import Decimal
 import pytest
 
 from app.domain.types import Direction
+from app.exchange import locked_adapter
 from app.exchange.contracts import (
     AlgoOrderIntent,
     AlgoOrderType,
@@ -46,6 +47,25 @@ async def test_live_adapter_is_hard_locked_for_normal_algo_test_and_stream_calls
 
     assert LIVE_TRADING_ENABLED is False
     with pytest.raises(LiveTradingLockedError, match="Phase 14"):
+        await adapter.place_normal_order(_normal_order())
+    with pytest.raises(LiveTradingLockedError):
+        await adapter.place_algo_order(_stop_order())
+    with pytest.raises(LiveTradingLockedError):
+        await adapter.test_order(_normal_order())
+    with pytest.raises(LiveTradingLockedError):
+        await adapter.start_user_data_stream()
+    with pytest.raises(LiveTradingLockedError):
+        await adapter.reconcile()
+
+
+@pytest.mark.anyio
+async def test_live_adapter_remains_fail_closed_when_lock_flag_is_monkeypatched_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = LockedBinanceAdapter()
+    monkeypatch.setattr(locked_adapter, "LIVE_TRADING_ENABLED", True)
+
+    with pytest.raises(LiveTradingLockedError):
         await adapter.place_normal_order(_normal_order())
     with pytest.raises(LiveTradingLockedError):
         await adapter.place_algo_order(_stop_order())

@@ -64,6 +64,50 @@ def test_structured_log_redacts_nested_fields_and_secret_like_text() -> None:
     assert redact_for_log({"secret": "value"}) == {"secret": "[REDACTED]"}
 
 
+def test_structured_log_redacts_camel_case_headers_queries_and_nested_values() -> None:
+    emitted: list[str] = []
+    logger = StructuredLogger(emitted.append)
+    canaries = (
+        "log-canary-client-secret",
+        "log-canary-access-token",
+        "log-canary-refresh-token",
+        "log-canary-secret-key",
+        "log-canary-api-key",
+        "log-canary-auth-header",
+        "log-canary-cookie",
+        "log-canary-passphrase",
+    )
+
+    serialized = logger.emit(
+        event="phase11_identifier_redaction",
+        fields={
+            "clientSecret": canaries[0],
+            "AccessToken": canaries[1],
+            "nested": {
+                "headers": {
+                    "Authorization": f"Bearer {canaries[5]}",
+                    "X-Api-Key": canaries[4],
+                    "Cookie": canaries[6],
+                },
+                "query": {
+                    "refreshToken": canaries[2],
+                    "secretKey": canaries[3],
+                    "passphrase": canaries[7],
+                },
+            },
+            "message": (
+                f"https://local.invalid/check?clientSecret={canaries[0]}&"
+                f"accessToken={canaries[1]}&refreshToken={canaries[2]}"
+            ),
+        },
+        occurred_at_utc=datetime(2026, 7, 12, tzinfo=UTC),
+    )
+
+    assert emitted == [serialized]
+    assert all(canary not in serialized for canary in canaries)
+    assert serialized.count("[REDACTED]") >= len(canaries)
+
+
 def test_metrics_are_label_free_decimal_safe_and_renderable() -> None:
     metrics = MetricRegistry()
     metrics.increment("uta_recovery_blocks_total")
@@ -135,7 +179,18 @@ def test_daily_report_and_backup_restore_readiness(session_factory: sessionmaker
         source="strategy",
         event_type="state_transition",
         occurred_at=datetime(2026, 7, 11, tzinfo=UTC),
-        payload={"plan_id": "plan-backup", "to_state": "CANDIDATE"},
+        payload={
+            "plan_id": "plan-backup",
+            "from_state": "DRAFT",
+            "to_state": "CANDIDATE",
+            "plan_version": 1,
+            "source_sequence": 1,
+            "transition_evidence": {
+                "risk_permits_entry": False,
+                "stop_confirmed": False,
+                "reduction_only": False,
+            },
+        },
     )
     events = repository.list_audit_events()
     manifest = create_backup_manifest(events)

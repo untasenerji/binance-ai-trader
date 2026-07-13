@@ -1,15 +1,25 @@
-"""Replay and exchange-truth comparison skeleton without an exchange client."""
+"""Fail-closed replay over the same reducer used for online projections."""
 
 from dataclasses import dataclass
 
 from app.domain.types import TradePlanState
+from app.persistence.audit import AuditChainHeadSnapshot, AuditDeliveryStatus, verify_hash_chain
 from app.persistence.models import AuditEvent
+from app.persistence.reducer import (
+    ProjectionState,
+    TransitionEventSchemaError,
+    TransitionSequenceError,
+    parse_state_transition_payload,
+    reduce_state_transition,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ReplayResult:
+    is_valid: bool
     plan_states: dict[str, TradePlanState]
     duplicate_event_ids: tuple[str, ...]
+    reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,29 +29,55 @@ class ReconciliationResult:
 
 
 class ReplayRunner:
-    """Reduces only the first delivery of each event ID into a local projection."""
+    """Reconstructs local projections only after chain and head evidence validate."""
 
-    def replay(self, events: tuple[AuditEvent, ...]) -> ReplayResult:
-        seen_event_ids: set[str] = set()
+    def replay(
+        self,
+        events: tuple[AuditEvent, ...],
+        chain_head: AuditChainHeadSnapshot,
+    ) -> ReplayResult:
+        if not verify_hash_chain(
+            events,
+            expected_count=chain_head.event_count,
+            expected_last_record_hash=chain_head.last_record_hash,
+        ):
+            return self._invalid("AUDIT_CHAIN_OR_HEAD_INVALID")
+
+        projections: dict[str, ProjectionState] = {}
         duplicate_event_ids: list[str] = []
-        plan_states: dict[str, TradePlanState] = {}
-
         for event in events:
-            if event.event_id in seen_event_ids:
+            try:
+                status = AuditDeliveryStatus(event.delivery_status)
+            except ValueError:
+                return self._invalid("AUDIT_DELIVERY_STATUS_INVALID")
+            if status is AuditDeliveryStatus.EXACT_DUPLICATE:
                 duplicate_event_ids.append(event.event_id)
                 continue
-            seen_event_ids.add(event.event_id)
-
-            plan_id = event.payload.get("plan_id")
-            target_state = event.payload.get("to_state")
-            if not isinstance(plan_id, str) or not isinstance(target_state, str):
+            if status is AuditDeliveryStatus.SEMANTIC_CONFLICT:
+                return self._invalid("AUDIT_SEMANTIC_CONFLICT")
+            if event.event_type != "state_transition":
                 continue
+
             try:
-                plan_states[plan_id] = TradePlanState(target_state)
-            except ValueError:
-                continue
+                transition_event = parse_state_transition_payload(event.payload)
+                reduction = reduce_state_transition(
+                    projections.get(transition_event.plan_id), transition_event
+                )
+            except (TransitionEventSchemaError, TransitionSequenceError):
+                return self._invalid("STATE_TRANSITION_INVALID")
+            if reduction.mutated:
+                projections[transition_event.plan_id] = reduction.projection
 
-        return ReplayResult(plan_states=plan_states, duplicate_event_ids=tuple(duplicate_event_ids))
+        return ReplayResult(
+            is_valid=True,
+            plan_states={plan_id: projection.state for plan_id, projection in projections.items()},
+            duplicate_event_ids=tuple(duplicate_event_ids),
+            reason=None,
+        )
+
+    @staticmethod
+    def _invalid(reason: str) -> ReplayResult:
+        return ReplayResult(is_valid=False, plan_states={}, duplicate_event_ids=(), reason=reason)
 
 
 def reconcile_projection(

@@ -12,6 +12,19 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: uta
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d uta"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,8 +39,19 @@ jobs:
         run: uv run --directory backend --locked ruff check .
       - name: Type-check backend
         run: uv run --directory backend --locked mypy
-      - name: Test backend
-        run: uv run --directory backend --locked pytest
+      - name: Test backend, including PostgreSQL acceptance coverage
+        run: |
+          mkdir -p backend/test-results
+          uv run --directory backend --locked pytest -m "not live_public" --cov-fail-under=80 --junitxml=test-results/junit.xml --cov-report=xml:coverage.xml
+      - name: Upload backend test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-evidence
+          path: |
+            backend/test-results/junit.xml
+            backend/coverage.xml
+          if-no-files-found: error
 
   frontend:
     runs-on: ubuntu-latest

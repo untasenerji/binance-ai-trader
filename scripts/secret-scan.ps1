@@ -22,9 +22,16 @@ if ([string]::IsNullOrWhiteSpace($gitleaks)) {
 }
 
 $config = Join-Path $root ".gitleaks.toml"
+$commonArguments = @("--no-banner", "--redact", "--exit-code", "1", "--config", $config)
 
-& $gitleaks dir --no-banner --redact --exit-code 1 --config $config $root
+& $gitleaks git @commonArguments "--log-opts=--all" $root
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Secret scan failed."
+    throw "Secret scan failed for Git history."
+}
+
+& $gitleaks dir @commonArguments $root
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Secret scan failed for the working tree."
 }

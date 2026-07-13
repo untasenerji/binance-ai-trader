@@ -5,8 +5,17 @@ import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.domain.types import TradePlanState
+from app.exchange.contracts import (
+    LocalReconciliationState,
+    ReconciliationSnapshot,
+    reconcile_local_state,
+)
 from app.persistence.audit import AuditRepository, verify_hash_chain
-from app.persistence.circuit_breaker import PersistenceCircuitBreaker, PersistenceUnavailable
+from app.persistence.circuit_breaker import (
+    PersistenceCircuitBreaker,
+    PersistenceRecoveryEvidence,
+    PersistenceUnavailable,
+)
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import AppendOnlyViolation, AuditEvent
 from app.persistence.replay import ReplayRunner, reconcile_projection
@@ -26,7 +35,18 @@ def _record_candidate(repository: AuditRepository, *, event_id: str = "evt-1") -
         source="strategy",
         event_type="state_transition",
         occurred_at=datetime(2026, 7, 10, tzinfo=UTC),
-        payload={"plan_id": "plan-1", "to_state": "CANDIDATE"},
+        payload={
+            "plan_id": "plan-1",
+            "from_state": "DRAFT",
+            "to_state": "CANDIDATE",
+            "plan_version": 1,
+            "source_sequence": 1,
+            "transition_evidence": {
+                "risk_permits_entry": False,
+                "stop_confirmed": False,
+                "reduction_only": False,
+            },
+        },
     )
 
 
@@ -37,10 +57,21 @@ def test_audit_chain_is_append_only_and_duplicates_are_state_idempotent(
     _record_candidate(repository)
     duplicate = repository.record_delivery(
         event_id="evt-1",
-        source="binance",
-        event_type="duplicate_delivery",
-        occurred_at=datetime(2026, 7, 10, 0, 1, tzinfo=UTC),
-        payload={"plan_id": "plan-1", "to_state": "CANDIDATE"},
+        source="strategy",
+        event_type="state_transition",
+        occurred_at=datetime(2026, 7, 10, tzinfo=UTC),
+        payload={
+            "plan_id": "plan-1",
+            "from_state": "DRAFT",
+            "to_state": "CANDIDATE",
+            "plan_version": 1,
+            "source_sequence": 1,
+            "transition_evidence": {
+                "risk_permits_entry": False,
+                "stop_confirmed": False,
+                "reduction_only": False,
+            },
+        },
     )
     events = repository.list_audit_events()
 
@@ -69,8 +100,9 @@ def test_restart_replay_restores_state_and_ignores_duplicate_event_ids(tmp_path:
     second_engine = create_database_engine(database_url)
     second_repository = AuditRepository(create_session_factory(second_engine))
     events = second_repository.list_audit_events()
-    replay = ReplayRunner().replay(events)
+    replay = ReplayRunner().replay(events, second_repository.audit_chain_head())
 
+    assert replay.is_valid
     assert replay.plan_states["plan-1"] is TradePlanState.CANDIDATE
     assert replay.duplicate_event_ids == ()
     second_engine.dispose()
@@ -84,7 +116,32 @@ def test_database_failure_blocks_new_entries_until_reconciliation() -> None:
     with pytest.raises(PersistenceUnavailable, match="DATABASE_AUDIT_FAILURE"):
         breaker.require_new_entries_allowed()
 
-    breaker.reset_after_successful_reconciliation()
+    breaker.reset_after_verified_reconciliation(
+        PersistenceRecoveryEvidence(
+            durable_write_probe_succeeded=True,
+            audit_chain_valid=True,
+            replay_valid=True,
+            reconciliation_outcome=reconcile_local_state(
+                local=LocalReconciliationState(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                    required_stop_symbols=frozenset(),
+                    unresolved_unknown_intent_ids=frozenset(),
+                    audit_chain_valid=True,
+                    replay_valid=True,
+                ),
+                snapshot=ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                ),
+            ),
+            unresolved_prepared_count=0,
+            unresolved_submitting_count=0,
+            unresolved_unknown_count=0,
+        )
+    )
     breaker.require_new_entries_allowed()
 
 

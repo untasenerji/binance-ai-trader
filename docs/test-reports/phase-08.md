@@ -6,7 +6,7 @@
 ## Delivered
 
 - Typed normal order, Algo stop/TP, unsigned request, signer protocol, transport protocol, and reconciliation snapshot contracts.
-- `LockedBinanceAdapter` with immutable `LIVE_TRADING_ENABLED = false`.
+- `LockedBinanceAdapter` with a fail-closed `LIVE_TRADING_ENABLED = false` lock.
 - All normal order, Algo order, `/order/test`, user-stream, and reconciliation entry points fail before any signer or transport can run.
 - Local reconciliation contract reports missing local and unexpected exchange order IDs.
 
@@ -20,6 +20,13 @@
 | User stream lock | PASS | No listen key or WebSocket path can start. |
 | Reconciliation contract | PASS | Local/exchange order mismatch is returned as typed evidence. |
 | Backend suite | PASS | pytest: 50 passed, 1 live-public test deliberately deselected. |
+
+## Independent Audit Remediation (2026-07-12)
+
+- Normal and Algo order identifiers reconcile in separate namespaces along with signed Decimal positions, stop evidence, unresolved UNKNOWN intents, audit health, and replay health.
+- Static and runtime tests prove every authenticated adapter entry point rejects before signer or transport access, even when a test monkeypatches the module flag.
+- No signer implementation, transport implementation, credential field, authenticated route, user stream, `/order/test`, or matching-engine path was added.
+- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage.
 
 ## Safety Confirmation
 

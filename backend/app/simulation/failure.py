@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
+from app.exchange.contracts import ReconciliationOutcome
 from app.simulation.models import SimulatedFault
 
 
@@ -49,7 +50,11 @@ class FailureCoordinator:
             )
         return ()
 
-    def mark_reconciled(self) -> None:
-        if not self.hard_halted:
-            self.reconciliation_required = False
-            self.new_entries_paused = False
+    def mark_reconciled(self, outcome: ReconciliationOutcome) -> bool:
+        if not isinstance(outcome, ReconciliationOutcome):
+            raise TypeError("outcome must be ReconciliationOutcome")
+        if self.hard_halted or not outcome.is_clean:
+            return False
+        self.reconciliation_required = False
+        self.new_entries_paused = False
+        return True

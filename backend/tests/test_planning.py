@@ -3,6 +3,7 @@ from decimal import Decimal
 import pytest
 
 from app.domain.filters import SymbolFilters
+from app.domain.risk import RiskSettings
 from app.domain.types import Direction
 from app.planning.exits import build_exit_plan
 from app.planning.ladder import (
@@ -13,7 +14,7 @@ from app.planning.ladder import (
     technical_level_ladder,
     time_sliced_ladder,
 )
-from app.planning.risk import CostAssumptions, risk_per_unit, solve_ladder
+from app.planning.risk import CostAssumptions, PlanningContext, risk_per_unit, solve_ladder
 
 
 @pytest.fixture
@@ -35,8 +36,45 @@ def costs() -> CostAssumptions:
     return CostAssumptions(
         entry_fee_rate=Decimal("0.0004"),
         exit_fee_rate=Decimal("0.0004"),
-        slippage_bps=Decimal("1"),
+        entry_slippage_bps=Decimal("1"),
+        stop_slippage_bps=Decimal("1"),
         funding_buffer_rate=Decimal("0.0001"),
+        funding_interval_count=1,
+    )
+
+
+@pytest.fixture
+def planning_context() -> PlanningContext:
+    return PlanningContext(
+        symbol="BTCUSDT",
+        requested_settings=RiskSettings(
+            pilot_equity_cap_usdt=Decimal("20"),
+            max_leverage=2,
+            max_concurrent_positions=1,
+            max_active_strategy_count=1,
+            max_stages=2,
+            risk_per_trade_usdt=Decimal("0.10"),
+            daily_loss_limit_usdt=Decimal("0.30"),
+            weekly_drawdown_limit_usdt=Decimal("0.80"),
+            consecutive_loss_limit=3,
+            openai_daily_budget_usd=Decimal("0.02"),
+        ),
+        verified_available_equity_usdt=Decimal("20"),
+        verified_effective_leverage=2,
+        leverage_bracket_notional_cap_usdt=Decimal("40"),
+        required_reserve_usdt=Decimal("0"),
+        existing_symbol_exposure_usdt=Decimal("0"),
+        existing_total_exposure_usdt=Decimal("0"),
+        symbol_exposure_cap_usdt=Decimal("40"),
+        total_exposure_cap_usdt=Decimal("40"),
+        existing_open_position_count=0,
+        active_strategy_count=0,
+        remaining_daily_loss_usdt=Decimal("0.30"),
+        remaining_weekly_drawdown_usdt=Decimal("0.80"),
+        consecutive_loss_count=0,
+        isolated_margin_verified=True,
+        one_way_mode_verified=True,
+        server_stop_capable=True,
     )
 
 
@@ -93,7 +131,7 @@ def test_all_ladder_variants_are_explicit_and_order_book_is_disabled_by_default(
 
 
 def test_total_all_fill_loss_never_exceeds_budget(
-    filters: SymbolFilters, costs: CostAssumptions
+    filters: SymbolFilters, costs: CostAssumptions, planning_context: PlanningContext
 ) -> None:
     blueprints = equal_percent_ladder(
         direction=Direction.LONG,
@@ -106,10 +144,9 @@ def test_total_all_fill_loss_never_exceeds_budget(
         direction=Direction.LONG,
         blueprints=blueprints,
         stop_price=Decimal("990"),
-        risk_budget=Decimal("0.10"),
         filters=filters,
         costs=costs,
-        max_stages=2,
+        planning_context=planning_context,
     )
 
     assert not plan.is_skipped
@@ -117,7 +154,10 @@ def test_total_all_fill_loss_never_exceeds_budget(
     assert len(plan.stages) == 2
 
 
-def test_min_notional_failure_skips_instead_of_increasing_risk(costs: CostAssumptions) -> None:
+def test_min_notional_failure_skips_instead_of_increasing_risk(
+    costs: CostAssumptions,
+    planning_context: PlanningContext,
+) -> None:
     restrictive_filters = SymbolFilters(
         symbol="BTCUSDT",
         tick_size=Decimal("0.1"),
@@ -140,10 +180,9 @@ def test_min_notional_failure_skips_instead_of_increasing_risk(costs: CostAssump
         direction=Direction.LONG,
         blueprints=blueprints,
         stop_price=Decimal("990"),
-        risk_budget=Decimal("0.10"),
         filters=restrictive_filters,
         costs=costs,
-        max_stages=2,
+        planning_context=planning_context,
     )
 
     assert plan.is_skipped
@@ -151,24 +190,30 @@ def test_min_notional_failure_skips_instead_of_increasing_risk(costs: CostAssump
     assert plan.stages == ()
 
 
-def test_long_and_short_price_loss_are_symmetric_without_costs() -> None:
+def test_long_and_short_price_loss_are_symmetric_without_costs(
+    filters: SymbolFilters,
+) -> None:
     zero_costs = CostAssumptions(
         entry_fee_rate=Decimal("0"),
         exit_fee_rate=Decimal("0"),
-        slippage_bps=Decimal("0"),
+        entry_slippage_bps=Decimal("0"),
+        stop_slippage_bps=Decimal("0"),
         funding_buffer_rate=Decimal("0"),
+        funding_interval_count=0,
     )
 
     long_loss = risk_per_unit(
         direction=Direction.LONG,
         entry_price=Decimal("100"),
         stop_price=Decimal("90"),
+        filters=filters,
         costs=zero_costs,
     )
     short_loss = risk_per_unit(
         direction=Direction.SHORT,
         entry_price=Decimal("100"),
         stop_price=Decimal("110"),
+        filters=filters,
         costs=zero_costs,
     )
 
@@ -193,3 +238,29 @@ def test_partial_fill_exit_quantities_never_exceed_confirmed_position(
     assert exit_plan.cancel_pending_entries
     assert total_take_profit_quantity == Decimal("0.013")
     assert total_take_profit_quantity <= exit_plan.confirmed_position_quantity
+
+
+def test_tick_collapsed_unscheduled_ladder_stages_fail_closed(
+    filters: SymbolFilters,
+    costs: CostAssumptions,
+    planning_context: PlanningContext,
+) -> None:
+    blueprints = technical_level_ladder(
+        direction=Direction.LONG,
+        levels=(Decimal("100.01"), Decimal("100.09")),
+        stop_price=Decimal("99"),
+        weights=(Decimal("0.5"), Decimal("0.5")),
+    )
+
+    plan = solve_ladder(
+        direction=Direction.LONG,
+        blueprints=blueprints,
+        stop_price=Decimal("99"),
+        filters=filters,
+        costs=costs,
+        planning_context=planning_context,
+    )
+
+    assert plan.is_skipped
+    assert plan.skip_reason == "ROUNDED_STAGE_PRICE_COLLISION"
+    assert plan.stages == ()

@@ -95,11 +95,22 @@ def test_backtest_uses_next_bar_and_accounts_for_costs_without_look_ahead() -> N
         entry_fee_rate=Decimal("0.001"),
         exit_fee_rate=Decimal("0.001"),
         slippage_bps=Decimal("10"),
-        funding_rate=Decimal("0.001"),
     )
-    result = BacktestEngine().run(OneShotStrategy(), candles, timeframe="1m", costs=costs)
+    result = BacktestEngine().run(
+        OneShotStrategy(),
+        candles,
+        timeframe="1m",
+        costs=costs,
+        evaluation_time_ms=candles[-1].close_time_ms,
+    )
     recording = RecordingStrategy()
-    BacktestEngine().run(recording, candles, timeframe="1m", costs=costs)
+    BacktestEngine().run(
+        recording,
+        candles,
+        timeframe="1m",
+        costs=costs,
+        evaluation_time_ms=candles[-1].close_time_ms,
+    )
 
     assert len(result.trades) == 1
     trade = result.trades[0]
@@ -107,9 +118,7 @@ def test_backtest_uses_next_bar_and_accounts_for_costs_without_look_ahead() -> N
     assert trade.entry_price > candles[1].open_price
     assert trade.exit_price < candles[1].close_price
     assert trade.net_pnl < trade.gross_pnl
-    assert trade.entry_fee + trade.exit_fee + trade.slippage_cost + trade.funding_cost > Decimal(
-        "0"
-    )
+    assert trade.entry_fee + trade.exit_fee + trade.slippage_cost > Decimal("0")
     assert recording.observed_lengths == [1, 2]
 
 
@@ -128,14 +137,13 @@ def test_walk_forward_returns_only_out_of_sample_trades_deterministically() -> N
         entry_fee_rate=Decimal("0"),
         exit_fee_rate=Decimal("0"),
         slippage_bps=Decimal("0"),
-        funding_rate=Decimal("0"),
     )
     windows = WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-        AlwaysSignalStrategy(),
+        AlwaysSignalStrategy,
         candles,
         timeframe="1m",
         costs=costs,
     )
 
     assert len(windows) == 2
-    assert all(trade.signal_bar_index >= 4 for window in windows for trade in window.result.trades)
+    assert all(trade.entry_bar_index >= 4 for window in windows for trade in window.result.trades)

@@ -1,4 +1,4 @@
-"""Durable local crash-recovery evidence without an exchange client."""
+"""Restart recovery derived from durable audit replay and typed reconciliation evidence."""
 
 import json
 import os
@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Literal
 
 from app.domain.decimal_math import ZERO
+from app.exchange.contracts import ReconciliationOutcome
 from app.observability.recovery import RecoveryAction
+from app.persistence.audit import AuditRepository
+from app.persistence.replay import ReplayRunner
 
 
 class StopProtectionEvidence(StrEnum):
@@ -50,10 +53,10 @@ class SimulatedOpenPosition:
 
 @dataclass(frozen=True, slots=True)
 class RecoveryCheckpoint:
-    audit_hash_chain_valid: bool
-    local_projection_consistent: bool
+    """Only position/stop facts are checkpointed; audit health is recomputed on restart."""
+
     positions: tuple[SimulatedOpenPosition, ...]
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
 
     def __post_init__(self) -> None:
         plan_ids = tuple(position.plan_id for position in self.positions)
@@ -104,8 +107,6 @@ class RecoveryJournal:
     @staticmethod
     def _encode(checkpoint: RecoveryCheckpoint) -> dict[str, object]:
         return {
-            "audit_hash_chain_valid": checkpoint.audit_hash_chain_valid,
-            "local_projection_consistent": checkpoint.local_projection_consistent,
             "positions": [
                 {
                     "plan_id": position.plan_id,
@@ -123,32 +124,17 @@ class RecoveryJournal:
     def _decode(payload: object) -> RecoveryCheckpoint:
         if not isinstance(payload, dict):
             raise RecoveryCheckpointError("recovery checkpoint must be an object")
-        expected_keys = {
-            "audit_hash_chain_valid",
-            "local_projection_consistent",
-            "positions",
-            "schema_version",
-        }
-        if set(payload) != expected_keys or payload["schema_version"] != 1:
+        expected_keys = {"positions", "schema_version"}
+        if set(payload) != expected_keys or payload["schema_version"] != 2:
             raise RecoveryCheckpointError("recovery checkpoint schema is not supported")
-
-        audit_valid = payload["audit_hash_chain_valid"]
-        projection_consistent = payload["local_projection_consistent"]
         positions_payload = payload["positions"]
-        if not isinstance(audit_valid, bool) or not isinstance(projection_consistent, bool):
-            raise RecoveryCheckpointError("recovery checkpoint flags must be boolean")
         if not isinstance(positions_payload, list):
             raise RecoveryCheckpointError("recovery checkpoint positions must be a list")
-
         positions = tuple(
             RecoveryJournal._decode_position(position) for position in positions_payload
         )
         try:
-            return RecoveryCheckpoint(
-                audit_hash_chain_valid=audit_valid,
-                local_projection_consistent=projection_consistent,
-                positions=positions,
-            )
+            return RecoveryCheckpoint(positions=positions)
         except ValueError as error:
             raise RecoveryCheckpointError("recovery checkpoint failed validation") from error
 
@@ -188,12 +174,26 @@ class RecoveryJournal:
 
 
 class LocalRecoveryCoordinator:
-    """Fails closed after a restart or network partition while Phase 14 is locked."""
+    """Fails closed after a restart until actual local audit and reconciliation checks succeed."""
 
-    def recover_after_restart(self, checkpoint: RecoveryCheckpoint) -> RecoveryResult:
-        if not checkpoint.audit_hash_chain_valid:
-            return self._hard_halt("AUDIT_CHAIN_INVALID", checkpoint)
-        if not checkpoint.local_projection_consistent:
+    def recover_after_restart(
+        self,
+        checkpoint: RecoveryCheckpoint,
+        *,
+        audit_repository: AuditRepository,
+        reconciliation_outcome: ReconciliationOutcome,
+    ) -> RecoveryResult:
+        if not isinstance(reconciliation_outcome, ReconciliationOutcome):
+            raise TypeError("reconciliation_outcome must be ReconciliationOutcome")
+        replay = ReplayRunner().replay(
+            audit_repository.list_audit_events(),
+            audit_repository.audit_chain_head(),
+        )
+        if not replay.is_valid:
+            return self._hard_halt("AUDIT_CHAIN_OR_REPLAY_INVALID", checkpoint)
+        projected_states = audit_repository.projected_states()
+        replayed_states = {plan_id: state.value for plan_id, state in replay.plan_states.items()}
+        if projected_states != replayed_states:
             return RecoveryResult(
                 disposition=RecoveryDisposition.PAUSED,
                 local_reconciliation_complete=False,
@@ -201,6 +201,15 @@ class LocalRecoveryCoordinator:
                 entry_authority_enabled=False,
                 actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
                 reason="LOCAL_PROJECTION_MISMATCH",
+            )
+        if not reconciliation_outcome.is_clean:
+            return RecoveryResult(
+                disposition=RecoveryDisposition.PAUSED,
+                local_reconciliation_complete=False,
+                stop_protection_invariant_holds=self._all_stops_confirmed(checkpoint),
+                entry_authority_enabled=False,
+                actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
+                reason="RECONCILIATION_MISMATCH",
             )
         if not self._all_stops_confirmed(checkpoint):
             return self._hard_halt("STOP_PROTECTION_UNCONFIRMED", checkpoint)

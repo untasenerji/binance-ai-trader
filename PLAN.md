@@ -78,7 +78,7 @@ Phase 8 is active under the user's explicit authorization and is limited to feat
 
 ## Phase 8 record
 
-Phase 8 is complete. Binance normal/algo/user-stream/test-order/reconciliation contracts exist only behind an immutable runtime lock. No signer, transport, API key, secret, or network invocation is implemented or reachable before Phase 14.
+Phase 8 is complete. Binance normal/algo/user-stream/test-order/reconciliation contracts exist only behind a fail-closed locked adapter. No signer, transport, API key, secret, or network invocation is implemented or reachable before Phase 14.
 
 Phase 9 is active under the user's explicit authorization and remains advisory-only with no AI tool access.
 
@@ -109,3 +109,9 @@ Phase 13 is active under the user's explicit 2026-07-11 authorization and remain
 ## Phase 13 record
 
 Phase 13 is complete. `GET /api/risk-config-preview` returns a fixed, read-only serialization of D-026 backend caps and the UI renders it without any mutation or activation control. The user guide and final acceptance record document local operation and the remaining Phase 14 gates. Full acceptance passed with 70 backend tests, one deliberately deselected credential-free public smoke test, frontend format/lint/type-check/test/build, two Playwright scenarios, clean Python and Node dependency scans, a clean Gitleaks scan, pre-commit, and Docker Compose configuration. The Connection Wizard remains display-only, `LIVE_TRADING_ENABLED=false`, and no credential or order capability was introduced.
+
+## Independent audit remediation record
+
+The independent P0/P1/P2 remediation completed on 2026-07-12 in the mandated order. The audit codec, transactionally linear audit chain, reducer/replay, persistence breaker, typed reconciliation, durable UNKNOWN ledger, directional risk envelope, fill/exit invariants, simulator matrix, temporal backtest controls, database append-only guards, redaction, Gitleaks history scan, financial float guard, and rounded-stage collision gate are recorded in `docs/AUDIT_REMEDIATION_REPORT.md`.
+
+The current local evidence is 172 passed plus 1 intentionally deselected public-live test with PostgreSQL included and 84.06% branch coverage. The default offline suite reports 167 passed plus 6 intentionally excluded public-live/PostgreSQL tests and 83.73% branch coverage. The 80% branch-coverage gate is enforced by the full-validation script and CI command, while focused test commands retain branch measurement without an irrelevant whole-application threshold. The GitHub workflow now provisions PostgreSQL and uploads JUnit/coverage artifacts, but a hosted CI execution is not claimed locally. The base Git revision is `0efde0b`; no remediation commit or push was created by instruction. Phase 14 remains locked.

@@ -4,7 +4,15 @@ from pathlib import Path
 import pytest
 
 from app.domain.types import Direction
+from app.exchange.contracts import (
+    LocalReconciliationState,
+    ReconciliationOutcome,
+    ReconciliationSnapshot,
+    reconcile_local_state,
+)
 from app.observability.recovery import RecoveryAction
+from app.persistence.audit import AuditRepository
+from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.security.recovery import (
     LocalRecoveryCoordinator,
     RecoveryCheckpoint,
@@ -14,14 +22,13 @@ from app.security.recovery import (
     SimulatedOpenPosition,
     StopProtectionEvidence,
 )
+from app.simulation.intent_ledger import DurableIntentLedger
 from app.simulation.models import OrderRole, SimulatedFault, SimulatedOrderIntent
 from app.simulation.simulator import ExchangeSimulator, FaultPlan
 
 
-def _confirmed_checkpoint(*, projection_consistent: bool = True) -> RecoveryCheckpoint:
+def _confirmed_checkpoint() -> RecoveryCheckpoint:
     return RecoveryCheckpoint(
-        audit_hash_chain_valid=True,
-        local_projection_consistent=projection_consistent,
         positions=(
             SimulatedOpenPosition(
                 plan_id="plan-recovery",
@@ -34,17 +41,50 @@ def _confirmed_checkpoint(*, projection_consistent: bool = True) -> RecoveryChec
     )
 
 
+@pytest.fixture
+def audit_repository(tmp_path: Path) -> AuditRepository:
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'security-recovery.sqlite'}")
+    create_schema(engine)
+    return AuditRepository(create_session_factory(engine))
+
+
+def _clean_reconciliation() -> ReconciliationOutcome:
+    return reconcile_local_state(
+        local=LocalReconciliationState(
+            positions_by_symbol={"BTCUSDT": Decimal("0.005")},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+            required_stop_symbols=frozenset({"BTCUSDT"}),
+            unresolved_unknown_intent_ids=frozenset(),
+            audit_chain_valid=True,
+            replay_valid=True,
+        ),
+        snapshot=ReconciliationSnapshot(
+            positions_by_symbol={"BTCUSDT": Decimal("0.005")},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+            stop_protected_symbols=frozenset({"BTCUSDT"}),
+        ),
+    )
+
+
 def test_restart_recovers_a_partial_simulated_position_from_durable_checkpoint(
     tmp_path: Path,
+    durable_intent_ledger: DurableIntentLedger,
+    audit_repository: AuditRepository,
 ) -> None:
-    simulator = ExchangeSimulator(fault_plan=FaultPlan.from_faults((SimulatedFault.PARTIAL_FILL,)))
+    simulator = ExchangeSimulator(
+        intent_ledger=durable_intent_ledger,
+        fault_plan=FaultPlan.from_faults((SimulatedFault.PARTIAL_FILL,)),
+    )
     partial = simulator.submit(
         SimulatedOrderIntent(
             client_order_id="UTA1-recovery-EN-1",
-            economic_key="recovery:ENTRY:1",
+            plan_id="recovery",
             symbol="BTCUSDT",
             direction=Direction.LONG,
             role=OrderRole.ENTRY,
+            stage_index=1,
             quantity=Decimal("0.010"),
             price=Decimal("1000"),
         )
@@ -55,7 +95,11 @@ def test_restart_recovers_a_partial_simulated_position_from_durable_checkpoint(
     journal_path = tmp_path / "recovery-checkpoint.json"
     RecoveryJournal(journal_path).save(checkpoint)
     restored_checkpoint = RecoveryJournal(journal_path).load()
-    result = LocalRecoveryCoordinator().recover_after_restart(restored_checkpoint)
+    result = LocalRecoveryCoordinator().recover_after_restart(
+        restored_checkpoint,
+        audit_repository=audit_repository,
+        reconciliation_outcome=_clean_reconciliation(),
+    )
 
     assert result.disposition is RecoveryDisposition.RECONCILED
     assert result.local_reconciliation_complete
@@ -75,10 +119,8 @@ def test_network_partition_pauses_entries_and_requires_stop_reverification() -> 
     assert RecoveryAction.VERIFY_STOP_PROTECTION in result.actions
 
 
-def test_missing_stop_or_invalid_audit_hard_halts_recovery() -> None:
+def test_missing_stop_hard_halts_recovery() -> None:
     missing_stop = RecoveryCheckpoint(
-        audit_hash_chain_valid=True,
-        local_projection_consistent=True,
         positions=(
             SimulatedOpenPosition(
                 plan_id="plan-unprotected",
@@ -89,23 +131,26 @@ def test_missing_stop_or_invalid_audit_hard_halts_recovery() -> None:
             ),
         ),
     )
-    invalid_audit = RecoveryCheckpoint(
-        audit_hash_chain_valid=False,
-        local_projection_consistent=True,
-        positions=(),
+    engine = create_database_engine("sqlite://")
+    create_schema(engine)
+    result = LocalRecoveryCoordinator().recover_after_restart(
+        missing_stop,
+        audit_repository=AuditRepository(create_session_factory(engine)),
+        reconciliation_outcome=_clean_reconciliation(),
     )
-    coordinator = LocalRecoveryCoordinator()
 
-    for checkpoint in (missing_stop, invalid_audit):
-        result = coordinator.recover_after_restart(checkpoint)
-        assert result.disposition is RecoveryDisposition.HARD_HALTED
-        assert result.entry_authority_enabled is False
-        assert RecoveryAction.HARD_HALT in result.actions
+    assert result.disposition is RecoveryDisposition.HARD_HALTED
+    assert result.entry_authority_enabled is False
+    assert RecoveryAction.HARD_HALT in result.actions
 
 
 def test_checkpoint_rejects_incompatible_or_tampered_content(tmp_path: Path) -> None:
     journal_path = tmp_path / "recovery-checkpoint.json"
-    journal_path.write_text('{"schema_version":2}', encoding="ascii")
+    journal_path.write_text(
+        '{"audit_hash_chain_valid":true,"local_projection_consistent":true,'
+        '"positions":[],"schema_version":1}',
+        encoding="ascii",
+    )
 
     with pytest.raises(RecoveryCheckpointError):
         RecoveryJournal(journal_path).load()

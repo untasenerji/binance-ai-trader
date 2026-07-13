@@ -23,26 +23,31 @@ _SENSITIVE_FIELD_PARTS = frozenset(
         "api",
         "apikey",
         "authorization",
+        "cookie",
         "credential",
         "key",
         "password",
+        "passphrase",
         "secret",
         "signature",
         "token",
     }
 )
-_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|api[_-]?secret|authorization|password|secret|signature|token)"
-    r"\s*[:=]\s*([^\s,;]+)"
+_SENSITIVE_ASSIGNMENT_NAME = (
+    r"api[_-]?key|api[_-]?secret|client[_-]?secret|access[_-]?token|"
+    r"refresh[_-]?token|secret[_-]?key|authorization|cookie|password|passphrase|"
+    r"secret|signature|token"
 )
+_ASSIGNMENT_PATTERN = re.compile(rf"(?i)\b({_SENSITIVE_ASSIGNMENT_NAME})\s*[:=]\s*([^\s,;;&]+)")
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+_CAMEL_CASE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 
 def redact_text(value: str) -> str:
     """Remove recognizable secret assignments without returning their original values."""
-    redacted = _ASSIGNMENT_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
-    redacted = _BEARER_PATTERN.sub("Bearer [REDACTED]", redacted)
+    redacted = _BEARER_PATTERN.sub("Bearer [REDACTED]", value)
+    redacted = _ASSIGNMENT_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", redacted)
     return _OPENAI_KEY_PATTERN.sub("[REDACTED]", redacted)
 
 
@@ -74,7 +79,8 @@ def redact_for_log(value: object) -> object:
 
 
 def _is_sensitive_field(key: str) -> bool:
-    key_parts = re.split(r"[^a-z0-9]+", key.casefold())
+    separated_key = _CAMEL_CASE_BOUNDARY.sub(" ", key)
+    key_parts = re.split(r"[^a-z0-9]+", separated_key.casefold())
     compact_key = "".join(key_parts)
     return (
         any(part in _SENSITIVE_FIELD_PARTS for part in key_parts)

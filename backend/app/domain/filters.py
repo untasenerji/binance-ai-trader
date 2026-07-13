@@ -3,7 +3,8 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
-from app.domain.decimal_math import ZERO, floor_to_increment
+from app.domain.decimal_math import ZERO, ceil_to_increment, floor_to_increment
+from app.domain.types import Direction
 
 
 class FilterViolation(ValueError):
@@ -37,6 +38,30 @@ class SymbolFilters:
 
     def round_price_down(self, price: Decimal) -> Decimal:
         return floor_to_increment(price, self.tick_size, field="price")
+
+    def round_price_up(self, price: Decimal) -> Decimal:
+        return ceil_to_increment(price, self.tick_size, field="price")
+
+    def round_entry_price(self, direction: Direction, price: Decimal) -> Decimal:
+        return (
+            self.round_price_up(price)
+            if direction is Direction.LONG
+            else self.round_price_down(price)
+        )
+
+    def round_stop_price(self, direction: Direction, price: Decimal) -> Decimal:
+        return (
+            self.round_price_down(price)
+            if direction is Direction.LONG
+            else self.round_price_up(price)
+        )
+
+    def round_take_profit_price(self, direction: Direction, price: Decimal) -> Decimal:
+        return (
+            self.round_price_down(price)
+            if direction is Direction.LONG
+            else self.round_price_up(price)
+        )
 
     def round_quantity_down(self, quantity: Decimal) -> Decimal:
         return floor_to_increment(quantity, self.step_size, field="quantity")

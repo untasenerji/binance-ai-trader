@@ -28,9 +28,10 @@ dev = [
 package = false
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers --cov=app --cov-report=term-missing -m 'not live_public'"
+addopts = "--strict-markers --cov=app --cov-branch --cov-report=term-missing -m 'not live_public and not postgresql'"
 markers = [
   "live_public: performs a credential-free public Binance smoke test",
+  "postgresql: requires the local Docker PostgreSQL acceptance service",
 ]
 testpaths = ["tests"]
 pythonpath = ["."]
@@ -48,3 +49,7 @@ strict = true
 files = ["app", "tests"]
 warn_unreachable = true
 no_implicit_reexport = true
+
+[tool.coverage.run]
+branch = true
+source = ["app"]

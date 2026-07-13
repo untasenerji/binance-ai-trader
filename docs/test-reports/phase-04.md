@@ -24,6 +24,14 @@
 | DB failure gate | PASS | `DATABASE_AUDIT_FAILURE` blocks new entries until successful reconciliation reset. |
 | Default backend suite | PASS | pytest: 29 passed, 1 live-public test deliberately deselected. |
 
+## Independent Audit Remediation (2026-07-12)
+
+- Added forward migrations `0002_audit_chain_head` through `0005_audit_database_guards`; `0001_initial_persistence.py` remains unchanged.
+- Audit payloads now use one recursive exact codec, and audit append, dedupe claim, projection, and chain-head update are transactional.
+- SQLite and PostgreSQL reject database-level audit mutation. PostgreSQL acceptance covers `UPDATE`, `DELETE`, `TRUNCATE`, migration head, and concurrent linear-chain delivery.
+- Replay validates durable head/count/hash before state reconstruction. Restart recovery compares actual replayed states with durable projections rather than trusting checkpoint health booleans.
+- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage. See `docs/AUDIT_REMEDIATION_REPORT.md`.
+
 ## Safety Confirmation
 
 - The database is optional during Phase 1-13 application startup and does not activate exchange connectivity.

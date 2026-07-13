@@ -18,11 +18,17 @@
 | Python dependency audit | PASS | `pip-audit` reported no known vulnerabilities after pytest was upgraded from the initial 8.4.2 finding to locked 9.1.1. |
 | Node dependency audit | PASS | Full `npm audit --audit-level=high` reported `found 0 vulnerabilities`. |
 | Secret scan | PASS | Final `scripts/check.ps1` run reported Gitleaks `no leaks found`. |
-| Partial-fill restart recovery | PASS | A fresh coordinator reloads an atomic checkpoint containing a 0.005 simulated partial position and reaches locally reconciled status. |
-| Stop-protection invariant | PASS | Missing/unconfirmed evidence and an invalid audit chain hard-halt; entry authority remains false in every result. |
+| Partial-fill restart recovery | PASS | A fresh coordinator reloads an atomic checkpoint containing a 0.005 simulated partial position and reaches locally reconciled status from repository replay plus typed reconciliation. |
+| Stop-protection invariant | PASS | Missing/unconfirmed evidence and a replay-invalid audit chain hard-halt; entry authority remains false in every result. |
 | Network partition | PASS | Entries pause and the result requires reconciliation plus stop re-verification. |
 | Focused security suite | PASS | `tests/test_security_recovery.py`: 4 passed. |
 | Full project suite | PASS | Backend pytest: 69 passed, 1 credential-free public smoke test deselected; frontend format/lint/type-check/test/build and 2 Playwright tests passed; Compose config and pre-commit passed. |
+
+## Independent Audit Remediation (2026-07-12)
+
+- Recovery checkpoint schema v2 contains only position/stop facts. It rejects old or hand-written audit/projection health flags.
+- Restart recomputes chain/replay validity, compares actual durable projections with replayed states, and consumes typed reconciliation output. Audit tampering hard-halts; a valid chain with projection divergence pauses.
+- Database trigger and privileged-tamper tests document the limit correctly: database superusers are not assumed unable to modify storage, but chain-head/count/hash replay makes a later alteration visible.
 
 ## Scope Boundary
 

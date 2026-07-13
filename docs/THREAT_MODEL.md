@@ -1,12 +1,12 @@
 # Threat Model
 
-**Date:** 2026-07-11
+**Date:** 2026-07-12
 **Scope:** Phase 12 local security and chaos validation. The project remains in its pre-live state: `LIVE_TRADING_ENABLED=false`, no credential is present or read, and no authenticated Binance request, user stream, test order, or real order is possible.
 
 ## Protected Assets
 
 - Future credential material, signatures, authorization headers, account identifiers, and local secret files.
-- Backend hard caps (D-026), no-frequency obligation (D-027), stop-protection invariant, and immutable Phase 14 lock.
+- Backend hard caps (D-026), no-frequency obligation (D-027), stop-protection invariant, and fail-closed locked adapter with Phase 14 lock.
 - Decimal trade-plan and audit evidence, including duplicate-delivery records and audit hash chain.
 - Local operator UI, health/control-plane data, logs, metrics, backups, dependency locks, and source integrity.
 
@@ -32,13 +32,13 @@
 | T-05 | Duplicate or unknown order evidence causes duplicate economic action | Idempotency keys, audit delivery dedupe, simulator UNKNOWN handling, and reconciliation-only recovery | A future exchange client must query authoritative state before any retry. |
 | T-06 | Crash occurs while a simulated position is open | Atomic local recovery journal, strict schema, partial-fill recovery test, audit/projection checks | `REMOTE_CONFIRMED` is simulated evidence only; actual exchange confirmation is deferred to Phase 14. |
 | T-07 | Network partition hides stop loss state | Entries pause, reconciliation and stop re-verification are mandatory; missing or unconfirmed protection hard-halts | No process may infer current remote state while disconnected. |
-| T-08 | Audit or recovery evidence is modified or malformed | Hash-chain checks, strict checkpoint schema, invalid evidence hard-halts | Local disk compromise requires manual containment and a trusted restore. |
+| T-08 | Audit or recovery evidence is modified or malformed | Database append-only guards, hash-chain head/count checks, strict checkpoint schema, actual replay, and typed reconciliation evidence | A privileged database operator can still tamper; the next verification/replay detects it and requires containment. |
 | T-09 | Known dependency vulnerability enters the build | Full Python and Node audit in `scripts/dependency-scan.ps1`; audit findings fail the check | Audits are point-in-time evidence and must run again before every acceptance checkpoint. |
 | T-10 | Browser, Codex, or MCP invokes a trade function | No browser command route, MCP trade tool, AI tool, signer, transport, or reachable order implementation | The Phase 14 activation design must preserve this separation and obtain explicit local consent. |
 
 ## Security Invariants
 
-1. `LIVE_TRADING_ENABLED` is false and every locked adapter operation rejects before any signer or transport could be reached.
+1. `LIVE_TRADING_ENABLED` is false and every fail-closed locked-adapter operation rejects before any signer or transport could be reached.
 2. A nonzero simulated position must have `REMOTE_CONFIRMED` stop evidence to be locally recovered; otherwise the result hard-halts.
 3. A network partition never restores entry authority. It pauses entries and requires reconciliation plus stop re-verification.
 4. A locally reconciled checkpoint still reports `entry_authority_enabled=false`; Phase 12 cannot unlock Phase 14.

@@ -25,6 +25,13 @@
 | Spread/slippage | PASS | Long execution worsens above ask and short execution worsens below bid. |
 | Backend suite | PASS | pytest: 48 passed, 1 live-public test deliberately deselected. |
 
+## Independent Audit Remediation (2026-07-12)
+
+- Submit attempts are durably prepared before simulator submission and use immutable economic identity derived from plan, symbol, role, direction, and stage.
+- PREPARED, SUBMITTING, and UNKNOWN attempts survive restart as unresolved and block a new economic action until typed bounded-absence evidence resolves them.
+- Fill events carry trade identity, delta/cumulative quantity, price, fee, and event time. The fill ledger deduplicates trade IDs, preserves Decimal VWAP, and blocks pending entries after actual-risk breach.
+- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage.
+
 ## Safety Confirmation
 
 - This is a pure local simulator. It has no Binance HTTP/WebSocket transport, credential, signing, test-order, or real-order functionality.

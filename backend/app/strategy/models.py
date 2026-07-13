@@ -20,9 +20,10 @@ class Candle:
     close_price: Decimal
     volume: Decimal
     funding_rate: Decimal = ZERO
+    timeframe: str = "1m"
 
     def __post_init__(self) -> None:
-        if not self.symbol or self.close_time_ms < self.open_time_ms:
+        if not self.symbol or not self.timeframe or self.close_time_ms <= self.open_time_ms:
             raise ValueError("candle identifiers and timestamps are invalid")
         if min(self.open_price, self.high_price, self.low_price, self.close_price) <= ZERO:
             raise ValueError("candle prices must be positive")

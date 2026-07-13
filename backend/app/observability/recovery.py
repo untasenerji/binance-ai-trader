@@ -86,7 +86,11 @@ class OperationsMonitor:
         now_ms: int,
     ) -> RecoveryDecision:
         self._metrics.increment("uta_restart_total")
-        if reconciliation_clean and protected_position_confirmed:
+        if (
+            reconciliation_clean
+            and protected_position_confirmed
+            and self._persistence_breaker.new_entries_allowed
+        ):
             return RecoveryDecision(new_entries_allowed=True, actions=(), alert_code=None)
         actions = [RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED]
         code = "RESTART_RECONCILIATION_REQUIRED"

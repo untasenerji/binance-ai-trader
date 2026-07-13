@@ -32,12 +32,22 @@ def to_decimal(value: object, *, field: str) -> Decimal:
 
 def floor_to_increment(value: Decimal, increment: Decimal, *, field: str) -> Decimal:
     """Round a non-negative trading value down to an exchange increment."""
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise DecimalValidationError(f"{field} must be a finite Decimal")
+    if not isinstance(increment, Decimal) or not increment.is_finite():
+        raise DecimalValidationError("increment must be a finite Decimal")
     if value < ZERO:
         raise DecimalValidationError(f"{field} must be non-negative")
     if increment <= ZERO:
         raise DecimalValidationError("increment must be positive")
 
     return (value // increment) * increment
+
+
+def ceil_to_increment(value: Decimal, increment: Decimal, *, field: str) -> Decimal:
+    """Round a non-negative trading value up without changing an aligned value."""
+    rounded_down = floor_to_increment(value, increment, field=field)
+    return rounded_down if rounded_down == value else rounded_down + increment
 
 
 def decimal_to_wire(value: Decimal) -> str:

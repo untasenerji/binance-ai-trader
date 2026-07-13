@@ -33,8 +33,6 @@ class LockedBinanceAdapter:
 
     @staticmethod
     def _reject() -> None:
-        if not LIVE_TRADING_ENABLED:
-            raise LiveTradingLockedError(
-                "Phase 8 adapter is locked until the Phase 14 activation flow"
-            )
-        raise AssertionError("LIVE_TRADING_ENABLED must remain false before Phase 14")
+        raise LiveTradingLockedError(
+            "Phase 8 adapter is fail-closed until the Phase 14 activation flow"
+        )

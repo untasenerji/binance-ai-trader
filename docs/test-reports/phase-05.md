@@ -24,6 +24,13 @@
 | Walk-forward | PASS | Test windows contain only out-of-sample trades and are deterministic. |
 | Backend suite | PASS | pytest: 34 passed, 1 live-public test deliberately deselected. |
 
+## Independent Audit Remediation (2026-07-12)
+
+- Candle streams now reject reverse, duplicate, overlapping, mixed-symbol, incomplete, and future-visible input rather than sorting or inferring safety.
+- Every walk-forward window receives a fresh strategy from a factory, retains global boundaries, and rejects unsafe overlapping out-of-sample aggregation.
+- Backtest accounting separately records market gross, execution PnL, slippage, executed-notional fees, and signed long/short funding settlements.
+- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage.
+
 ## Safety Confirmation
 
 - Strategy scans do not produce an order, order intent, or execution command.
