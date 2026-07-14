@@ -2,7 +2,8 @@
 
 **Date:** 2026-07-13
 **Base revision:** `022631d5e91823976d4c5a5063bc5fa217ed5a55`
-**Worktree state:** Intentionally uncommitted at the user's direction. No commit or push was created.
+**Checkpoint commit:** `bc05bac` (`fix: remediate second independent audit findings`)
+**Checkpoint state:** The remediation is committed locally. No push was created.
 
 ## Safety State
 

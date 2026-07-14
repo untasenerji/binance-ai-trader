@@ -25,7 +25,8 @@
 
 ## Second Independent Audit Remediation
 
-- Base revision: `022631d`; the second remediation worktree is intentionally uncommitted by user instruction.
+- Base revision: `022631d`; the second remediation worktree was checkpointed locally without a push.
+- Checkpoint commit: `bc05bac` (`fix: remediate second independent audit findings`).
 - `docs/SECOND_AUDIT_REMEDIATION_REPORT.md` records local PASS evidence for all code findings: 200 PostgreSQL-inclusive backend tests, true branch coverage 65.49% (`702/1072`), PostgreSQL populated-0001 migration/role tests, full Windows validation, and pre-commit.
 - The hosted GitHub Actions run for the new Gitleaks install has not executed from this uncommitted worktree. It is explicitly **NOT VERIFIED**, not a PASS.
 - Phase 14 remains **LOCKED**.
