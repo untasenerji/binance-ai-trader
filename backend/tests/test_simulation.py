@@ -5,8 +5,9 @@ import pytest
 from app.domain.types import Direction
 from app.simulation.failure import FailureAction, FailureCoordinator
 from app.simulation.intent_ledger import (
-    BoundedAbsenceEvidence,
+    AbsenceEvidenceSource,
     DurableIntentLedger,
+    UnknownIntentObservation,
     UnresolvedEconomicAction,
 )
 from app.simulation.models import (
@@ -94,16 +95,18 @@ def test_delayed_event_and_unknown_outcome_prevent_duplicate_economic_order(
         unknown.submit(unknown_intent)
     with pytest.raises(UnresolvedEconomicAction):
         unknown.submit(_intent(client_id="UTA1-plan-EN-2-2", stage_index=2))
-    unknown.resolve_unknown_as_absent(
-        unknown_intent.client_order_id,
-        BoundedAbsenceEvidence(
-            client_order_id=unknown_intent.client_order_id,
-            economic_key=unknown_intent.economic_key,
-            first_not_found_at_ms=0,
-            last_not_found_at_ms=1_000,
-            not_found_observation_count=2,
-        ),
-    )
+    for source in AbsenceEvidenceSource:
+        for observed_at_ms in (0, 1_000):
+            unknown.record_unknown_absence_observation(
+                unknown_intent.client_order_id,
+                UnknownIntentObservation(
+                    source=source,
+                    observed_at_ms=observed_at_ms,
+                    stream_watermark_ms=observed_at_ms + 1,
+                    found=False,
+                ),
+            )
+    unknown.resolve_unknown_as_absent(unknown_intent.client_order_id)
     replacement = unknown.submit(_intent(client_id="UTA1-plan-EN-2-2", stage_index=2))
     assert replacement.status is SimulatedOrderStatus.NEW
 

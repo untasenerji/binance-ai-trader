@@ -7,14 +7,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import cast
+from typing import TYPE_CHECKING, cast
+from uuid import uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.persistence.circuit_breaker import EntryIntentAuthorizationGate, PersistenceCircuitBreaker
+from app.persistence.circuit_breaker import (
+    EntryIntentAuthorizationGate,
+    PersistenceCircuitBreaker,
+    PersistenceRecoveryEvidence,
+)
 from app.persistence.models import (
     AuditChainHead,
     AuditEvent,
@@ -30,6 +35,9 @@ from app.persistence.reducer import (
     projection_state_from_value,
     reduce_state_transition,
 )
+
+if TYPE_CHECKING:
+    from app.exchange.contracts import ReconciliationOutcome
 
 type AuditJSONValue = None | bool | int | str | list["AuditJSONValue"] | dict[str, "AuditJSONValue"]
 
@@ -92,7 +100,7 @@ def normalize_audit_payload(payload: Mapping[str, object]) -> dict[str, AuditJSO
     return normalized
 
 
-def _canonical_record(
+def _canonical_semantic_record(
     *,
     event_id: str,
     source: str,
@@ -107,6 +115,36 @@ def _canonical_record(
             "event_type": event_type,
             "occurred_at": _utc_iso(occurred_at, allow_naive_utc=allow_naive_utc),
             "payload": payload,
+            "source": source,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _canonical_record(
+    *,
+    event_id: str,
+    source: str,
+    event_type: str,
+    occurred_at: datetime,
+    payload: Mapping[str, AuditJSONValue],
+    chain_sequence: int,
+    delivery_status: AuditDeliveryStatus,
+    semantic_fingerprint: str,
+    allow_naive_utc: bool = False,
+) -> str:
+    """Canonical evidence for a chain link, including replay-relevant metadata."""
+    return json.dumps(
+        {
+            "chain_sequence": chain_sequence,
+            "delivery_status": delivery_status.value,
+            "event_id": event_id,
+            "event_type": event_type,
+            "occurred_at": _utc_iso(occurred_at, allow_naive_utc=allow_naive_utc),
+            "payload": payload,
+            "semantic_fingerprint": semantic_fingerprint,
             "source": source,
         },
         ensure_ascii=True,
@@ -166,7 +204,6 @@ class AuditRepository:
 
         normalized_occurred_at = _normalize_audit_timestamp(occurred_at)
         normalized_payload = normalize_audit_payload(payload)
-        transition_event = self._parse_transition_event(event_type, normalized_payload)
         try:
             with self._session_factory.begin() as session:
                 head = self._chain_head_for_update(session)
@@ -183,24 +220,37 @@ class AuditRepository:
                     source=source,
                     semantic_fingerprint=semantic_fingerprint,
                 )
+                chain_sequence = head.last_sequence + 1
                 canonical = _canonical_record(
                     event_id=event_id,
                     source=source,
                     event_type=event_type,
                     occurred_at=normalized_occurred_at,
                     payload=normalized_payload,
+                    chain_sequence=chain_sequence,
+                    delivery_status=delivery_status,
+                    semantic_fingerprint=semantic_fingerprint,
                 )
                 record_hash = hashlib.sha256(
                     f"{head.last_record_hash or ''}{canonical}".encode()
                 ).hexdigest()
-                reduction = self._reduce_projection(session, transition_event)
+                # A malformed canonical transition must roll back its claim. Exact duplicates and
+                # semantic conflicts are evidence, not a request to re-run the reducer.
+                reduction = (
+                    self._reduce_projection(
+                        session,
+                        self._parse_transition_event(event_type, normalized_payload),
+                    )
+                    if delivery_status is AuditDeliveryStatus.CANONICAL
+                    else None
+                )
                 audit_event = AuditEvent(
                     event_id=event_id,
                     source=source,
                     event_type=event_type,
                     occurred_at=normalized_occurred_at,
                     payload=cast(dict[str, object], normalized_payload),
-                    chain_sequence=head.last_sequence + 1,
+                    chain_sequence=chain_sequence,
                     semantic_fingerprint=semantic_fingerprint,
                     delivery_status=delivery_status.value,
                     previous_hash=head.last_record_hash,
@@ -274,6 +324,46 @@ class AuditRepository:
             projections = session.scalars(select(TradePlanProjection))
             return {projection.plan_id: projection.state for projection in projections}
 
+    def collect_persistence_recovery_evidence(
+        self,
+        *,
+        intent_ledger: object,
+        reconciliation_outcome: "ReconciliationOutcome",
+    ) -> PersistenceRecoveryEvidence:
+        """Generate reset evidence from committed storage, never caller-provided health flags."""
+        from app.exchange.contracts import ReconciliationOutcome
+        from app.persistence.replay import ReplayRunner
+
+        if not isinstance(reconciliation_outcome, ReconciliationOutcome):
+            raise TypeError("reconciliation_outcome must be ReconciliationOutcome")
+        unresolved_client_order_ids = getattr(intent_ledger, "unresolved_client_order_ids", None)
+        if not callable(unresolved_client_order_ids):
+            raise TypeError("intent_ledger must expose durable unresolved intent IDs")
+
+        probe_event_id = f"persistence-recovery-probe-{uuid4().hex}"
+        self.record_delivery(
+            event_id=probe_event_id,
+            source="persistence",
+            event_type="persistence_recovery_probe",
+            occurred_at=datetime.now(UTC),
+            payload={"probe_id": probe_event_id},
+        )
+        events = self.list_audit_events()
+        head = self.audit_chain_head()
+        replay = ReplayRunner().replay(events, head)
+        replayed_states = {plan_id: state.value for plan_id, state in replay.plan_states.items()}
+        return PersistenceRecoveryEvidence(
+            write_probe_event_id=probe_event_id,
+            audit_event_count=head.event_count,
+            audit_last_sequence=head.last_sequence,
+            audit_last_record_hash=head.last_record_hash,
+            replay_valid=replay.is_valid,
+            projection_matches_replay=replay.is_valid
+            and self.projected_states() == replayed_states,
+            reconciliation_outcome=reconciliation_outcome,
+            unresolved_intent_ids=tuple(sorted(unresolved_client_order_ids())),
+        )
+
     @staticmethod
     def _chain_head_for_update(session: Session) -> AuditChainHead:
         statement = select(AuditChainHead).where(AuditChainHead.chain_id == 1)
@@ -321,7 +411,7 @@ class AuditRepository:
         occurred_at: datetime,
         payload: Mapping[str, AuditJSONValue],
     ) -> str:
-        canonical = _canonical_record(
+        canonical = _canonical_semantic_record(
             event_id=event_id,
             source=source,
             event_type=event_type,
@@ -381,7 +471,10 @@ class AuditRepository:
         processed_event = session.get(ProcessedEvent, event_id)
         if processed_event is None:
             raise RuntimeError("atomic processed-event claim did not leave a durable row")
-        if processed_event.semantic_fingerprint == semantic_fingerprint:
+        if semantic_fingerprint in {
+            processed_event.semantic_fingerprint,
+            processed_event.legacy_semantic_fingerprint,
+        }:
             return AuditDeliveryStatus.EXACT_DUPLICATE
         return AuditDeliveryStatus.SEMANTIC_CONFLICT
 
@@ -449,6 +542,7 @@ def verify_hash_chain(
     events: tuple[AuditEvent, ...],
     *,
     expected_count: int | None = None,
+    expected_last_sequence: int | None = None,
     expected_last_record_hash: str | None = None,
 ) -> bool:
     if expected_count is not None and len(events) != expected_count:
@@ -464,12 +558,31 @@ def verify_hash_chain(
             return False
         if event.payload != normalized_payload:
             return False
+        expected_semantic_fingerprint = hashlib.sha256(
+            _canonical_semantic_record(
+                event_id=event.event_id,
+                source=event.source,
+                event_type=event.event_type,
+                occurred_at=event.occurred_at,
+                payload=normalized_payload,
+                allow_naive_utc=True,
+            ).encode()
+        ).hexdigest()
+        if event.semantic_fingerprint != expected_semantic_fingerprint:
+            return False
+        try:
+            delivery_status = AuditDeliveryStatus(event.delivery_status)
+        except ValueError:
+            return False
         canonical = _canonical_record(
             event_id=event.event_id,
             source=event.source,
             event_type=event.event_type,
             occurred_at=event.occurred_at,
             payload=normalized_payload,
+            chain_sequence=event.chain_sequence,
+            delivery_status=delivery_status,
+            semantic_fingerprint=event.semantic_fingerprint,
             allow_naive_utc=True,
         )
         expected_hash = hashlib.sha256(f"{previous_hash or ''}{canonical}".encode()).hexdigest()
@@ -477,4 +590,7 @@ def verify_hash_chain(
             return False
         previous_hash = event.record_hash
         expected_sequence += 1
+    actual_last_sequence = expected_sequence - 1
+    if expected_last_sequence is not None and actual_last_sequence != expected_last_sequence:
+        return False
     return expected_last_record_hash is None or previous_hash == expected_last_record_hash

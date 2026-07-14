@@ -4,7 +4,12 @@ from decimal import Decimal
 import pytest
 
 from app.domain.types import Direction
-from app.strategy.backtest import BacktestCosts, BacktestEngine, FundingSettlement
+from app.strategy.backtest import (
+    BacktestCosts,
+    BacktestDataError,
+    BacktestEngine,
+    FundingSettlement,
+)
 from app.strategy.models import Candle, SignalCandidate
 
 
@@ -111,6 +116,8 @@ def test_signed_funding_supports_long_short_and_positive_negative_rates(
             quantity=Decimal("2"),
             funding_settlements=(
                 FundingSettlement(
+                    symbol="BTCUSDT",
+                    timeframe="1m",
                     settled_at_ms=90_000,
                     rate=rate,
                     mark_price=Decimal("100"),
@@ -136,11 +143,15 @@ def test_multiple_settlements_use_each_timestamped_mark_notional() -> None:
             holding_bars=2,
             funding_settlements=(
                 FundingSettlement(
+                    symbol="BTCUSDT",
+                    timeframe="1m",
                     settled_at_ms=90_000,
                     rate=Decimal("0.01"),
                     mark_price=Decimal("100"),
                 ),
                 FundingSettlement(
+                    symbol="BTCUSDT",
+                    timeframe="1m",
                     settled_at_ms=110_000,
                     rate=Decimal("-0.005"),
                     mark_price=Decimal("200"),
@@ -181,3 +192,26 @@ def test_fees_use_executed_notional_and_slippage_is_not_double_counted() -> None
     assert trade.net_pnl == (
         trade.execution_pnl - trade.entry_fee - trade.exit_fee + trade.funding_pnl
     )
+
+
+def test_funding_settlement_rejects_a_different_symbol_or_timeframe() -> None:
+    candles = _candles()
+
+    with pytest.raises(BacktestDataError, match="symbol"):
+        BacktestEngine().run(
+            FirstSignal(Direction.LONG),
+            candles,
+            timeframe="1m",
+            costs=_costs(),
+            evaluation_time_ms=candles[-1].close_time_ms,
+            holding_bars=2,
+            funding_settlements=(
+                FundingSettlement(
+                    symbol="ETHUSDT",
+                    timeframe="1m",
+                    settled_at_ms=90_000,
+                    rate=Decimal("0.01"),
+                    mark_price=Decimal("100"),
+                ),
+            ),
+        )

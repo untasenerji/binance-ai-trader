@@ -15,16 +15,16 @@
 |---|---|---|
 | Read-only risk endpoint | PASS | `tests/test_health.py` verifies the exact fixed D-026 payload; local smoke returned phase 13 and `live_trading_enabled:false`. |
 | Risk Center integration | PASS | Vitest and Playwright mock the backend payload and confirm the read-only preview is visible. |
-| Backend quality | PASS | Current default suite: 167 passed, 6 deliberate public-live/PostgreSQL deselections, 83.73% branch coverage with an enforced 80% gate. |
+| Backend quality | PASS | Current default suite: 193 passed, 8 deliberate deselections, 82.80% total coverage with an enforced 80% total-coverage gate, and 65.11% true branch coverage (`698/1072`) against an independent 65% branch-only gate. |
 | Frontend quality | PASS | Prettier, Oxlint, TypeScript, Vitest: 1 passed, production build, and 2 Playwright scenarios passed. |
 | Dependency and secret scans | PASS | `pip-audit`: no known vulnerabilities; full Node audit: 0 vulnerabilities; Gitleaks history plus working-tree scans found no leaks. |
 | Acceptance tooling | PASS | `uv run --directory backend --locked pre-commit run --all-files` and `docker compose config --quiet` passed. |
 
 ## Independent Audit Remediation (2026-07-12)
 
-- PostgreSQL-inclusive local validation produced 172 passed, 1 public-live deselection, 84.06% branch coverage, JUnit XML, and coverage XML.
+- Historical reports mislabeled 83.73% and 84.06% combined total coverage as branch coverage. Current PostgreSQL-inclusive local validation produced 200 passed, 1 public-live deselection, 83.01% total coverage, 65.49% true branch coverage (`702/1072`), JUnit XML, and coverage JSON/XML.
 - CI now provisions PostgreSQL and uploads JUnit/coverage artifacts. Hosted GitHub Actions execution is **NOT VERIFIED** locally and is not recorded as a pass.
-- `docs/AUDIT_REMEDIATION_REPORT.md` records the exact commands, evidence, base revision `0efde0b`, and the intentional absence of a new commit.
+- `docs/AUDIT_REMEDIATION_REPORT.md` and `docs/SECOND_AUDIT_REMEDIATION_REPORT.md` record the exact commands and evidence. The second-audit base revision is `022631d`; its worktree remains intentionally uncommitted.
 
 ## Safety Confirmation
 

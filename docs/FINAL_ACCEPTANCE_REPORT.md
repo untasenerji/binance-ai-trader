@@ -19,15 +19,15 @@
 
 ## Current Validation Evidence
 
-- `scripts/check.ps1`: PASS. Python audit found no known vulnerability; Node audit found 0 vulnerabilities; Gitleaks history and working-tree scans found no leaks.
-- Default backend suite: PASS with 167 passed, 6 deliberately deselected public-live/PostgreSQL tests, 83.73% branch coverage, and an enforced 80% threshold. One upstream Starlette `TestClient` deprecation warning remains non-failing and has no execution or credential impact.
-- PostgreSQL-inclusive backend suite: PASS with 172 passed, 1 deliberately deselected public-live test, 84.06% branch coverage, JUnit XML, and coverage XML.
+- `scripts/check.ps1`: PASS. Python audit found no known vulnerability; Node audit found 0 vulnerabilities; Gitleaks history and working-tree scans found no leaks; 193 backend tests passed with 8 deliberate deselections, 82.80% total coverage, and 65.11% true branch coverage (`698/1072`).
+- PostgreSQL-inclusive backend suite: PASS with 200 passed, 1 deliberately deselected public-live test, 83.01% total coverage, 65.49% true branch coverage (`702/1072`), JUnit XML, and coverage JSON/XML.
+- The historical 83.73% and 84.06% values in earlier reports were combined total coverage, not branch coverage. The independent true-branch gate is 65% and reads only branch counters.
 - Frontend: Prettier, Oxlint, TypeScript, Vitest, production build, and 2 Playwright scenarios passed.
-- `uv run --directory backend --locked pre-commit run --all-files`: PASS. The global `pre-commit` executable was absent from PATH; the locked project environment was used without skipping hooks.
+- `backend/.venv/Scripts/pre-commit.exe run --all-files`: PASS. The global `pre-commit` executable was absent from PATH; the locked project environment was used without skipping hooks.
 - `docker compose config --quiet`: PASS.
 - Local safe smoke remains read-only: `GET /api/health` reports `live_trading_enabled:false`; `GET /api/risk-config-preview` has no mutation route.
-- CI configuration provisions PostgreSQL and uploads JUnit/coverage artifacts. Hosted GitHub Actions execution is **NOT VERIFIED** in this local environment.
-- Full remediation details: `docs/AUDIT_REMEDIATION_REPORT.md`.
+- CI configuration provisions PostgreSQL and uploads JUnit/coverage artifacts. It now installs checksum-verified Gitleaks before the backend secret-scan contract; the exact Linux installation sequence passed in a local container. Hosted GitHub Actions execution is **NOT VERIFIED** in this local environment.
+- Full remediation details: `docs/AUDIT_REMEDIATION_REPORT.md` and `docs/SECOND_AUDIT_REMEDIATION_REPORT.md`.
 
 ## Non-Negotiable Safety State
 

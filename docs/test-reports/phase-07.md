@@ -30,7 +30,7 @@
 - Submit attempts are durably prepared before simulator submission and use immutable economic identity derived from plan, symbol, role, direction, and stage.
 - PREPARED, SUBMITTING, and UNKNOWN attempts survive restart as unresolved and block a new economic action until typed bounded-absence evidence resolves them.
 - Fill events carry trade identity, delta/cumulative quantity, price, fee, and event time. The fill ledger deduplicates trade IDs, preserves Decimal VWAP, and blocks pending entries after actual-risk breach.
-- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage.
+- Historical 84.06% was combined total coverage, not branch coverage. Current second-audit PostgreSQL-inclusive validation: 200 passed, 1 public-live test deselected, 83.01% total coverage, and 65.49% true branch coverage (`702/1072`).
 
 ## Safety Confirmation
 

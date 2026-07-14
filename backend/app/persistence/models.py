@@ -2,7 +2,16 @@
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, Integer, String, Text, UniqueConstraint, event
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    event,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -41,6 +50,7 @@ class ProcessedEvent(Base):
     event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     source: Mapped[str] = mapped_column(String(32))
     semantic_fingerprint: Mapped[str] = mapped_column(String(64))
+    legacy_semantic_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -101,6 +111,54 @@ class DurableOrderIntent(Base):
     )
 
 
+class DurableIntentFill(Base):
+    """Immutable fill facts required to rebuild VWAP and fees after a restart."""
+
+    __tablename__ = "durable_intent_fills"
+    __table_args__ = (
+        UniqueConstraint("client_order_id", "trade_id", name="uq_durable_intent_fill_trade"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_order_id: Mapped[str] = mapped_column(
+        ForeignKey("durable_order_intents.client_order_id"), index=True
+    )
+    trade_id: Mapped[str] = mapped_column(String(128))
+    semantic_fingerprint: Mapped[str] = mapped_column(String(64))
+    last_quantity: Mapped[str] = mapped_column(String(64))
+    cumulative_quantity: Mapped[str] = mapped_column(String(64))
+    fill_price: Mapped[str] = mapped_column(String(64))
+    fee: Mapped[str] = mapped_column(String(64))
+    fee_asset: Mapped[str] = mapped_column(String(32))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableIntentAbsenceObservation(Base):
+    """Immutable reconciliation observations for a 503 UNKNOWN absence decision."""
+
+    __tablename__ = "durable_intent_absence_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "client_order_id",
+            "source",
+            "observed_at_ms",
+            name="uq_durable_intent_absence_observation",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_order_id: Mapped[str] = mapped_column(
+        ForeignKey("durable_order_intents.client_order_id"), index=True
+    )
+    economic_key: Mapped[str] = mapped_column(String(256))
+    source: Mapped[str] = mapped_column(String(48))
+    observed_at_ms: Mapped[int] = mapped_column(Integer)
+    stream_watermark_ms: Mapped[int] = mapped_column(Integer)
+    found: Mapped[bool] = mapped_column()
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 @event.listens_for(AuditEvent, "before_update")
 def _reject_audit_update(*_: object) -> None:
     raise AppendOnlyViolation("audit_events are append-only")
@@ -109,3 +167,11 @@ def _reject_audit_update(*_: object) -> None:
 @event.listens_for(AuditEvent, "before_delete")
 def _reject_audit_delete(*_: object) -> None:
     raise AppendOnlyViolation("audit_events are append-only")
+
+
+@event.listens_for(DurableIntentFill, "before_update")
+@event.listens_for(DurableIntentFill, "before_delete")
+@event.listens_for(DurableIntentAbsenceObservation, "before_update")
+@event.listens_for(DurableIntentAbsenceObservation, "before_delete")
+def _reject_durable_evidence_mutation(*_: object) -> None:
+    raise AppendOnlyViolation("durable reconciliation evidence is append-only")

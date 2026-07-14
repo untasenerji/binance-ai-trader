@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.domain.types import Direction
 from app.strategy.backtest import BacktestCosts, BacktestEngine, WalkForwardRunner
-from app.strategy.models import Candle, SignalCandidate
+from app.strategy.models import Candle, FrozenStrategy, SignalCandidate
 from app.strategy.strategies import (
     MeanReversionStrategy,
     NoTradeBaseline,
@@ -83,6 +83,16 @@ class AlwaysSignalStrategy:
     def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None:
         del timeframe
         return _signal(candles[-1])
+
+    def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
+        del timeframe
+        return FrozenStrategy(
+            strategy_id=self.strategy_id,
+            training_candle_count=len(candles),
+            training_end_ms=candles[-1].close_time_ms,
+            configuration_fingerprint="always-signal-v1",
+            evaluator=self.evaluate,
+        )
 
 
 def test_backtest_uses_next_bar_and_accounts_for_costs_without_look_ahead() -> None:

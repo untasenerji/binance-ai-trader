@@ -111,6 +111,14 @@ class FutureDataSentinel:
         return _signal(candles[-1]) if len(candles) == 1 else None
 
 
+class EveryBarSignal:
+    strategy_id = "every-bar"
+
+    def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None:
+        del timeframe
+        return _signal(candles[-1])
+
+
 @pytest.mark.parametrize(
     "candles",
     (
@@ -184,4 +192,22 @@ def test_strategy_receives_only_closed_prefixes_and_never_future_candles() -> No
     assert sentinel.observed_close_times == [
         (candles[0].close_time_ms,),
         (candles[0].close_time_ms, candles[1].close_time_ms),
+    ]
+
+
+def test_open_simulated_position_blocks_overlapping_entries_until_its_exit_bar() -> None:
+    candles = tuple(_candle(index) for index in range(6))
+
+    result = BacktestEngine().run(
+        EveryBarSignal(),
+        candles,
+        timeframe="1m",
+        costs=_costs(),
+        evaluation_time_ms=candles[-1].close_time_ms,
+        holding_bars=2,
+    )
+
+    assert [(trade.entry_bar_index, trade.exit_bar_index) for trade in result.trades] == [
+        (1, 2),
+        (3, 4),
     ]

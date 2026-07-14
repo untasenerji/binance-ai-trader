@@ -39,6 +39,7 @@ class ReplayRunner:
         if not verify_hash_chain(
             events,
             expected_count=chain_head.event_count,
+            expected_last_sequence=chain_head.last_sequence,
             expected_last_record_hash=chain_head.last_record_hash,
         ):
             return self._invalid("AUDIT_CHAIN_OR_HEAD_INVALID")

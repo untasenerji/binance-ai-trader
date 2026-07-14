@@ -30,7 +30,7 @@
 - Audit payloads now use one recursive exact codec, and audit append, dedupe claim, projection, and chain-head update are transactional.
 - SQLite and PostgreSQL reject database-level audit mutation. PostgreSQL acceptance covers `UPDATE`, `DELETE`, `TRUNCATE`, migration head, and concurrent linear-chain delivery.
 - Replay validates durable head/count/hash before state reconstruction. Restart recovery compares actual replayed states with durable projections rather than trusting checkpoint health booleans.
-- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage. See `docs/AUDIT_REMEDIATION_REPORT.md`.
+- Historical 84.06% was combined total coverage, not branch coverage. Current second-audit PostgreSQL-inclusive validation: 200 passed, 1 public-live test deselected, 83.01% total coverage, and 65.49% true branch coverage (`702/1072`). See `docs/SECOND_AUDIT_REMEDIATION_REPORT.md`.
 
 ## Safety Confirmation
 

@@ -1,10 +1,13 @@
 """Deterministic candidate strategies for research and backtesting only."""
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
+from hashlib import sha256
+from typing import ClassVar
 
 from app.domain.types import Direction
-from app.strategy.models import Candle, SignalCandidate
+from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, Strategy
 
 _ONE_HUNDRED = Decimal("100")
 
@@ -15,22 +18,47 @@ def _mean(values: Sequence[Decimal]) -> Decimal:
     return sum(values, Decimal("0")) / Decimal(len(values))
 
 
+def _freeze(
+    strategy: Strategy,
+    candles: Sequence[Candle],
+    *,
+    timeframe: str,
+) -> FrozenStrategy:
+    training_candles = tuple(candles)
+    if not training_candles:
+        raise ValueError("strategy fitting requires at least one training candle")
+    if any(candle.timeframe != timeframe for candle in training_candles):
+        raise ValueError("strategy fitting timeframe does not match its training candles")
+    return FrozenStrategy(
+        strategy_id=strategy.strategy_id,
+        training_candle_count=len(training_candles),
+        training_end_ms=training_candles[-1].close_time_ms,
+        configuration_fingerprint=sha256(repr(strategy).encode()).hexdigest(),
+        evaluator=strategy.evaluate,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class NoTradeBaseline:
-    strategy_id = "no_trade_baseline_v1"
+    strategy_id: ClassVar[str] = "no_trade_baseline_v1"
 
     def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None:
         del candles, timeframe
         return None
 
+    def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
+        return _freeze(self, candles, timeframe=timeframe)
 
+
+@dataclass(frozen=True, slots=True)
 class TrendPullbackStrategy:
-    strategy_id = "trend_pullback_v1"
+    strategy_id: ClassVar[str] = "trend_pullback_v1"
+    lookback: int = 3
+    validity_ms: int = 900_000
 
-    def __init__(self, *, lookback: int = 3, validity_ms: int = 900_000) -> None:
-        if lookback < 2 or validity_ms <= 0:
+    def __post_init__(self) -> None:
+        if self.lookback < 2 or self.validity_ms <= 0:
             raise ValueError("trend pullback configuration is invalid")
-        self.lookback = lookback
-        self.validity_ms = validity_ms
 
     def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None:
         if len(candles) < self.lookback:
@@ -51,15 +79,19 @@ class TrendPullbackStrategy:
             )
         return None
 
+    def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
+        return _freeze(self, candles, timeframe=timeframe)
 
+
+@dataclass(frozen=True, slots=True)
 class VolatilityBreakoutStrategy:
-    strategy_id = "volatility_breakout_v1"
+    strategy_id: ClassVar[str] = "volatility_breakout_v1"
+    lookback: int = 3
+    validity_ms: int = 900_000
 
-    def __init__(self, *, lookback: int = 3, validity_ms: int = 900_000) -> None:
-        if lookback < 2 or validity_ms <= 0:
+    def __post_init__(self) -> None:
+        if self.lookback < 2 or self.validity_ms <= 0:
             raise ValueError("breakout configuration is invalid")
-        self.lookback = lookback
-        self.validity_ms = validity_ms
 
     def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None:
         if len(candles) < self.lookback:
@@ -92,22 +124,20 @@ class VolatilityBreakoutStrategy:
             )
         return None
 
+    def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
+        return _freeze(self, candles, timeframe=timeframe)
 
+
+@dataclass(frozen=True, slots=True)
 class MeanReversionStrategy:
-    strategy_id = "mean_reversion_v1"
+    strategy_id: ClassVar[str] = "mean_reversion_v1"
+    lookback: int = 3
+    deviation_percent: Decimal = Decimal("2")
+    validity_ms: int = 900_000
 
-    def __init__(
-        self,
-        *,
-        lookback: int = 3,
-        deviation_percent: Decimal = Decimal("2"),
-        validity_ms: int = 900_000,
-    ) -> None:
-        if lookback < 2 or deviation_percent <= Decimal("0") or validity_ms <= 0:
+    def __post_init__(self) -> None:
+        if self.lookback < 2 or self.deviation_percent <= Decimal("0") or self.validity_ms <= 0:
             raise ValueError("mean reversion configuration is invalid")
-        self.lookback = lookback
-        self.deviation_percent = deviation_percent
-        self.validity_ms = validity_ms
 
     def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None:
         if len(candles) < self.lookback:
@@ -140,3 +170,6 @@ class MeanReversionStrategy:
                 reason_codes=("UPPER_BAND_DEVIATION",),
             )
         return None
+
+    def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
+        return _freeze(self, candles, timeframe=timeframe)

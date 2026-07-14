@@ -16,19 +16,23 @@ from app.exchange.contracts import (
     ReconciliationSnapshot,
     reconcile_local_state,
 )
-from app.persistence.circuit_breaker import PersistenceCircuitBreaker, PersistenceRecoveryEvidence
+from app.persistence.audit import AuditRepository
+from app.persistence.circuit_breaker import PersistenceCircuitBreaker
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import DurableOrderIntent
 from app.simulation.intent_ledger import (
+    AbsenceEvidenceSource,
     BoundedAbsenceEvidence,
     BoundedAbsenceEvidenceError,
     DurableIntentLedger,
     DurableIntentStatus,
+    UnknownIntentObservation,
     UnresolvedEconomicAction,
 )
 from app.simulation.models import (
     OrderRole,
     SimulatedFault,
+    SimulatedFill,
     SimulatedOrderIntent,
     SimulatedOrderStatus,
 )
@@ -47,8 +51,10 @@ def session_factory(tmp_path: Path) -> sessionmaker[Session]:
     return create_session_factory(engine)
 
 
-def _open_breaker() -> PersistenceCircuitBreaker:
+def _open_ledger(session_factory: sessionmaker[Session]) -> DurableIntentLedger:
     breaker = PersistenceCircuitBreaker()
+    ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
+    repository = AuditRepository(session_factory, persistence_breaker=breaker)
     clean_reconciliation = reconcile_local_state(
         local=LocalReconciliationState(
             positions_by_symbol={},
@@ -66,22 +72,16 @@ def _open_breaker() -> PersistenceCircuitBreaker:
         ),
     )
     breaker.reset_after_verified_reconciliation(
-        PersistenceRecoveryEvidence(
-            durable_write_probe_succeeded=True,
-            audit_chain_valid=True,
-            replay_valid=True,
-            reconciliation_outcome=clean_reconciliation,
-            unresolved_prepared_count=0,
-            unresolved_submitting_count=0,
-            unresolved_unknown_count=0,
-        )
+        audit_repository=repository,
+        intent_ledger=ledger,
+        reconciliation_outcome=clean_reconciliation,
     )
-    return breaker
+    return ledger
 
 
 @pytest.fixture
 def ledger(session_factory: sessionmaker[Session]) -> DurableIntentLedger:
-    return DurableIntentLedger(session_factory, persistence_breaker=_open_breaker())
+    return _open_ledger(session_factory)
 
 
 def _intent(
@@ -109,13 +109,39 @@ def _unknown_simulator(ledger: DurableIntentLedger) -> ExchangeSimulator:
     )
 
 
-def _absence_evidence(intent: SimulatedOrderIntent) -> BoundedAbsenceEvidence:
-    return BoundedAbsenceEvidence(
-        client_order_id=intent.client_order_id,
-        economic_key=intent.economic_key,
-        first_not_found_at_ms=0,
-        last_not_found_at_ms=1_000,
-        not_found_observation_count=2,
+def _record_bounded_absence_observations(
+    simulator: ExchangeSimulator,
+    intent: SimulatedOrderIntent,
+) -> None:
+    for source in AbsenceEvidenceSource:
+        for observed_at_ms in (0, 1_000):
+            simulator.record_unknown_absence_observation(
+                intent.client_order_id,
+                UnknownIntentObservation(
+                    source=source,
+                    observed_at_ms=observed_at_ms,
+                    stream_watermark_ms=observed_at_ms + 1,
+                    found=False,
+                ),
+            )
+
+
+def _fills_for_unknown_resolution(
+    *,
+    status: SimulatedOrderStatus,
+    filled_quantity: Decimal,
+) -> tuple[SimulatedFill, ...]:
+    if status not in {SimulatedOrderStatus.PARTIALLY_FILLED, SimulatedOrderStatus.FILLED}:
+        return ()
+    return (
+        SimulatedFill(
+            trade_id=f"unknown-{status.value.lower()}-fill",
+            last_quantity=filled_quantity,
+            cumulative_quantity=filled_quantity,
+            fill_price=Decimal("1000"),
+            fee=Decimal("0.001"),
+            fee_asset="USDT",
+        ),
     )
 
 
@@ -149,6 +175,10 @@ def test_unknown_503_can_only_be_resolved_to_a_durable_known_outcome(
         intent.client_order_id,
         status=status,
         filled_quantity=filled_quantity,
+        fills=_fills_for_unknown_resolution(
+            status=status,
+            filled_quantity=filled_quantity,
+        ),
     )
 
     assert ledger.intent(intent.client_order_id).status is DurableIntentStatus(status.value)
@@ -163,20 +193,25 @@ def test_unknown_absence_requires_bounded_evidence_before_a_retry_is_possible(
     with pytest.raises(UnknownOrderOutcome):
         simulator.submit(intent)
 
-    early_not_found = BoundedAbsenceEvidence(
+    caller_supplied_evidence = BoundedAbsenceEvidence(
         client_order_id=intent.client_order_id,
         economic_key=intent.economic_key,
         first_not_found_at_ms=0,
-        last_not_found_at_ms=0,
-        not_found_observation_count=1,
+        last_not_found_at_ms=1_000,
+        not_found_observation_count=999,
     )
     with pytest.raises(BoundedAbsenceEvidenceError):
-        simulator.resolve_unknown_as_absent(intent.client_order_id, early_not_found)
+        simulator.resolve_unknown_as_absent(intent.client_order_id, caller_supplied_evidence)
+    with pytest.raises(BoundedAbsenceEvidenceError, match="no durable absence observations"):
+        simulator.resolve_unknown_as_absent(intent.client_order_id)
     with pytest.raises(UnresolvedEconomicAction):
         simulator.submit(_intent(client_order_id="UTA1-plan-1-EN-2"))
 
-    simulator.resolve_unknown_as_absent(intent.client_order_id, _absence_evidence(intent))
-    assert ledger.intent(intent.client_order_id).status is DurableIntentStatus.ABSENT
+    _record_bounded_absence_observations(simulator, intent)
+    restarted = ledger.reopen_after_restart()
+    assert len(restarted.list_absence_observations(intent.client_order_id)) == 10
+    restarted.resolve_unknown_as_absent(intent.client_order_id)
+    assert restarted.intent(intent.client_order_id).status is DurableIntentStatus.ABSENT
 
     replacement = simulator.submit(_intent(client_order_id="UTA1-plan-1-EN-2"))
     assert replacement.status is SimulatedOrderStatus.NEW
@@ -195,7 +230,10 @@ def test_restart_keeps_prepared_submitting_and_unknown_intents_unresolved(
     ledger.mark_submitting(unknown.client_order_id)
     ledger.mark_unknown(unknown.client_order_id)
 
-    restarted = DurableIntentLedger(session_factory, persistence_breaker=_open_breaker())
+    restarted = DurableIntentLedger(
+        session_factory,
+        persistence_breaker=ledger.persistence_breaker,
+    )
 
     assert restarted.unresolved_client_order_ids() == ("prepared", "submitting", "unknown")
     assert restarted.unresolved_counts() == {

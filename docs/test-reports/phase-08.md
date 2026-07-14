@@ -26,7 +26,7 @@
 - Normal and Algo order identifiers reconcile in separate namespaces along with signed Decimal positions, stop evidence, unresolved UNKNOWN intents, audit health, and replay health.
 - Static and runtime tests prove every authenticated adapter entry point rejects before signer or transport access, even when a test monkeypatches the module flag.
 - No signer implementation, transport implementation, credential field, authenticated route, user stream, `/order/test`, or matching-engine path was added.
-- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage.
+- Historical 84.06% was combined total coverage, not branch coverage. Current second-audit PostgreSQL-inclusive validation: 200 passed, 1 public-live test deselected, 83.01% total coverage, and 65.49% true branch coverage (`702/1072`).
 
 ## Safety Confirmation
 

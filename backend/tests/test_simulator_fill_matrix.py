@@ -88,20 +88,28 @@ def test_configurable_fill_sequence_keeps_delta_cumulative_financial_invariants(
     order = simulator.submit(_intent())
     events = simulator.advance_to(100)
     ledger = FillLedger()
-    receipts = tuple(
-        ledger.record(_as_fill(event.trade_id, event))
-        for event in events
-        if event.trade_id is not None
-    )
+    delivered_fills = tuple(event for event in events if event.trade_id is not None)
+    # User-stream delivery may be delayed/out of order; reconciliation consumes the
+    # complete durable facts in cumulative order and must still reject a real gap.
+    receipts = []
+    for event in sorted(
+        delivered_fills,
+        key=lambda event: (event.cumulative_filled_quantity, event.trade_id or ""),
+    ):
+        assert event.trade_id is not None
+        receipts.append(ledger.record(_as_fill(event.trade_id, event)))
 
     assert order.status is SimulatedOrderStatus.FILLED
     assert order.filled_quantity == Decimal("0.010")
     assert [event.trade_id for event in events] == ["trade-second", "trade-second", "trade-first"]
-    assert receipts[1].is_duplicate
+    assert receipts[2].is_duplicate
     assert ledger.filled_quantity == Decimal("0.010")
     assert ledger.average_fill_price == Decimal("100.7")
     assert ledger.total_fee == Decimal("0.003")
     assert durable_intent_ledger.intent("matrix-entry").status is DurableIntentStatus.FILLED
+    assert durable_intent_ledger.fill_ledger_for_plan("matrix-plan").average_fill_price == Decimal(
+        "100.7"
+    )
 
 
 def test_partial_fill_cancel_keeps_known_partial_quantity_across_restart_boundary(

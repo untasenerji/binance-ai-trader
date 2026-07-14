@@ -99,6 +99,7 @@ def test_restart_recovers_a_partial_simulated_position_from_durable_checkpoint(
         restored_checkpoint,
         audit_repository=audit_repository,
         reconciliation_outcome=_clean_reconciliation(),
+        intent_ledger=durable_intent_ledger,
     )
 
     assert result.disposition is RecoveryDisposition.RECONCILED
@@ -133,10 +134,12 @@ def test_missing_stop_hard_halts_recovery() -> None:
     )
     engine = create_database_engine("sqlite://")
     create_schema(engine)
+    intent_ledger = DurableIntentLedger(create_session_factory(engine))
     result = LocalRecoveryCoordinator().recover_after_restart(
         missing_stop,
         audit_repository=AuditRepository(create_session_factory(engine)),
         reconciliation_outcome=_clean_reconciliation(),
+        intent_ledger=intent_ledger,
     )
 
     assert result.disposition is RecoveryDisposition.HARD_HALTED

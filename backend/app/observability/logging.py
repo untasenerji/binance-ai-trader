@@ -40,14 +40,31 @@ _SENSITIVE_ASSIGNMENT_NAME = (
 )
 _ASSIGNMENT_PATTERN = re.compile(rf"(?i)\b({_SENSITIVE_ASSIGNMENT_NAME})\s*[:=]\s*([^\s,;;&]+)")
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
+_BASIC_PATTERN = re.compile(r"(?i)\bbasic\s+[^\s,;]+")
+_URL_ENCODED_SEPARATOR = r"(?:[_-]|%5[fF]|%2[dD])"
+_URL_ENCODED_SENSITIVE_ASSIGNMENT_NAME = (
+    rf"api{_URL_ENCODED_SEPARATOR}?(?:key|secret)|"
+    rf"client{_URL_ENCODED_SEPARATOR}?secret|"
+    rf"access{_URL_ENCODED_SEPARATOR}?token|"
+    rf"refresh{_URL_ENCODED_SEPARATOR}?token|"
+    rf"secret{_URL_ENCODED_SEPARATOR}?key|"
+    r"authorization|cookie|password|passphrase|secret|signature|token"
+)
+_URL_ENCODED_ASSIGNMENT_PATTERN = re.compile(
+    rf"(?i)\b({_URL_ENCODED_SENSITIVE_ASSIGNMENT_NAME})(?:%3[aA]|%3[dD])([^\s,;;&]+)"
+)
 _OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 _CAMEL_CASE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 
 def redact_text(value: str) -> str:
     """Remove recognizable secret assignments without returning their original values."""
-    redacted = _BEARER_PATTERN.sub("Bearer [REDACTED]", value)
+    redacted = _BASIC_PATTERN.sub("Basic [REDACTED]", value)
+    redacted = _BEARER_PATTERN.sub("Bearer [REDACTED]", redacted)
     redacted = _ASSIGNMENT_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", redacted)
+    redacted = _URL_ENCODED_ASSIGNMENT_PATTERN.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]", redacted
+    )
     return _OPENAI_KEY_PATTERN.sub("[REDACTED]", redacted)
 
 
@@ -105,7 +122,7 @@ class StructuredLogEvent:
     def to_json(self) -> str:
         return json.dumps(
             {
-                "event": self.event,
+                "event": redact_text(self.event),
                 "fields": redact_for_log(self.fields),
                 "level": self.level.value,
                 "occurred_at_utc": self.occurred_at_utc.astimezone(UTC).isoformat(),

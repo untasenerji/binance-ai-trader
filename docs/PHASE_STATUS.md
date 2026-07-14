@@ -6,14 +6,14 @@
 | 1 | COMPLETED | `docs/test-reports/phase-01.md` | None. Phase scope remained tooling and skeleton only; no credentials or trading integration were added. |
 | 2 | COMPLETED | `docs/test-reports/phase-02.md` | None. Decimal domain, state and hard-cap gates are covered; no exchange integration was added. |
 | 3 | COMPLETED | `docs/test-reports/phase-03.md` | None. Official public-market contracts, mock tests, and credential-free smoke test passed. |
-| 4 | COMPLETED | `docs/test-reports/phase-04.md` | None. 2026-07-12 audit remediation revalidated codec, atomic chain/dedupe, shared replay, database guards, and SQLite/local PostgreSQL evidence. |
-| 5 | COMPLETED | `docs/test-reports/phase-05.md` | None. D-027, no-trade, look-ahead, walk-forward isolation, and funding accounting were revalidated. |
-| 6 | COMPLETED | `docs/test-reports/phase-06.md` | None. Directional rounding, authoritative risk envelope, and rounded-stage collision rejection are covered. |
-| 7 | COMPLETED | `docs/test-reports/phase-07.md` | None. Durable UNKNOWN, fill ledger, partial-fill and failure-matrix invariants are covered locally. |
-| 8 | COMPLETED | `docs/test-reports/phase-08.md` | None. Reconciliation namespaces and the fail-closed locked adapter remain covered with no credential or transport path. |
+| 4 | COMPLETED | `docs/test-reports/phase-04.md` | None. Second-audit local evidence covers hash metadata, populated-0001 upgrade, PostgreSQL runtime grants, replay, and breaker reset. |
+| 5 | COMPLETED | `docs/test-reports/phase-05.md` | None. Train-only walk-forward, non-overlapping positions, and funding symbol/timeframe identity are covered locally. |
+| 6 | COMPLETED | `docs/test-reports/phase-06.md` | None. Multi-stage SHORT commitment/margin and exact financial properties are covered locally. |
+| 7 | COMPLETED | `docs/test-reports/phase-07.md` | None. Durable UNKNOWN evidence, multi-stage fills, semantic conflicts, restart persistence, and actual-risk entry blocking are covered locally. |
+| 8 | COMPLETED | `docs/test-reports/phase-08.md` | None. Reconciliation cleanliness and the recursive fail-closed adapter architecture remain covered with no credential or transport path. |
 | 9 | COMPLETED | `docs/test-reports/phase-09.md` | None. Local no-tools contract, strict parser, mock provider, fail-safe modes, and D-026 budget cap are covered; account model availability remains deliberately unverified without credentials. |
 | 10 | COMPLETED | `docs/test-reports/phase-10.md` | None. Ten local operator views, safety scenarios, responsive checks, and the anonymous locked-status stream are covered. |
-| 11 | COMPLETED | `docs/test-reports/phase-11.md` | None. CamelCase/header/query/nested redaction and structured-log bypass checks are covered. |
+| 11 | COMPLETED | `docs/test-reports/phase-11.md` | None. Basic authorization, URL-encoded assignments, event text, and structured-field redaction are covered. |
 | 12 | COMPLETED | `docs/test-reports/phase-12.md` | None. Recovery derives health from actual audit replay and typed reconciliation; no real exchange verification is claimed. |
 | 13 | COMPLETED | `docs/test-reports/phase-13.md` | None. Local audit remediation validation is complete; hosted CI execution remains NOT VERIFIED and Phase 14 remains locked. |
 | 14 | LOCKED | - | All prior phases + explicit user consent |
@@ -22,3 +22,10 @@
 
 - Remediation checkpoint: `f792a19` (`fix: remediate phase 4-8 independent audit findings`).
 - Local validation is recorded in `docs/AUDIT_REMEDIATION_REPORT.md`; Phase 14 remains **LOCKED**.
+
+## Second Independent Audit Remediation
+
+- Base revision: `022631d`; the second remediation worktree is intentionally uncommitted by user instruction.
+- `docs/SECOND_AUDIT_REMEDIATION_REPORT.md` records local PASS evidence for all code findings: 200 PostgreSQL-inclusive backend tests, true branch coverage 65.49% (`702/1072`), PostgreSQL populated-0001 migration/role tests, full Windows validation, and pre-commit.
+- The hosted GitHub Actions run for the new Gitleaks install has not executed from this uncommitted worktree. It is explicitly **NOT VERIFIED**, not a PASS.
+- Phase 14 remains **LOCKED**.

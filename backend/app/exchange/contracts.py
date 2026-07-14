@@ -257,7 +257,20 @@ class ReconciliationOutcome:
 
     @property
     def is_clean(self) -> bool:
-        return not self.reason_codes
+        return not any(
+            (
+                self.missing_normal_order_ids,
+                self.unexpected_normal_order_ids,
+                self.missing_algo_order_ids,
+                self.unexpected_algo_order_ids,
+                self.position_quantity_mismatches,
+                self.missing_expected_positions,
+                self.unexpected_exchange_positions,
+                self.missing_stop_symbols,
+                self.unresolved_unknown_intent_ids,
+                self.reason_codes,
+            )
+        )
 
     @property
     def missing_local_order_ids(self) -> tuple[str, ...]:

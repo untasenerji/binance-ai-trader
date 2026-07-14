@@ -13,6 +13,7 @@ from app.exchange.contracts import ReconciliationOutcome
 from app.observability.recovery import RecoveryAction
 from app.persistence.audit import AuditRepository
 from app.persistence.replay import ReplayRunner
+from app.simulation.intent_ledger import DurableIntentLedger, DurableIntentStatus
 
 
 class StopProtectionEvidence(StrEnum):
@@ -182,9 +183,12 @@ class LocalRecoveryCoordinator:
         *,
         audit_repository: AuditRepository,
         reconciliation_outcome: ReconciliationOutcome,
+        intent_ledger: DurableIntentLedger,
     ) -> RecoveryResult:
         if not isinstance(reconciliation_outcome, ReconciliationOutcome):
             raise TypeError("reconciliation_outcome must be ReconciliationOutcome")
+        if not isinstance(intent_ledger, DurableIntentLedger):
+            raise TypeError("intent_ledger must be DurableIntentLedger")
         replay = ReplayRunner().replay(
             audit_repository.list_audit_events(),
             audit_repository.audit_chain_head(),
@@ -201,6 +205,21 @@ class LocalRecoveryCoordinator:
                 entry_authority_enabled=False,
                 actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
                 reason="LOCAL_PROJECTION_MISMATCH",
+            )
+        unresolved_counts = intent_ledger.unresolved_counts()
+        if unresolved_counts:
+            reason = (
+                "DURABLE_UNKNOWN_INTENT"
+                if unresolved_counts.get(DurableIntentStatus.UNKNOWN, 0) > 0
+                else "DURABLE_UNRESOLVED_INTENT"
+            )
+            return RecoveryResult(
+                disposition=RecoveryDisposition.PAUSED,
+                local_reconciliation_complete=False,
+                stop_protection_invariant_holds=self._all_stops_confirmed(checkpoint),
+                entry_authority_enabled=False,
+                actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
+                reason=reason,
             )
         if not reconciliation_outcome.is_clean:
             return RecoveryResult(

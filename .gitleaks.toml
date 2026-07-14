@@ -6,7 +6,7 @@ useDefault = true
 [allowlist]
 description = "Ignored paths are generated dependencies or local runtime data already excluded from version control."
 paths = [
-    '''(^|/)(backend/\.venv|frontend/node_modules|frontend/dist|frontend/coverage|frontend/playwright-report|frontend/test-results)(/|$)''',
+    '''(^|/)(backend/\.venv|backend/test-results|frontend/node_modules|frontend/dist|frontend/coverage|frontend/playwright-report|frontend/test-results)(/|$)''',
     '''(^|/)(\.pytest_cache|\.mypy_cache|\.ruff_cache|__pycache__)(/|$)''',
     '''(^|/)(\.coverage|coverage\.xml)$''',
     '''(^|/)data(/|$)''',

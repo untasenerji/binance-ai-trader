@@ -1,7 +1,7 @@
 """Strategy research contracts that are intentionally separate from execution."""
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Protocol
 
@@ -59,7 +59,47 @@ class SignalCandidate:
             raise ValueError("candidate validity and reasons are required")
 
 
-class Strategy(Protocol):
+FrozenStrategyEvaluator = Callable[..., SignalCandidate | None]
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenStrategy:
+    """A train-derived, immutable strategy configuration allowed in test windows."""
+
     strategy_id: str
+    training_candle_count: int
+    training_end_ms: int
+    configuration_fingerprint: str
+    evaluator: FrozenStrategyEvaluator = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.strategy_id or not self.configuration_fingerprint:
+            raise ValueError("frozen strategy needs an identity and configuration fingerprint")
+        if (
+            not isinstance(self.training_candle_count, int)
+            or isinstance(self.training_candle_count, bool)
+            or self.training_candle_count < 1
+            or not isinstance(self.training_end_ms, int)
+            or isinstance(self.training_end_ms, bool)
+            or self.training_end_ms < 0
+        ):
+            raise ValueError("frozen strategy training provenance is invalid")
+        if not callable(self.evaluator):
+            raise TypeError("frozen strategy evaluator must be callable")
+
+    def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None:
+        return self.evaluator(tuple(candles), timeframe=timeframe)
+
+
+class Strategy(Protocol):
+    @property
+    def strategy_id(self) -> str: ...
 
     def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None: ...
+
+
+class TrainableStrategy(Protocol):
+    @property
+    def strategy_id(self) -> str: ...
+
+    def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy: ...

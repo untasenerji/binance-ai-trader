@@ -39,10 +39,26 @@ jobs:
         run: uv run --directory backend --locked ruff check .
       - name: Type-check backend
         run: uv run --directory backend --locked mypy
+      - name: Install Gitleaks CLI for backend secret-scan contract
+        run: |
+          readonly GITLEAKS_VERSION="8.30.0"
+          readonly GITLEAKS_ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          readonly GITLEAKS_SHA256="79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e"
+          readonly GITLEAKS_DIRECTORY="${RUNNER_TEMP}/gitleaks"
+          mkdir -p "${GITLEAKS_DIRECTORY}"
+          curl --fail --silent --show-error --location \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${GITLEAKS_ARCHIVE}" \
+            --output "${GITLEAKS_DIRECTORY}/${GITLEAKS_ARCHIVE}"
+          echo "${GITLEAKS_SHA256}  ${GITLEAKS_DIRECTORY}/${GITLEAKS_ARCHIVE}" | sha256sum --check --status
+          tar --extract --gzip --file "${GITLEAKS_DIRECTORY}/${GITLEAKS_ARCHIVE}" --directory "${GITLEAKS_DIRECTORY}"
+          echo "${GITLEAKS_DIRECTORY}" >> "${GITHUB_PATH}"
+          "${GITLEAKS_DIRECTORY}/gitleaks" version
       - name: Test backend, including PostgreSQL acceptance coverage
         run: |
           mkdir -p backend/test-results
-          uv run --directory backend --locked pytest -m "not live_public" --cov-fail-under=80 --junitxml=test-results/junit.xml --cov-report=xml:coverage.xml
+          uv run --directory backend --locked pytest -m "not live_public" --cov-fail-under=80 --junitxml=test-results/junit.xml --cov-report=xml:coverage.xml --cov-report=json:coverage.json
+      - name: Enforce true branch coverage
+        run: uv run --directory backend --locked python scripts/verify_branch_coverage.py --coverage-json coverage.json --minimum 65
       - name: Upload backend test evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -51,6 +67,7 @@ jobs:
           path: |
             backend/test-results/junit.xml
             backend/coverage.xml
+            backend/coverage.json
           if-no-files-found: error
 
   frontend:

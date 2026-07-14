@@ -1,6 +1,7 @@
 """Fail-closed persistence authorization for any future entry-intent path."""
 
 from dataclasses import dataclass
+from typing import Protocol
 
 from app.exchange.contracts import ReconciliationOutcome
 
@@ -11,53 +12,58 @@ class PersistenceUnavailable(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class PersistenceRecoveryEvidence:
-    """Required locally verified facts before a persistence pause can be lifted."""
+    """Repository-generated facts required before a persistence pause can be lifted."""
 
-    durable_write_probe_succeeded: bool
-    audit_chain_valid: bool
+    write_probe_event_id: str
+    audit_event_count: int
+    audit_last_sequence: int
+    audit_last_record_hash: str | None
     replay_valid: bool
+    projection_matches_replay: bool
     reconciliation_outcome: ReconciliationOutcome
-    unresolved_prepared_count: int
-    unresolved_submitting_count: int
-    unresolved_unknown_count: int
+    unresolved_intent_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        boolean_fields = (
-            self.durable_write_probe_succeeded,
-            self.audit_chain_valid,
-            self.replay_valid,
-        )
-        if not all(isinstance(value, bool) for value in boolean_fields):
-            raise TypeError("persistence recovery verification fields must be boolean")
+        if not self.write_probe_event_id:
+            raise ValueError("recovery evidence requires a durable write-probe event ID")
+        if self.audit_event_count < 1 or self.audit_last_sequence < 1:
+            raise ValueError("recovery evidence requires a non-empty audited chain")
+        if self.audit_last_sequence != self.audit_event_count:
+            raise ValueError("recovery evidence requires a contiguous audited chain")
         if not isinstance(self.reconciliation_outcome, ReconciliationOutcome):
-            raise TypeError("reconciliation_outcome must be ReconciliationOutcome")
-        unresolved_counts = (
-            self.unresolved_prepared_count,
-            self.unresolved_submitting_count,
-            self.unresolved_unknown_count,
-        )
+            raise TypeError("recovery evidence requires a typed reconciliation outcome")
         if any(
-            not isinstance(value, int) or isinstance(value, bool) or value < 0
-            for value in unresolved_counts
+            not isinstance(intent_id, str) or not intent_id
+            for intent_id in self.unresolved_intent_ids
         ):
-            raise ValueError("unresolved intent counts must be non-negative integers")
+            raise ValueError("unresolved intent IDs must be non-empty strings")
 
     @property
     def is_complete(self) -> bool:
         return (
-            self.durable_write_probe_succeeded
-            and self.audit_chain_valid
-            and self.replay_valid
+            self.replay_valid
+            and self.projection_matches_replay
             and self.reconciliation_outcome.is_clean
-            and self.unresolved_prepared_count == 0
-            and self.unresolved_submitting_count == 0
-            and self.unresolved_unknown_count == 0
+            and not self.unresolved_intent_ids
         )
+
+
+class RecoveryEvidenceRepository(Protocol):
+    def collect_persistence_recovery_evidence(
+        self,
+        *,
+        intent_ledger: "RecoveryIntentLedger",
+        reconciliation_outcome: ReconciliationOutcome,
+    ) -> PersistenceRecoveryEvidence: ...
+
+
+class RecoveryIntentLedger(Protocol):
+    def unresolved_client_order_ids(self) -> tuple[str, ...]: ...
 
 
 @dataclass(slots=True)
 class PersistenceCircuitBreaker:
-    """Starts closed and can only reopen after full, typed reconciliation evidence."""
+    """Starts closed and can reopen only from repository-derived recovery evidence."""
 
     halted_reason: str | None = "STARTUP_RECONCILIATION_REQUIRED"
 
@@ -72,12 +78,31 @@ class PersistenceCircuitBreaker:
         if not self.new_entries_allowed:
             raise PersistenceUnavailable(self.halted_reason)
 
-    def reset_after_verified_reconciliation(self, evidence: PersistenceRecoveryEvidence) -> None:
+    def reset_after_verified_reconciliation(
+        self,
+        *,
+        audit_repository: RecoveryEvidenceRepository,
+        intent_ledger: RecoveryIntentLedger,
+        reconciliation_outcome: ReconciliationOutcome,
+    ) -> PersistenceRecoveryEvidence:
+        if not isinstance(reconciliation_outcome, ReconciliationOutcome):
+            raise TypeError("reconciliation_outcome must be ReconciliationOutcome")
+        if not hasattr(intent_ledger, "unresolved_client_order_ids"):
+            raise TypeError("intent_ledger must expose durable unresolved intent IDs")
+        try:
+            evidence = audit_repository.collect_persistence_recovery_evidence(
+                intent_ledger=intent_ledger,
+                reconciliation_outcome=reconciliation_outcome,
+            )
+        except Exception as error:
+            self.record_write_failure(error)
+            raise PersistenceUnavailable("RECOVERY_EVIDENCE_COLLECTION_FAILED") from error
         if not isinstance(evidence, PersistenceRecoveryEvidence):
-            raise TypeError("evidence must be PersistenceRecoveryEvidence")
+            raise TypeError("audit repository did not return PersistenceRecoveryEvidence")
         if not evidence.is_complete:
             raise PersistenceUnavailable("RECOVERY_EVIDENCE_INCOMPLETE")
         self.halted_reason = None
+        return evidence
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
-from app.strategy.models import Candle, SignalCandidate, Strategy
+from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, Strategy, TrainableStrategy
 
 _BPS_DENOMINATOR = Decimal("10000")
 
@@ -17,6 +17,10 @@ class BacktestDataError(ValueError):
 
 class BacktestSignalError(ValueError):
     """Raised when a strategy candidate cannot legally enter on the next bar."""
+
+
+class WalkForwardTrainingError(ValueError):
+    """Raised when a walk-forward trainer cannot prove a frozen train-only snapshot."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,11 +39,15 @@ class BacktestCosts:
 
 @dataclass(frozen=True, slots=True)
 class FundingSettlement:
+    symbol: str
+    timeframe: str
     settled_at_ms: int
     rate: Decimal
     mark_price: Decimal
 
     def __post_init__(self) -> None:
+        if not self.symbol or not self.timeframe:
+            raise ValueError("funding settlement symbol and timeframe are required")
         if (
             not isinstance(self.settled_at_ms, int)
             or isinstance(self.settled_at_ms, bool)
@@ -116,10 +124,17 @@ class BacktestEngine:
         series = tuple(candles)
         self._validate_candles(series, timeframe=timeframe, evaluation_time_ms=evaluation_time_ms)
         settlements = tuple(funding_settlements)
-        self._validate_funding_settlements(settlements)
+        self._validate_funding_settlements(
+            settlements,
+            symbol=series[0].symbol,
+            timeframe=timeframe,
+        )
 
         trades: list[SimulatedTrade] = []
+        next_available_signal_index = 0
         for signal_index in range(len(series) - holding_bars):
+            if signal_index < next_available_signal_index:
+                continue
             historical_candles = series[: signal_index + 1]
             signal = strategy.evaluate(historical_candles, timeframe=timeframe)
             if signal is None:
@@ -140,6 +155,7 @@ class BacktestEngine:
                     funding_settlements=settlements,
                 )
             )
+            next_available_signal_index = signal_index + holding_bars
 
         return BacktestResult(trades=tuple(trades))
 
@@ -184,9 +200,18 @@ class BacktestEngine:
             raise BacktestSignalError("signal is stale at the next-bar entry time")
 
     @staticmethod
-    def _validate_funding_settlements(settlements: Sequence[FundingSettlement]) -> None:
+    def _validate_funding_settlements(
+        settlements: Sequence[FundingSettlement],
+        *,
+        symbol: str,
+        timeframe: str,
+    ) -> None:
         previous_settlement_ms: int | None = None
         for settlement in settlements:
+            if settlement.symbol != symbol:
+                raise BacktestDataError("funding settlement symbol does not match candle series")
+            if settlement.timeframe != timeframe:
+                raise BacktestDataError("funding settlement timeframe does not match backtest")
             if (
                 previous_settlement_ms is not None
                 and settlement.settled_at_ms <= previous_settlement_ms
@@ -271,6 +296,7 @@ class WalkForwardWindow:
     train_end: int
     test_start: int
     test_end: int
+    configuration_fingerprint: str
     result: BacktestResult
 
 
@@ -288,7 +314,7 @@ class WalkForwardRunner:
 
     def run(
         self,
-        strategy_factory: Callable[[], Strategy],
+        strategy_factory: Callable[[], TrainableStrategy],
         candles: Sequence[Candle],
         *,
         timeframe: str,
@@ -302,9 +328,15 @@ class WalkForwardRunner:
             train_end = start + self.train_size
             test_end = train_end + self.test_size
             segment = series[start:test_end]
-            strategy = strategy_factory()
+            training_candles = tuple(series[start:train_end])
+            trainer = strategy_factory()
+            frozen_strategy = self._fit_train_only(
+                trainer,
+                training_candles=training_candles,
+                timeframe=timeframe,
+            )
             raw_result = engine.run(
-                strategy,
+                frozen_strategy,
                 segment,
                 timeframe=timeframe,
                 costs=costs,
@@ -322,8 +354,31 @@ class WalkForwardRunner:
                     train_end=train_end,
                     test_start=train_end,
                     test_end=test_end,
+                    configuration_fingerprint=frozen_strategy.configuration_fingerprint,
                     result=BacktestResult(trades=test_trades),
                 )
             )
             start += self.step_size
         return tuple(windows)
+
+    @staticmethod
+    def _fit_train_only(
+        trainer: TrainableStrategy,
+        *,
+        training_candles: tuple[Candle, ...],
+        timeframe: str,
+    ) -> FrozenStrategy:
+        fit = getattr(trainer, "fit", None)
+        if not callable(fit):
+            raise WalkForwardTrainingError("walk-forward trainer must implement fit")
+        frozen_strategy = fit(training_candles, timeframe=timeframe)
+        if not isinstance(frozen_strategy, FrozenStrategy):
+            raise WalkForwardTrainingError("walk-forward fit must return FrozenStrategy")
+        if (
+            frozen_strategy.training_candle_count != len(training_candles)
+            or frozen_strategy.training_end_ms != training_candles[-1].close_time_ms
+        ):
+            raise WalkForwardTrainingError(
+                "frozen strategy training provenance does not match the train slice"
+            )
+        return frozen_strategy

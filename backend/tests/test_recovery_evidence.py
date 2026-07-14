@@ -13,6 +13,7 @@ from app.exchange.contracts import (
 )
 from app.persistence.audit import AuditRepository
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
+from app.persistence.models import DurableOrderIntent
 from app.security.recovery import (
     LocalRecoveryCoordinator,
     RecoveryCheckpoint,
@@ -20,6 +21,7 @@ from app.security.recovery import (
     SimulatedOpenPosition,
     StopProtectionEvidence,
 )
+from app.simulation.intent_ledger import DurableIntentLedger, DurableIntentStatus
 
 
 @pytest.fixture
@@ -49,6 +51,10 @@ def _clean_reconciliation() -> ReconciliationOutcome:
     )
 
 
+def _ledger(engine: Engine) -> DurableIntentLedger:
+    return DurableIntentLedger(create_session_factory(engine))
+
+
 def _record_candidate(audit_repository: AuditRepository) -> None:
     audit_repository.record_delivery(
         event_id="recovery-state-1",
@@ -73,7 +79,7 @@ def _record_candidate(audit_repository: AuditRepository) -> None:
 def test_restart_derives_recovery_from_actual_audit_replay_and_typed_reconciliation(
     audit_repository: tuple[AuditRepository, Engine],
 ) -> None:
-    repository, _ = audit_repository
+    repository, engine = audit_repository
     checkpoint = RecoveryCheckpoint(
         positions=(
             SimulatedOpenPosition(
@@ -90,6 +96,7 @@ def test_restart_derives_recovery_from_actual_audit_replay_and_typed_reconciliat
         checkpoint,
         audit_repository=repository,
         reconciliation_outcome=_clean_reconciliation(),
+        intent_ledger=_ledger(engine),
     )
 
     assert result.disposition is RecoveryDisposition.RECONCILED
@@ -110,6 +117,7 @@ def test_restart_hard_halts_when_a_privileged_audit_mutation_breaks_replay(
         RecoveryCheckpoint(positions=()),
         audit_repository=repository,
         reconciliation_outcome=_clean_reconciliation(),
+        intent_ledger=_ledger(engine),
     )
 
     assert result.disposition is RecoveryDisposition.HARD_HALTED
@@ -133,7 +141,43 @@ def test_restart_pauses_when_durable_projection_disagrees_with_valid_replay(
         RecoveryCheckpoint(positions=()),
         audit_repository=repository,
         reconciliation_outcome=_clean_reconciliation(),
+        intent_ledger=_ledger(engine),
     )
 
     assert result.disposition is RecoveryDisposition.PAUSED
     assert result.reason == "LOCAL_PROJECTION_MISMATCH"
+
+
+def test_restart_pauses_when_the_durable_ledger_still_has_an_unknown_intent(
+    audit_repository: tuple[AuditRepository, Engine],
+) -> None:
+    repository, engine = audit_repository
+    session_factory = create_session_factory(engine)
+    with session_factory.begin() as session:
+        session.add(
+            DurableOrderIntent(
+                economic_key="recovery-plan:BTCUSDT:LONG:ENTRY:1",
+                attempt_number=1,
+                client_order_id="recovery-unknown",
+                plan_id="recovery-plan",
+                symbol="BTCUSDT",
+                direction="LONG",
+                role="ENTRY",
+                stage_index=1,
+                quantity="0.005",
+                price="100",
+                filled_quantity="0",
+                status=DurableIntentStatus.UNKNOWN.value,
+            )
+        )
+    ledger = DurableIntentLedger(session_factory)
+
+    result = LocalRecoveryCoordinator().recover_after_restart(
+        RecoveryCheckpoint(positions=()),
+        audit_repository=repository,
+        reconciliation_outcome=_clean_reconciliation(),
+        intent_ledger=ledger,
+    )
+
+    assert result.disposition is RecoveryDisposition.PAUSED
+    assert result.reason == "DURABLE_UNKNOWN_INTENT"

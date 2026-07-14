@@ -431,8 +431,10 @@ def solve_ladder(
         )
 
     projected_total_loss = sum((stage.risk_contribution for stage in stages), ZERO)
+    # Stop-loss risk uses the adverse fill projection, but exposure and margin reserve the
+    # largest possible entry commitment. A short's loss-adverse fill can be below its limit.
     planned_notional = sum(
-        (stage.quantity * stage.worst_entry_fill_price for stage in stages),
+        (stage.quantity * max(stage.entry_price, stage.worst_entry_fill_price) for stage in stages),
         ZERO,
     )
     required_margin = (

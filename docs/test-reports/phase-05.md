@@ -29,7 +29,7 @@
 - Candle streams now reject reverse, duplicate, overlapping, mixed-symbol, incomplete, and future-visible input rather than sorting or inferring safety.
 - Every walk-forward window receives a fresh strategy from a factory, retains global boundaries, and rejects unsafe overlapping out-of-sample aggregation.
 - Backtest accounting separately records market gross, execution PnL, slippage, executed-notional fees, and signed long/short funding settlements.
-- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage.
+- Historical 84.06% was combined total coverage, not branch coverage. Current second-audit PostgreSQL-inclusive validation: 200 passed, 1 public-live test deselected, 83.01% total coverage, and 65.49% true branch coverage (`702/1072`).
 
 ## Safety Confirmation
 

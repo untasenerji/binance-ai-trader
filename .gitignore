@@ -12,6 +12,7 @@ backend/.venv/
 .ruff_cache/
 .coverage
 coverage.xml
+coverage.json
 backend/test-results/
 *.db
 *.sqlite3

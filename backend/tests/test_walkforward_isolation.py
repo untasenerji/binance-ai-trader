@@ -5,7 +5,7 @@ import pytest
 
 from app.domain.types import Direction
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner
-from app.strategy.models import Candle, SignalCandidate, Strategy
+from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, TrainableStrategy
 
 
 def _candle(index: int, close_price: Decimal | None = None) -> Candle:
@@ -57,6 +57,15 @@ class StatefulPoisonStrategy:
             return _signal(candles[-1])
         return None
 
+    def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
+        return FrozenStrategy(
+            strategy_id=self.strategy_id,
+            training_candle_count=len(candles),
+            training_end_ms=candles[-1].close_time_ms,
+            configuration_fingerprint="stateful-poison-v1",
+            evaluator=self.evaluate,
+        )
+
 
 class ExternalMutationStrategy:
     strategy_id = "external-mutation"
@@ -71,12 +80,22 @@ class ExternalMutationStrategy:
         self._source[-1] = _candle(len(self._source) - 1, Decimal("999"))
         return None
 
+    def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
+        del timeframe
+        return FrozenStrategy(
+            strategy_id=self.strategy_id,
+            training_candle_count=len(candles),
+            training_end_ms=candles[-1].close_time_ms,
+            configuration_fingerprint="external-mutation-v1",
+            evaluator=self.evaluate,
+        )
+
 
 def test_walk_forward_uses_a_fresh_factory_instance_per_window_and_global_entry_indexes() -> None:
     candles = tuple(_candle(index) for index in range(10))
     created: list[StatefulPoisonStrategy] = []
 
-    def factory() -> Strategy:
+    def factory() -> TrainableStrategy:
         strategy = StatefulPoisonStrategy()
         created.append(strategy)
         return strategy
@@ -99,7 +118,7 @@ def test_walk_forward_snapshots_source_candles_before_a_strategy_mutates_future_
     source = [_candle(index) for index in range(10)]
     observed_closes: list[Decimal] = []
 
-    def factory() -> Strategy:
+    def factory() -> TrainableStrategy:
         return ExternalMutationStrategy(source, observed_closes)
 
     WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(

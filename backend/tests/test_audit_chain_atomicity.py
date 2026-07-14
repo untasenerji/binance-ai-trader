@@ -98,3 +98,30 @@ def test_semantic_conflict_is_audited_without_projection_mutation(
     ]
     assert repository.projected_state("plan-atomic") == "CANDIDATE"
     assert repository.processed_event_count() == 1
+
+
+def test_malformed_semantic_conflict_is_evidence_not_a_reducer_failure(
+    session_factory: sessionmaker[Session],
+) -> None:
+    repository = AuditRepository(session_factory)
+    occurred_at = datetime(2026, 7, 12, tzinfo=UTC)
+    repository.record_delivery(
+        event_id="evt-malformed-conflict",
+        source="strategy",
+        event_type="state_transition",
+        occurred_at=occurred_at,
+        payload=_candidate_payload(),
+    )
+
+    conflict = repository.record_delivery(
+        event_id="evt-malformed-conflict",
+        source="strategy",
+        event_type="state_transition",
+        occurred_at=occurred_at,
+        payload={"plan_id": "plan-atomic", "to_state": "CANDIDATE"},
+    )
+
+    assert conflict.delivery_status is AuditDeliveryStatus.SEMANTIC_CONFLICT
+    assert conflict.reconciliation_required
+    assert len(repository.list_audit_events()) == 2
+    assert repository.projected_state("plan-atomic") == "CANDIDATE"

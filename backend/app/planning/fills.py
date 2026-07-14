@@ -1,5 +1,6 @@
 """Exact fill accounting and confirmed-position stop-risk evaluation."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -13,6 +14,10 @@ class FillLedgerError(ValueError):
 
 
 class PositionQuantityMismatch(FillLedgerError):
+    pass
+
+
+class FillSemanticConflict(FillLedgerError):
     pass
 
 
@@ -64,55 +69,139 @@ class ConfirmedPositionRisk:
     reason: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ActualRiskPolicy:
+    """Immutable local policy used to gate simulated entry stages after real fills."""
+
+    plan_id: str
+    direction: Direction
+    worst_stop_exit_price: Decimal
+    exit_fee_rate: Decimal
+    funding_buffer_rate: Decimal
+    funding_interval_count: int
+    risk_budget: Decimal
+    stop_confirmed: bool
+
+    def __post_init__(self) -> None:
+        if not self.plan_id:
+            raise FillLedgerError("actual-risk policy needs a plan ID")
+        if not isinstance(self.direction, Direction):
+            raise TypeError("actual-risk policy direction must be typed")
+        if not isinstance(self.stop_confirmed, bool):
+            raise TypeError("actual-risk policy stop confirmation must be boolean")
+        # Keep policy validation aligned with the financial evaluator so a malformed
+        # policy cannot silently skip the post-fill entry gate.
+        evaluate_confirmed_position_risk(
+            direction=self.direction,
+            signed_confirmed_position_quantity=ZERO,
+            fills=FillLedger(),
+            worst_stop_exit_price=self.worst_stop_exit_price,
+            exit_fee_rate=self.exit_fee_rate,
+            funding_buffer_rate=self.funding_buffer_rate,
+            funding_interval_count=self.funding_interval_count,
+            risk_budget=self.risk_budget,
+            stop_confirmed=self.stop_confirmed,
+        )
+
+
 @dataclass(slots=True)
 class FillLedger:
-    """Deduplicates exchange trade IDs; arrival order never changes financial totals."""
+    """Deduplicates exact exchange fills across all entry stages without financial gaps."""
 
     _events_by_trade_id: dict[str, FillEvent] = field(default_factory=dict)
-    _client_order_id: str | None = None
-    _filled_quantity: Decimal = ZERO
-    _filled_notional: Decimal = ZERO
-    _total_fee: Decimal = ZERO
-    _observed_cumulative_quantity: Decimal = ZERO
+
+    @classmethod
+    def from_events(cls, events: Iterable[FillEvent]) -> "FillLedger":
+        ledger = cls()
+        for event in events:
+            ledger.record(event)
+        return ledger
 
     def record(self, event: FillEvent) -> FillLedgerReceipt:
-        if self._client_order_id is None:
-            self._client_order_id = event.client_order_id
-        elif self._client_order_id != event.client_order_id:
-            raise FillLedgerError("a fill ledger can only represent one client order")
-        if event.trade_id in self._events_by_trade_id:
+        existing = self._events_by_trade_id.get(event.trade_id)
+        if existing is not None:
+            if existing != event:
+                raise FillSemanticConflict("trade ID was redelivered with a semantic conflict")
             return self._receipt(is_duplicate=True)
-        self._events_by_trade_id[event.trade_id] = event
-        self._filled_quantity += event.last_quantity
-        self._filled_notional += event.last_quantity * event.fill_price
-        self._total_fee += event.fee
-        self._observed_cumulative_quantity = max(
-            self._observed_cumulative_quantity,
-            event.cumulative_quantity,
+        self._assert_contiguous_client_fills(
+            (*self._events_for_client(event.client_order_id), event)
         )
+        self._events_by_trade_id[event.trade_id] = event
         return self._receipt(is_duplicate=False)
 
     @property
     def filled_quantity(self) -> Decimal:
-        return self._filled_quantity
+        return sum((event.last_quantity for event in self._events_by_trade_id.values()), ZERO)
 
     @property
     def average_fill_price(self) -> Decimal:
-        if self._filled_quantity <= ZERO:
+        if self.filled_quantity <= ZERO:
             raise FillLedgerError("average fill price requires at least one fill")
-        return self._filled_notional / self._filled_quantity
+        filled_notional = sum(
+            (event.last_quantity * event.fill_price for event in self._events_by_trade_id.values()),
+            ZERO,
+        )
+        return filled_notional / self.filled_quantity
 
     @property
     def total_fee(self) -> Decimal:
-        return self._total_fee
+        return sum((event.fee for event in self._events_by_trade_id.values()), ZERO)
 
     @property
     def observed_cumulative_quantity(self) -> Decimal:
-        return self._observed_cumulative_quantity
+        return sum(
+            (
+                max(event.cumulative_quantity for event in self._events_for_client(client_order_id))
+                for client_order_id in self.client_order_ids
+            ),
+            ZERO,
+        )
+
+    @property
+    def client_order_ids(self) -> frozenset[str]:
+        return frozenset(event.client_order_id for event in self._events_by_trade_id.values())
 
     @property
     def fee_assets(self) -> frozenset[str]:
         return frozenset(event.fee_asset for event in self._events_by_trade_id.values())
+
+    @property
+    def events(self) -> tuple[FillEvent, ...]:
+        return tuple(
+            sorted(
+                self._events_by_trade_id.values(),
+                key=lambda event: (
+                    event.client_order_id,
+                    event.cumulative_quantity,
+                    event.trade_id,
+                ),
+            )
+        )
+
+    def filled_quantity_for(self, client_order_id: str) -> Decimal:
+        return sum(
+            (event.last_quantity for event in self._events_for_client(client_order_id)),
+            ZERO,
+        )
+
+    def _events_for_client(self, client_order_id: str) -> tuple[FillEvent, ...]:
+        return tuple(
+            event
+            for event in self._events_by_trade_id.values()
+            if event.client_order_id == client_order_id
+        )
+
+    @staticmethod
+    def _assert_contiguous_client_fills(events: Iterable[FillEvent]) -> None:
+        expected_cumulative = ZERO
+        for event in sorted(
+            events, key=lambda candidate: (candidate.cumulative_quantity, candidate.trade_id)
+        ):
+            if event.cumulative_quantity - event.last_quantity != expected_cumulative:
+                raise FillLedgerError(
+                    "fill cumulative quantities must be contiguous per client order"
+                )
+            expected_cumulative = event.cumulative_quantity
 
     def _receipt(self, *, is_duplicate: bool) -> FillLedgerReceipt:
         return FillLedgerReceipt(

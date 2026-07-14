@@ -14,7 +14,7 @@ from app.observability.alerts import (
     InMemoryAlertAdapter,
 )
 from app.observability.backup import BackupNotReady, create_backup_manifest, verify_restore
-from app.observability.logging import LogLevel, StructuredLogger, redact_for_log
+from app.observability.logging import LogLevel, StructuredLogger, redact_for_log, redact_text
 from app.observability.metrics import MetricRegistry
 from app.observability.recovery import OperationsMonitor, RecoveryAction
 from app.observability.reports import DailyOperationsReport, DailyReportInput
@@ -106,6 +106,38 @@ def test_structured_log_redacts_camel_case_headers_queries_and_nested_values() -
     assert emitted == [serialized]
     assert all(canary not in serialized for canary in canaries)
     assert serialized.count("[REDACTED]") >= len(canaries)
+
+
+def test_log_redaction_covers_basic_credentials_url_encoded_secrets_and_event_text() -> None:
+    basic_canary = "basic-credential-canary"
+    encoded_access_canary = "encoded-access-canary"
+    encoded_api_canary = "encoded-api-canary"
+    event_canary = "event-secret-canary"
+    emitted: list[str] = []
+    logger = StructuredLogger(emitted.append)
+    encoded_text = (
+        f"Authorization: Basic {basic_canary}; "
+        f"access%5Ftoken%3D{encoded_access_canary}&"
+        f"api%5Fkey%3D{encoded_api_canary}"
+    )
+
+    serialized = logger.emit(
+        event=f"upstream failed: {encoded_text}; secret={event_canary}",
+        fields={"detail": encoded_text},
+        occurred_at_utc=datetime(2026, 7, 13, tzinfo=UTC),
+    )
+
+    assert emitted == [serialized]
+    assert all(
+        canary not in serialized
+        for canary in (
+            basic_canary,
+            encoded_access_canary,
+            encoded_api_canary,
+            event_canary,
+        )
+    )
+    assert basic_canary not in redact_text(encoded_text)
 
 
 def test_metrics_are_label_free_decimal_safe_and_renderable() -> None:

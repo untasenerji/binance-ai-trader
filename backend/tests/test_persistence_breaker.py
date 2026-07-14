@@ -17,10 +17,10 @@ from app.persistence.audit import AuditRepository
 from app.persistence.circuit_breaker import (
     EntryIntentAuthorizationGate,
     PersistenceCircuitBreaker,
-    PersistenceRecoveryEvidence,
     PersistenceUnavailable,
 )
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
+from app.simulation.intent_ledger import DurableIntentLedger
 
 
 @pytest.fixture
@@ -55,18 +55,6 @@ def _record(repository: AuditRepository, event_id: str = "evt-breaker") -> None:
     )
 
 
-def _verified_evidence() -> PersistenceRecoveryEvidence:
-    return PersistenceRecoveryEvidence(
-        durable_write_probe_succeeded=True,
-        audit_chain_valid=True,
-        replay_valid=True,
-        reconciliation_outcome=_clean_reconciliation_outcome(),
-        unresolved_prepared_count=0,
-        unresolved_submitting_count=0,
-        unresolved_unknown_count=0,
-    )
-
-
 def _clean_reconciliation_outcome() -> ReconciliationOutcome:
     return reconcile_local_state(
         local=LocalReconciliationState(
@@ -86,8 +74,31 @@ def _clean_reconciliation_outcome() -> ReconciliationOutcome:
     )
 
 
-def test_breaker_starts_fail_closed_and_only_verified_evidence_opens_it() -> None:
+def _recovery_components(
+    session_factory: sessionmaker[Session],
+) -> tuple[PersistenceCircuitBreaker, DurableIntentLedger, AuditRepository]:
     breaker = PersistenceCircuitBreaker()
+    ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
+    repository = AuditRepository(session_factory, persistence_breaker=breaker)
+    return breaker, ledger, repository
+
+
+def _open_breaker(
+    session_factory: sessionmaker[Session],
+) -> tuple[PersistenceCircuitBreaker, DurableIntentLedger, AuditRepository]:
+    breaker, ledger, repository = _recovery_components(session_factory)
+    breaker.reset_after_verified_reconciliation(
+        audit_repository=repository,
+        intent_ledger=ledger,
+        reconciliation_outcome=_clean_reconciliation_outcome(),
+    )
+    return breaker, ledger, repository
+
+
+def test_breaker_starts_fail_closed_and_only_repository_derived_evidence_opens_it(
+    session_factory: sessionmaker[Session],
+) -> None:
+    breaker, ledger, repository = _recovery_components(session_factory)
     gate = EntryIntentAuthorizationGate(breaker)
 
     with pytest.raises(PersistenceUnavailable, match="STARTUP_RECONCILIATION_REQUIRED"):
@@ -95,45 +106,46 @@ def test_breaker_starts_fail_closed_and_only_verified_evidence_opens_it() -> Non
 
     with pytest.raises(PersistenceUnavailable, match="RECOVERY_EVIDENCE_INCOMPLETE"):
         breaker.reset_after_verified_reconciliation(
-            PersistenceRecoveryEvidence(
-                durable_write_probe_succeeded=True,
-                audit_chain_valid=True,
-                replay_valid=True,
-                reconciliation_outcome=reconcile_local_state(
-                    local=LocalReconciliationState(
-                        positions_by_symbol={},
-                        normal_order_client_ids=frozenset(),
-                        algo_order_client_ids=frozenset(),
-                        required_stop_symbols=frozenset(),
-                        unresolved_unknown_intent_ids=frozenset({"unknown"}),
-                        audit_chain_valid=True,
-                        replay_valid=True,
-                    ),
-                    snapshot=ReconciliationSnapshot(
-                        positions_by_symbol={},
-                        normal_order_client_ids=frozenset(),
-                        algo_order_client_ids=frozenset(),
-                    ),
+            audit_repository=repository,
+            intent_ledger=ledger,
+            reconciliation_outcome=reconcile_local_state(
+                local=LocalReconciliationState(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                    required_stop_symbols=frozenset(),
+                    unresolved_unknown_intent_ids=frozenset({"unknown"}),
+                    audit_chain_valid=True,
+                    replay_valid=True,
                 ),
-                unresolved_prepared_count=0,
-                unresolved_submitting_count=0,
-                unresolved_unknown_count=0,
-            )
+                snapshot=ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                ),
+            ),
         )
 
-    with pytest.raises(TypeError, match="PersistenceRecoveryEvidence"):
-        breaker.reset_after_verified_reconciliation({})  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        breaker.reset_after_verified_reconciliation(  # type: ignore[misc, call-arg]
+            {}  # type: ignore[arg-type]
+        )
 
-    breaker.reset_after_verified_reconciliation(_verified_evidence())
+    evidence = breaker.reset_after_verified_reconciliation(
+        audit_repository=repository,
+        intent_ledger=ledger,
+        reconciliation_outcome=_clean_reconciliation_outcome(),
+    )
+    assert evidence.write_probe_event_id.startswith("persistence-recovery-probe-")
+    assert evidence.replay_valid
+    assert evidence.projection_matches_replay
     gate.authorize_new_entry_intent()
 
 
 def test_normalization_error_does_not_trip_an_open_breaker(
     session_factory: sessionmaker[Session],
 ) -> None:
-    breaker = PersistenceCircuitBreaker()
-    breaker.reset_after_verified_reconciliation(_verified_evidence())
-    repository = AuditRepository(session_factory, persistence_breaker=breaker)
+    breaker, _, repository = _open_breaker(session_factory)
 
     with pytest.raises(ValueError, match="binary floating point"):
         repository.record_delivery(
@@ -232,13 +244,21 @@ def test_commit_failure_rolls_back_and_trips_shared_breaker(
     assert not breaker.new_entries_allowed
 
 
-def test_restart_remains_closed_until_full_evidence_is_provided() -> None:
-    restarted_breaker = PersistenceCircuitBreaker()
+def test_restart_remains_closed_until_repository_evidence_is_recomputed(
+    session_factory: sessionmaker[Session],
+) -> None:
+    restarted_breaker, restarted_ledger, restarted_repository = _recovery_components(
+        session_factory
+    )
 
     assert not restarted_breaker.new_entries_allowed
     with pytest.raises(PersistenceUnavailable):
         restarted_breaker.require_new_entries_allowed()
 
-    restarted_breaker.reset_after_verified_reconciliation(_verified_evidence())
+    restarted_breaker.reset_after_verified_reconciliation(
+        audit_repository=restarted_repository,
+        intent_ledger=restarted_ledger,
+        reconciliation_outcome=_clean_reconciliation_outcome(),
+    )
 
     assert restarted_breaker.new_entries_allowed

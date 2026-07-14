@@ -13,12 +13,12 @@ from app.exchange.contracts import (
 from app.persistence.audit import AuditRepository, verify_hash_chain
 from app.persistence.circuit_breaker import (
     PersistenceCircuitBreaker,
-    PersistenceRecoveryEvidence,
     PersistenceUnavailable,
 )
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import AppendOnlyViolation, AuditEvent
 from app.persistence.replay import ReplayRunner, reconcile_projection
+from app.simulation.intent_ledger import DurableIntentLedger
 
 
 @pytest.fixture
@@ -108,8 +108,12 @@ def test_restart_replay_restores_state_and_ignores_duplicate_event_ids(tmp_path:
     second_engine.dispose()
 
 
-def test_database_failure_blocks_new_entries_until_reconciliation() -> None:
+def test_database_failure_blocks_new_entries_until_reconciliation(
+    session_factory: sessionmaker[Session],
+) -> None:
     breaker = PersistenceCircuitBreaker()
+    ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
+    repository = AuditRepository(session_factory, persistence_breaker=breaker)
     breaker.record_write_failure(RuntimeError("disk unavailable"))
 
     assert not breaker.new_entries_allowed
@@ -117,30 +121,24 @@ def test_database_failure_blocks_new_entries_until_reconciliation() -> None:
         breaker.require_new_entries_allowed()
 
     breaker.reset_after_verified_reconciliation(
-        PersistenceRecoveryEvidence(
-            durable_write_probe_succeeded=True,
-            audit_chain_valid=True,
-            replay_valid=True,
-            reconciliation_outcome=reconcile_local_state(
-                local=LocalReconciliationState(
-                    positions_by_symbol={},
-                    normal_order_client_ids=frozenset(),
-                    algo_order_client_ids=frozenset(),
-                    required_stop_symbols=frozenset(),
-                    unresolved_unknown_intent_ids=frozenset(),
-                    audit_chain_valid=True,
-                    replay_valid=True,
-                ),
-                snapshot=ReconciliationSnapshot(
-                    positions_by_symbol={},
-                    normal_order_client_ids=frozenset(),
-                    algo_order_client_ids=frozenset(),
-                ),
+        audit_repository=repository,
+        intent_ledger=ledger,
+        reconciliation_outcome=reconcile_local_state(
+            local=LocalReconciliationState(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+                required_stop_symbols=frozenset(),
+                unresolved_unknown_intent_ids=frozenset(),
+                audit_chain_valid=True,
+                replay_valid=True,
             ),
-            unresolved_prepared_count=0,
-            unresolved_submitting_count=0,
-            unresolved_unknown_count=0,
-        )
+            snapshot=ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            ),
+        ),
     )
     breaker.require_new_entries_allowed()
 

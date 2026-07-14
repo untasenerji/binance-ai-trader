@@ -28,7 +28,7 @@
 - `PlanningContext` and `RiskEnvelope` require verified equity, leverage, brackets, reserve, exposures, loss limits, position counts, margin mode, and stop capability; missing facts skip or halt.
 - Worst-case entry/stop slippage is tick-rounded conservatively and all-fill loss, notional, and required margin are rechecked after filters.
 - Unscheduled blueprints that collapse to the same rounded entry tick fail closed with `ROUNDED_STAGE_PRICE_COLLISION`; time-sliced stages retain their schedule identity.
-- Current PostgreSQL-inclusive validation: 172 passed, 1 public-live test deselected, 84.06% branch coverage.
+- Historical 84.06% was combined total coverage, not branch coverage. Current second-audit PostgreSQL-inclusive validation: 200 passed, 1 public-live test deselected, 83.01% total coverage, and 65.49% true branch coverage (`702/1072`).
 
 ## Safety Confirmation
 

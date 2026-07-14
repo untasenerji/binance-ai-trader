@@ -11,7 +11,8 @@ from app.exchange.contracts import (
     ReconciliationSnapshot,
     reconcile_local_state,
 )
-from app.persistence.circuit_breaker import PersistenceCircuitBreaker, PersistenceRecoveryEvidence
+from app.persistence.audit import AuditRepository
+from app.persistence.circuit_breaker import PersistenceCircuitBreaker
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import Base
 from app.simulation.intent_ledger import DurableIntentLedger
@@ -41,19 +42,16 @@ def durable_intent_ledger(tmp_path: Path) -> Iterator[DurableIntentLedger]:
         ),
     )
     breaker = PersistenceCircuitBreaker()
+    session_factory = create_session_factory(engine)
+    ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
+    repository = AuditRepository(session_factory, persistence_breaker=breaker)
     breaker.reset_after_verified_reconciliation(
-        PersistenceRecoveryEvidence(
-            durable_write_probe_succeeded=True,
-            audit_chain_valid=True,
-            replay_valid=True,
-            reconciliation_outcome=clean_reconciliation,
-            unresolved_prepared_count=0,
-            unresolved_submitting_count=0,
-            unresolved_unknown_count=0,
-        )
+        audit_repository=repository,
+        intent_ledger=ledger,
+        reconciliation_outcome=clean_reconciliation,
     )
     try:
-        yield DurableIntentLedger(create_session_factory(engine), persistence_breaker=breaker)
+        yield ledger
     finally:
         engine.dispose()
 
