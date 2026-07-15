@@ -31,7 +31,17 @@ try {
     Invoke-CheckedCommand -Description "Backend lint" -FilePath "uv" -Arguments @("run", "--directory", "backend", "--locked", "ruff", "check", ".")
     Invoke-CheckedCommand -Description "Backend type check" -FilePath "uv" -Arguments @("run", "--directory", "backend", "--locked", "mypy")
     Invoke-CheckedCommand -Description "Backend tests and total coverage gate" -FilePath "uv" -Arguments @("run", "--directory", "backend", "--locked", "pytest", "--cov-fail-under=80", "--cov-report=json:coverage.json")
-    Invoke-CheckedCommand -Description "Backend true branch coverage gate" -FilePath "uv" -Arguments @("run", "--directory", "backend", "--locked", "python", "scripts/verify_branch_coverage.py", "--coverage-json", "coverage.json", "--minimum", "65")
+    Invoke-CheckedCommand -Description "Backend true branch coverage gate" -FilePath "uv" -Arguments @(
+        "run", "--directory", "backend", "--locked", "python", "scripts/verify_branch_coverage.py",
+        "--coverage-json", "coverage.json", "--minimum", "65",
+        "--module", "app/planning/fills.py=70",
+        "--module", "app/simulation/intent_ledger.py=70",
+        "--module", "app/simulation/simulator.py=70",
+        "--module", "app/persistence/circuit_breaker.py=70",
+        "--module", "app/persistence/recovery_service.py=70",
+        "--module", "app/exchange/contracts.py=70",
+        "--module", "app/observability/logging.py=70"
+    )
     Invoke-CheckedCommand -Description "Frontend format check" -FilePath "npm" -Arguments @("--prefix", "frontend", "run", "format:check")
     Invoke-CheckedCommand -Description "Frontend lint" -FilePath "npm" -Arguments @("--prefix", "frontend", "run", "lint")
     Invoke-CheckedCommand -Description "Frontend type check" -FilePath "npm" -Arguments @("--prefix", "frontend", "run", "typecheck")

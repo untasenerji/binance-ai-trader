@@ -23,7 +23,6 @@ from app.simulation.intent_ledger import (
     BoundedAbsenceEvidenceError,
     DurableIntentLedger,
     DurableIntentStatus,
-    UnknownIntentObservation,
     UnresolvedEconomicAction,
 )
 from app.simulation.models import (
@@ -37,6 +36,8 @@ from app.simulation.simulator import (
     DurableIntentLedgerRequired,
     ExchangeSimulator,
     FaultPlan,
+    SimulatedUnknownQueryPlan,
+    SimulatedUnknownRemoteState,
     UnknownOrderOutcome,
 )
 
@@ -92,6 +93,9 @@ def _unknown_simulator(ledger: DurableIntentLedger) -> ExchangeSimulator:
         intent_ledger=ledger,
         actual_risk_policy=actual_risk_policy_for("plan-1"),
         fault_plan=FaultPlan.from_faults((SimulatedFault.UNKNOWN_503,)),
+        unknown_query_plan=SimulatedUnknownQueryPlan.from_states(
+            (SimulatedUnknownRemoteState.ABSENT,)
+        ),
     )
 
 
@@ -99,21 +103,10 @@ def _record_bounded_absence_observations(
     simulator: ExchangeSimulator,
     intent: SimulatedOrderIntent,
 ) -> None:
-    for source in AbsenceEvidenceSource:
-        for observed_at_ms in (0, 1_000):
-            simulator.record_unknown_absence_observation(
-                intent.client_order_id,
-                UnknownIntentObservation(
-                    source=source,
-                    observed_at_ms=observed_at_ms,
-                    stream_watermark_ms=observed_at_ms + 1,
-                    found=False,
-                    query_reference=f"{source.value}-{observed_at_ms}",
-                    query_client_order_id=intent.client_order_id,
-                    query_economic_key=intent.economic_key,
-                    query_started_at_ms=observed_at_ms,
-                ),
-            )
+    for observed_at_ms in (0, 1_000):
+        simulator.advance_to(observed_at_ms + 1)
+        for source in AbsenceEvidenceSource:
+            simulator.query_unknown_source(intent.client_order_id, source)
 
 
 def _fills_for_unknown_resolution(

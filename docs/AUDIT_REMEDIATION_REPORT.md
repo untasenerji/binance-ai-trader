@@ -43,4 +43,4 @@ JUnit and coverage XML are generated under ignored test-artifact paths. The GitH
 - `LIVE_TRADING_ENABLED=false` remains enforced by the fail-closed locked adapter, including when tests monkeypatch its module flag.
 - No API key, credential input, signer, transport implementation, authenticated Binance call, test order, or real order was added or invoked.
 - Checkpoint commit `f792a19` was created locally; no push was created.
-- The follow-up second-audit remediation is intentionally uncommitted and documented in `docs/SECOND_AUDIT_REMEDIATION_REPORT.md`.
+- The follow-up second-audit remediation was subsequently checkpointed as `bc05bac` and is documented in `docs/SECOND_AUDIT_REMEDIATION_REPORT.md`.

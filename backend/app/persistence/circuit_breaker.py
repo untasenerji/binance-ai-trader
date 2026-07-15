@@ -77,19 +77,20 @@ class PersistenceCircuitBreaker:
         reconciliation_snapshot: ReconciliationSnapshot,
     ) -> PersistenceRecoveryEvidence:
         from app.persistence.audit import AuditRepository
+        from app.persistence.recovery_service import PersistenceRecoveryService
         from app.simulation.intent_ledger import DurableIntentLedger
 
-        if not isinstance(audit_repository, AuditRepository):
+        if type(audit_repository) is not AuditRepository:
             raise TypeError("audit_repository must be the concrete audit repository")
-        if not isinstance(intent_ledger, DurableIntentLedger):
+        if type(intent_ledger) is not DurableIntentLedger:
             raise TypeError("intent_ledger must be the concrete durable intent ledger")
-        if not isinstance(reconciliation_snapshot, ReconciliationSnapshot):
+        if type(reconciliation_snapshot) is not ReconciliationSnapshot:
             raise TypeError("reconciliation_snapshot must be a typed exchange observation")
         try:
-            evidence = audit_repository.collect_persistence_recovery_evidence(
+            evidence = PersistenceRecoveryService(
+                audit_repository=audit_repository,
                 intent_ledger=intent_ledger,
-                reconciliation_snapshot=reconciliation_snapshot,
-            )
+            ).collect(reconciliation_snapshot)
         except Exception as error:
             self.record_write_failure(error)
             raise PersistenceUnavailable("RECOVERY_EVIDENCE_COLLECTION_FAILED") from error

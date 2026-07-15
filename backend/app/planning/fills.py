@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
@@ -60,8 +61,8 @@ class FillLedgerReceipt:
 
 
 @dataclass(frozen=True, slots=True)
-class ConfirmedPositionRisk:
-    confirmed_position_quantity: Decimal
+class PositionRiskAssessment:
+    position_quantity: Decimal
     average_entry_price: Decimal | None
     actual_notional_usdt: Decimal
     actual_required_margin_usdt: Decimal
@@ -72,8 +73,40 @@ class ConfirmedPositionRisk:
 
 
 @dataclass(frozen=True, slots=True)
+class PortfolioRiskAssessment:
+    pending_order_exposure_usdt: Decimal
+    position_exposure_usdt: Decimal
+    aggregate_symbol_exposure_usdt: Decimal
+    aggregate_total_exposure_usdt: Decimal
+    required_margin_usdt: Decimal
+    reserve_usdt: Decimal
+    projected_plan_stop_risk: Decimal
+    blocked: bool
+    reason: str | None
+
+
+class RiskReductionStatus(StrEnum):
+    OPEN = "OPEN"
+    RESOLVED = "RESOLVED"
+
+
+@dataclass(frozen=True, slots=True)
+class RiskReductionRequirement:
+    plan_id: str
+    symbol: str
+    direction: Direction
+    reason: str
+    required_reduction_quantity: Decimal
+    status: RiskReductionStatus
+
+    @property
+    def is_open(self) -> bool:
+        return self.status is RiskReductionStatus.OPEN
+
+
+@dataclass(frozen=True, slots=True)
 class ActualRiskPolicy:
-    """Immutable local policy used to gate simulated entry stages after real fills."""
+    """Immutable local policy used to gate entry stages after durable simulated fills."""
 
     plan_id: str
     symbol: str
@@ -92,7 +125,6 @@ class ActualRiskPolicy:
     effective_equity_usdt: Decimal
     protective_stop_reference: str
     reduce_only_exit_reference: str
-    stop_confirmed: bool
 
     def __post_init__(self) -> None:
         if not self.plan_id or not self.symbol:
@@ -101,20 +133,18 @@ class ActualRiskPolicy:
             raise FillLedgerError("actual-risk policy needs durable protection references")
         if not isinstance(self.direction, Direction):
             raise TypeError("actual-risk policy direction must be typed")
-        if not isinstance(self.stop_confirmed, bool):
-            raise TypeError("actual-risk policy stop confirmation must be boolean")
         # Keep policy validation aligned with the financial evaluator so a malformed
         # policy cannot silently skip the post-fill entry gate.
-        evaluate_confirmed_position_risk(
+        evaluate_simulated_position_risk(
             direction=self.direction,
-            signed_confirmed_position_quantity=ZERO,
+            signed_simulated_position_quantity=ZERO,
             fills=FillLedger(),
             worst_stop_exit_price=self.worst_stop_exit_price,
             exit_fee_rate=self.exit_fee_rate,
             funding_buffer_rate=self.funding_buffer_rate,
             funding_interval_count=self.funding_interval_count,
             risk_budget=self.risk_budget,
-            stop_confirmed=self.stop_confirmed,
+            simulated_protection_ready=False,
             max_symbol_exposure_usdt=self.max_symbol_exposure_usdt,
             max_total_exposure_usdt=self.max_total_exposure_usdt,
             existing_symbol_exposure_usdt=self.existing_symbol_exposure_usdt,
@@ -127,7 +157,7 @@ class ActualRiskPolicy:
 
 @dataclass(slots=True)
 class FillLedger:
-    """Deduplicates exact exchange fills across all entry stages without financial gaps."""
+    """Deduplicates authoritative fill facts across entry stages without financial gaps."""
 
     _events_by_trade_id: dict[str, FillEvent] = field(default_factory=dict)
 
@@ -233,17 +263,18 @@ class FillLedger:
         )
 
 
-def evaluate_confirmed_position_risk(
+def _evaluate_position_risk(
     *,
     direction: Direction,
-    signed_confirmed_position_quantity: Decimal,
+    signed_position_quantity: Decimal,
     fills: FillLedger,
     worst_stop_exit_price: Decimal,
     exit_fee_rate: Decimal,
     funding_buffer_rate: Decimal,
     funding_interval_count: int,
     risk_budget: Decimal,
-    stop_confirmed: bool,
+    protection_ready: bool,
+    unprotected_reason: str,
     max_symbol_exposure_usdt: Decimal | None = None,
     max_total_exposure_usdt: Decimal | None = None,
     existing_symbol_exposure_usdt: Decimal = ZERO,
@@ -251,10 +282,9 @@ def evaluate_confirmed_position_risk(
     effective_leverage: int | None = None,
     required_reserve_usdt: Decimal = ZERO,
     effective_equity_usdt: Decimal | None = None,
-) -> ConfirmedPositionRisk:
-    """Use confirmed exchange quantity, never a local fill total, as the position authority."""
+) -> PositionRiskAssessment:
     decimal_values = (
-        signed_confirmed_position_quantity,
+        signed_position_quantity,
         worst_stop_exit_price,
         exit_fee_rate,
         funding_buffer_rate,
@@ -305,9 +335,9 @@ def evaluate_confirmed_position_risk(
             raise FillLedgerError("effective leverage must be a positive integer")
     elif effective_leverage is not None:
         raise FillLedgerError("effective leverage requires complete exposure and margin caps")
-    if signed_confirmed_position_quantity == ZERO:
-        return ConfirmedPositionRisk(
-            confirmed_position_quantity=ZERO,
+    if signed_position_quantity == ZERO:
+        return PositionRiskAssessment(
+            position_quantity=ZERO,
             average_entry_price=None,
             actual_notional_usdt=ZERO,
             actual_required_margin_usdt=ZERO,
@@ -316,13 +346,13 @@ def evaluate_confirmed_position_risk(
             hard_halted=False,
             reason=None,
         )
-    if direction is Direction.LONG and signed_confirmed_position_quantity < ZERO:
+    if direction is Direction.LONG and signed_position_quantity < ZERO:
         raise PositionQuantityMismatch("long position quantity must be positive")
-    if direction is Direction.SHORT and signed_confirmed_position_quantity > ZERO:
+    if direction is Direction.SHORT and signed_position_quantity > ZERO:
         raise PositionQuantityMismatch("short position quantity must be negative")
-    confirmed_quantity = abs(signed_confirmed_position_quantity)
-    if fills.filled_quantity <= ZERO or confirmed_quantity > fills.filled_quantity:
-        raise PositionQuantityMismatch("confirmed exchange position exceeds local entry fills")
+    position_quantity = abs(signed_position_quantity)
+    if fills.filled_quantity <= ZERO or position_quantity > fills.filled_quantity:
+        raise PositionQuantityMismatch("position quantity exceeds durable entry fills")
     if fills.fee_assets != frozenset({"USDT"}):
         raise FillLedgerError("non-USDT fees need a verified conversion before risk evaluation")
 
@@ -334,34 +364,34 @@ def evaluate_confirmed_position_risk(
     )
     if price_loss_per_unit < ZERO:
         raise FillLedgerError("stop is on the non-loss side of the confirmed entry")
-    allocated_entry_fee = fills.total_fee * confirmed_quantity / fills.filled_quantity
-    projected_exit_fee = confirmed_quantity * worst_stop_exit_price * exit_fee_rate
+    allocated_entry_fee = fills.total_fee * position_quantity / fills.filled_quantity
+    projected_exit_fee = position_quantity * worst_stop_exit_price * exit_fee_rate
     funding_buffer = (
-        confirmed_quantity * average_entry * funding_buffer_rate * funding_interval_count
+        position_quantity * average_entry * funding_buffer_rate * funding_interval_count
     )
     actual_risk = (
-        confirmed_quantity * price_loss_per_unit
+        position_quantity * price_loss_per_unit
         + allocated_entry_fee
         + projected_exit_fee
         + funding_buffer
     )
-    actual_notional = confirmed_quantity * average_entry
+    actual_notional = position_quantity * average_entry
     actual_required_margin = (
         (existing_total_exposure_usdt + actual_notional) / Decimal(effective_leverage)
         + required_reserve_usdt
         if effective_leverage is not None
         else ZERO
     )
-    if not stop_confirmed:
-        return ConfirmedPositionRisk(
-            confirmed_position_quantity=confirmed_quantity,
+    if not protection_ready:
+        return PositionRiskAssessment(
+            position_quantity=position_quantity,
             average_entry_price=average_entry,
             actual_notional_usdt=actual_notional,
             actual_required_margin_usdt=actual_required_margin,
             actual_stop_risk=actual_risk,
             pending_entries_blocked=True,
             hard_halted=True,
-            reason="STOP_UNCONFIRMED",
+            reason=unprotected_reason,
         )
     if has_cap_policy:
         assert max_symbol_exposure_usdt is not None
@@ -371,8 +401,8 @@ def evaluate_confirmed_position_risk(
             existing_symbol_exposure_usdt + actual_notional > max_symbol_exposure_usdt
             or existing_total_exposure_usdt + actual_notional > max_total_exposure_usdt
         ):
-            return ConfirmedPositionRisk(
-                confirmed_position_quantity=confirmed_quantity,
+            return PositionRiskAssessment(
+                position_quantity=position_quantity,
                 average_entry_price=average_entry,
                 actual_notional_usdt=actual_notional,
                 actual_required_margin_usdt=actual_required_margin,
@@ -382,8 +412,8 @@ def evaluate_confirmed_position_risk(
                 reason="ACTUAL_EXPOSURE_LIMIT_BREACH",
             )
         if actual_required_margin > effective_equity_usdt:
-            return ConfirmedPositionRisk(
-                confirmed_position_quantity=confirmed_quantity,
+            return PositionRiskAssessment(
+                position_quantity=position_quantity,
                 average_entry_price=average_entry,
                 actual_notional_usdt=actual_notional,
                 actual_required_margin_usdt=actual_required_margin,
@@ -393,8 +423,8 @@ def evaluate_confirmed_position_risk(
                 reason="ACTUAL_MARGIN_REQUIREMENT_BREACH",
             )
     if actual_risk > risk_budget:
-        return ConfirmedPositionRisk(
-            confirmed_position_quantity=confirmed_quantity,
+        return PositionRiskAssessment(
+            position_quantity=position_quantity,
             average_entry_price=average_entry,
             actual_notional_usdt=actual_notional,
             actual_required_margin_usdt=actual_required_margin,
@@ -403,8 +433,8 @@ def evaluate_confirmed_position_risk(
             hard_halted=False,
             reason="ACTUAL_STOP_RISK_BREACH",
         )
-    return ConfirmedPositionRisk(
-        confirmed_position_quantity=confirmed_quantity,
+    return PositionRiskAssessment(
+        position_quantity=position_quantity,
         average_entry_price=average_entry,
         actual_notional_usdt=actual_notional,
         actual_required_margin_usdt=actual_required_margin,
@@ -412,4 +442,87 @@ def evaluate_confirmed_position_risk(
         pending_entries_blocked=False,
         hard_halted=False,
         reason=None,
+    )
+
+
+def evaluate_confirmed_position_risk(
+    *,
+    direction: Direction,
+    signed_confirmed_position_quantity: Decimal,
+    fills: FillLedger,
+    worst_stop_exit_price: Decimal,
+    exit_fee_rate: Decimal,
+    funding_buffer_rate: Decimal,
+    funding_interval_count: int,
+    risk_budget: Decimal,
+    stop_confirmed: bool,
+    max_symbol_exposure_usdt: Decimal | None = None,
+    max_total_exposure_usdt: Decimal | None = None,
+    existing_symbol_exposure_usdt: Decimal = ZERO,
+    existing_total_exposure_usdt: Decimal = ZERO,
+    effective_leverage: int | None = None,
+    required_reserve_usdt: Decimal = ZERO,
+    effective_equity_usdt: Decimal | None = None,
+) -> PositionRiskAssessment:
+    """Evaluate exchange-confirmed quantity against durable fill and stop evidence."""
+    return _evaluate_position_risk(
+        direction=direction,
+        signed_position_quantity=signed_confirmed_position_quantity,
+        fills=fills,
+        worst_stop_exit_price=worst_stop_exit_price,
+        exit_fee_rate=exit_fee_rate,
+        funding_buffer_rate=funding_buffer_rate,
+        funding_interval_count=funding_interval_count,
+        risk_budget=risk_budget,
+        protection_ready=stop_confirmed,
+        unprotected_reason="STOP_UNCONFIRMED",
+        max_symbol_exposure_usdt=max_symbol_exposure_usdt,
+        max_total_exposure_usdt=max_total_exposure_usdt,
+        existing_symbol_exposure_usdt=existing_symbol_exposure_usdt,
+        existing_total_exposure_usdt=existing_total_exposure_usdt,
+        effective_leverage=effective_leverage,
+        required_reserve_usdt=required_reserve_usdt,
+        effective_equity_usdt=effective_equity_usdt,
+    )
+
+
+def evaluate_simulated_position_risk(
+    *,
+    direction: Direction,
+    signed_simulated_position_quantity: Decimal,
+    fills: FillLedger,
+    worst_stop_exit_price: Decimal,
+    exit_fee_rate: Decimal,
+    funding_buffer_rate: Decimal,
+    funding_interval_count: int,
+    risk_budget: Decimal,
+    simulated_protection_ready: bool,
+    unprotected_reason: str = "SIMULATED_PROTECTION_MISSING",
+    max_symbol_exposure_usdt: Decimal | None = None,
+    max_total_exposure_usdt: Decimal | None = None,
+    existing_symbol_exposure_usdt: Decimal = ZERO,
+    existing_total_exposure_usdt: Decimal = ZERO,
+    effective_leverage: int | None = None,
+    required_reserve_usdt: Decimal = ZERO,
+    effective_equity_usdt: Decimal | None = None,
+) -> PositionRiskAssessment:
+    """Evaluate rehearsal-only position and protection facts without exchange claims."""
+    return _evaluate_position_risk(
+        direction=direction,
+        signed_position_quantity=signed_simulated_position_quantity,
+        fills=fills,
+        worst_stop_exit_price=worst_stop_exit_price,
+        exit_fee_rate=exit_fee_rate,
+        funding_buffer_rate=funding_buffer_rate,
+        funding_interval_count=funding_interval_count,
+        risk_budget=risk_budget,
+        protection_ready=simulated_protection_ready,
+        unprotected_reason=unprotected_reason,
+        max_symbol_exposure_usdt=max_symbol_exposure_usdt,
+        max_total_exposure_usdt=max_total_exposure_usdt,
+        existing_symbol_exposure_usdt=existing_symbol_exposure_usdt,
+        existing_total_exposure_usdt=existing_total_exposure_usdt,
+        effective_leverage=effective_leverage,
+        required_reserve_usdt=required_reserve_usdt,
+        effective_equity_usdt=effective_equity_usdt,
     )

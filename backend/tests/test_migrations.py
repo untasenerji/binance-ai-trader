@@ -244,8 +244,10 @@ def test_postgresql_populated_0001_database_upgrades_to_current_head(tmp_path: P
             assert repository.list_audit_events()[0].payload == {"price": "100.2"}
             assert {
                 "durable_actual_risk_policies",
+                "durable_actual_risk_policy_versions",
                 "durable_actual_risk_states",
-                "durable_plan_protections",
+                "durable_risk_reduction_requirements",
+                "durable_simulated_protections",
             } <= set(inspect(upgraded_engine).get_table_names())
         finally:
             upgraded_engine.dispose()

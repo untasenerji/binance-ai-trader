@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
+from types import FunctionType, MethodType, ModuleType
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
@@ -23,6 +24,191 @@ class BacktestSignalError(ValueError):
 
 class WalkForwardTrainingError(ValueError):
     """Raised when a walk-forward trainer cannot prove a frozen train-only snapshot."""
+
+
+@dataclass(slots=True)
+class _TrainingIsolationGuard:
+    training_candles: tuple[Candle, ...]
+    forbidden_scalar_tokens: frozenset[tuple[type[object], object]]
+    reject_unproven_scalars: bool
+    seen: set[int]
+
+    @classmethod
+    def for_window(
+        cls,
+        training_candles: tuple[Candle, ...],
+        held_out_candles: tuple[Candle, ...],
+        *,
+        reject_unproven_scalars: bool = False,
+    ) -> "_TrainingIsolationGuard":
+        training_tokens = cls._market_scalar_tokens(training_candles)
+        held_out_tokens = cls._market_scalar_tokens(held_out_candles)
+        return cls(
+            training_candles=training_candles,
+            forbidden_scalar_tokens=frozenset(held_out_tokens - training_tokens),
+            reject_unproven_scalars=reject_unproven_scalars,
+            seen=set(),
+        )
+
+    @staticmethod
+    def _market_scalar_tokens(candles: tuple[Candle, ...]) -> set[tuple[type[object], object]]:
+        tokens: set[tuple[type[object], object]] = set()
+        for candle in candles:
+            for descriptor in fields(candle):
+                value = getattr(candle, descriptor.name)
+                if isinstance(value, bool) or not isinstance(value, (int, str, Decimal)):
+                    continue
+                tokens.add((type(value), value))
+                if isinstance(value, (int, Decimal)):
+                    tokens.add((str, format(value, "f")))
+                    tokens.add((float, float(value)))
+        return tokens
+
+    def inspect(self, value: object, *, path: str) -> None:
+        if isinstance(value, Candle):
+            if value not in self.training_candles:
+                raise WalkForwardTrainingError(
+                    f"{path} retains held-out market data outside the train slice"
+                )
+            return
+        if value is None or isinstance(value, (bool, bytes, Direction)):
+            return
+        if isinstance(value, (int, float, str, Decimal)):
+            if (type(value), value) in self.forbidden_scalar_tokens:
+                raise WalkForwardTrainingError(
+                    f"{path} retains a held-out market scalar outside the train slice"
+                )
+            if self.reject_unproven_scalars:
+                raise WalkForwardTrainingError(
+                    f"{path} contains scalar state whose train-only origin cannot be isolated"
+                )
+            return
+        if isinstance(value, ModuleType):
+            return
+
+        value_id = id(value)
+        if value_id in self.seen:
+            return
+        self.seen.add(value_id)
+
+        if isinstance(value, Mapping):
+            for key, nested_value in value.items():
+                self.inspect(key, path=f"{path}.key")
+                self.inspect(nested_value, path=f"{path}[{key!r}]")
+            return
+        if isinstance(value, (tuple, list, set, frozenset)):
+            for index, nested_value in enumerate(value):
+                self.inspect(nested_value, path=f"{path}[{index}]")
+            return
+        if isinstance(value, MethodType):
+            self.inspect(value.__self__, path=f"{path}.__self__")
+            self.inspect(value.__func__, path=f"{path}.__func__")
+            return
+        if isinstance(value, FunctionType):
+            self._inspect_function(value, path=path)
+            return
+        if isinstance(value, type):
+            self._inspect_class(value, path=path)
+            return
+
+        inspected = False
+        if is_dataclass(value) and not isinstance(value, type):
+            inspected = True
+            for descriptor in fields(value):
+                self.inspect(
+                    getattr(value, descriptor.name),
+                    path=f"{path}.{descriptor.name}",
+                )
+        attributes = getattr(value, "__dict__", None)
+        if isinstance(attributes, dict):
+            inspected = True
+            for name, nested_value in attributes.items():
+                self.inspect(nested_value, path=f"{path}.{name}")
+        for owner in type(value).__mro__:
+            slots = vars(owner).get("__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for slot in slots:
+                if slot in {"__dict__", "__weakref__"} or not hasattr(value, slot):
+                    continue
+                inspected = True
+                self.inspect(getattr(value, slot), path=f"{path}.{slot}")
+        self._inspect_class(type(value), path=f"{path}.__class__")
+        if not inspected and type(value).__module__ == "builtins":
+            raise WalkForwardTrainingError(
+                f"{path} contains opaque state that the train-only guard cannot isolate"
+            )
+
+    def _inspect_function(self, function: FunctionType, *, path: str) -> None:
+        defaults = function.__defaults__ or ()
+        self.inspect(defaults, path=f"{path}.__defaults__")
+        for name, default in (function.__kwdefaults__ or {}).items():
+            self.inspect(default, path=f"{path}.__kwdefaults__[{name!r}]")
+        for index, cell in enumerate(function.__closure__ or ()):
+            try:
+                cell_value = cell.cell_contents
+            except ValueError:
+                continue
+            self.inspect(cell_value, path=f"{path}.__closure__[{index}]")
+        for name in function.__code__.co_names:
+            if name not in function.__globals__:
+                continue
+            global_value = function.__globals__[name]
+            if self._global_requires_inspection(global_value, function=function):
+                self.inspect(global_value, path=f"{path}.__globals__[{name!r}]")
+
+    @staticmethod
+    def _global_requires_inspection(value: object, *, function: FunctionType) -> bool:
+        if isinstance(
+            value,
+            (
+                Candle,
+                Decimal,
+                FunctionType,
+                Mapping,
+                float,
+                int,
+                list,
+                str,
+                tuple,
+                set,
+                frozenset,
+            ),
+        ):
+            return True
+        if isinstance(value, type):
+            return value.__module__ == function.__module__
+        return type(value).__module__ == function.__module__
+
+    def _inspect_class(self, value: type[object], *, path: str) -> None:
+        for name, nested_value in vars(value).items():
+            if name.startswith("__") and name not in {"__slots__"}:
+                continue
+            if name == "strategy_id":
+                continue
+            if isinstance(nested_value, (staticmethod, classmethod)):
+                nested_value = nested_value.__func__
+            elif isinstance(nested_value, property):
+                nested_value = nested_value.fget
+            if nested_value is None:
+                continue
+            if isinstance(
+                nested_value,
+                (
+                    Candle,
+                    Decimal,
+                    FunctionType,
+                    Mapping,
+                    float,
+                    int,
+                    list,
+                    str,
+                    tuple,
+                    set,
+                    frozenset,
+                ),
+            ):
+                self.inspect(nested_value, path=f"{path}.{name}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,8 +508,10 @@ class WalkForwardRunner:
         *,
         timeframe: str,
         costs: BacktestCosts,
+        funding_settlements: Sequence[FundingSettlement] = (),
     ) -> tuple[WalkForwardWindow, ...]:
         series = tuple(candles)
+        settlements = tuple(funding_settlements)
         windows: list[WalkForwardWindow] = []
         start = 0
         engine = BacktestEngine()
@@ -336,6 +524,7 @@ class WalkForwardRunner:
             frozen_strategy, training_data_fingerprint = self._fit_train_only(
                 trainer,
                 training_candles=training_candles,
+                held_out_candles=tuple(series[train_end:]),
                 timeframe=timeframe,
             )
             raw_result = engine.run(
@@ -345,6 +534,7 @@ class WalkForwardRunner:
                 costs=costs,
                 evaluation_time_ms=segment[-1].close_time_ms,
                 start_index=start,
+                funding_settlements=settlements,
             )
             test_trades = tuple(
                 trade
@@ -371,15 +561,28 @@ class WalkForwardRunner:
         trainer: TrainableStrategy,
         *,
         training_candles: tuple[Candle, ...],
+        held_out_candles: tuple[Candle, ...],
         timeframe: str,
     ) -> tuple[FrozenStrategy, str]:
-        training_data_fingerprint = cls._training_data_fingerprint(training_candles)
-        cls._reject_held_out_candle_references(
-            trainer,
-            training_candles=training_candles,
-            path="trainer",
-            seen=set(),
+        from app.strategy.strategies import (
+            MeanReversionStrategy,
+            NoTradeBaseline,
+            TrendPullbackStrategy,
+            VolatilityBreakoutStrategy,
         )
+
+        training_data_fingerprint = cls._training_data_fingerprint(training_candles)
+        trusted_trainer_types = (
+            MeanReversionStrategy,
+            NoTradeBaseline,
+            TrendPullbackStrategy,
+            VolatilityBreakoutStrategy,
+        )
+        _TrainingIsolationGuard.for_window(
+            training_candles,
+            held_out_candles,
+            reject_unproven_scalars=type(trainer) not in trusted_trainer_types,
+        ).inspect(trainer, path="trainer")
         fit = getattr(trainer, "fit", None)
         if not callable(fit):
             raise WalkForwardTrainingError("walk-forward trainer must implement fit")
@@ -393,11 +596,9 @@ class WalkForwardRunner:
             raise WalkForwardTrainingError(
                 "frozen strategy training provenance does not match the train slice"
             )
-        cls._reject_held_out_candle_references(
+        _TrainingIsolationGuard.for_window(training_candles, held_out_candles).inspect(
             frozen_strategy.evaluator,
-            training_candles=training_candles,
             path="frozen evaluator",
-            seen=set(),
         )
         return frozen_strategy, training_data_fingerprint
 
@@ -424,89 +625,3 @@ class WalkForwardRunner:
             sort_keys=True,
         )
         return hashlib.sha256(canonical.encode()).hexdigest()
-
-    @classmethod
-    def _reject_held_out_candle_references(
-        cls,
-        value: object,
-        *,
-        training_candles: tuple[Candle, ...],
-        path: str,
-        seen: set[int],
-    ) -> None:
-        """Reject fit/freeze objects that retain market candles outside the train slice."""
-        if isinstance(value, Candle):
-            if value not in training_candles:
-                raise WalkForwardTrainingError(
-                    f"{path} retains held-out market data outside the train slice"
-                )
-            return
-        if value is None or isinstance(value, (bool, int, float, str, bytes, Decimal, Direction)):
-            return
-        value_id = id(value)
-        if value_id in seen:
-            return
-        seen.add(value_id)
-        if isinstance(value, Mapping):
-            for key, nested_value in value.items():
-                cls._reject_held_out_candle_references(
-                    key,
-                    training_candles=training_candles,
-                    path=f"{path}.key",
-                    seen=seen,
-                )
-                cls._reject_held_out_candle_references(
-                    nested_value,
-                    training_candles=training_candles,
-                    path=f"{path}[{key!r}]",
-                    seen=seen,
-                )
-            return
-        if isinstance(value, (tuple, list, set, frozenset)):
-            for index, nested_value in enumerate(value):
-                cls._reject_held_out_candle_references(
-                    nested_value,
-                    training_candles=training_candles,
-                    path=f"{path}[{index}]",
-                    seen=seen,
-                )
-            return
-        if is_dataclass(value) and not isinstance(value, type):
-            for descriptor in fields(value):
-                cls._reject_held_out_candle_references(
-                    getattr(value, descriptor.name),
-                    training_candles=training_candles,
-                    path=f"{path}.{descriptor.name}",
-                    seen=seen,
-                )
-            return
-        bound_instance = getattr(value, "__self__", None)
-        if bound_instance is not None and bound_instance is not value:
-            cls._reject_held_out_candle_references(
-                bound_instance,
-                training_candles=training_candles,
-                path=f"{path}.__self__",
-                seen=seen,
-            )
-        closure = getattr(value, "__closure__", None)
-        if closure is not None:
-            for cell in closure:
-                try:
-                    cell_value = cell.cell_contents
-                except ValueError:
-                    continue
-                cls._reject_held_out_candle_references(
-                    cell_value,
-                    training_candles=training_candles,
-                    path=f"{path}.__closure__",
-                    seen=seen,
-                )
-        attributes = getattr(value, "__dict__", None)
-        if isinstance(attributes, dict):
-            for name, nested_value in attributes.items():
-                cls._reject_held_out_candle_references(
-                    nested_value,
-                    training_candles=training_candles,
-                    path=f"{path}.{name}",
-                    seen=seen,
-                )

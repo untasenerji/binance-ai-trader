@@ -184,11 +184,11 @@ def test_breaker_remains_halted_when_repository_recovery_collection_fails(
 ) -> None:
     breaker, ledger, repository = _recovery_components(session_factory)
 
-    def raise_collection_failure(**_: object) -> PersistenceRecoveryEvidence:
+    def raise_collection_failure(*_: object, **__: object) -> PersistenceRecoveryEvidence:
         raise RuntimeError("simulated recovery collection failure")
 
     monkeypatch.setattr(
-        repository,
+        AuditRepository,
         "collect_persistence_recovery_evidence",
         raise_collection_failure,
     )

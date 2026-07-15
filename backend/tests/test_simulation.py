@@ -8,7 +8,6 @@ from app.simulation.failure import FailureAction, FailureCoordinator
 from app.simulation.intent_ledger import (
     AbsenceEvidenceSource,
     DurableIntentLedger,
-    UnknownIntentObservation,
     UnresolvedEconomicAction,
 )
 from app.simulation.models import (
@@ -21,6 +20,8 @@ from app.simulation.simulator import (
     ExchangeSimulator,
     FaultPlan,
     InjectedExchangeError,
+    SimulatedUnknownQueryPlan,
+    SimulatedUnknownRemoteState,
     SpreadSlippageModel,
     UnknownOrderOutcome,
 )
@@ -93,27 +94,19 @@ def test_delayed_event_and_unknown_outcome_prevent_duplicate_economic_order(
         intent_ledger=durable_intent_ledger,
         actual_risk_policy=actual_risk_policy_for("plan-1"),
         fault_plan=FaultPlan.from_faults((SimulatedFault.UNKNOWN_503,)),
+        unknown_query_plan=SimulatedUnknownQueryPlan.from_states(
+            (SimulatedUnknownRemoteState.ABSENT,)
+        ),
     )
     unknown_intent = _intent(client_id="UTA1-plan-EN-2-1", stage_index=2)
     with pytest.raises(UnknownOrderOutcome):
         unknown.submit(unknown_intent)
     with pytest.raises(UnresolvedEconomicAction):
         unknown.submit(_intent(client_id="UTA1-plan-EN-2-2", stage_index=2))
-    for source in AbsenceEvidenceSource:
-        for observed_at_ms in (0, 1_000):
-            unknown.record_unknown_absence_observation(
-                unknown_intent.client_order_id,
-                UnknownIntentObservation(
-                    source=source,
-                    observed_at_ms=observed_at_ms,
-                    stream_watermark_ms=observed_at_ms + 1,
-                    found=False,
-                    query_reference=f"{source.value}-{observed_at_ms}",
-                    query_client_order_id=unknown_intent.client_order_id,
-                    query_economic_key=unknown_intent.economic_key,
-                    query_started_at_ms=observed_at_ms,
-                ),
-            )
+    for observed_at_ms in (0, 1_000):
+        unknown.advance_to(observed_at_ms + 1)
+        for source in AbsenceEvidenceSource:
+            unknown.query_unknown_source(unknown_intent.client_order_id, source)
     unknown.resolve_unknown_as_absent(unknown_intent.client_order_id)
     replacement = unknown.submit(_intent(client_id="UTA1-plan-EN-2-2", stage_index=2))
     assert replacement.status is SimulatedOrderStatus.NEW

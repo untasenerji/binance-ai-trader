@@ -19,8 +19,8 @@ from app.security.recovery import (
     RecoveryCheckpointError,
     RecoveryDisposition,
     RecoveryJournal,
-    SimulatedOpenPosition,
-    StopProtectionEvidence,
+    SimulatedPositionCheckpoint,
+    SimulatedProtectionStatus,
 )
 from app.simulation.intent_ledger import DurableIntentLedger
 from app.simulation.models import OrderRole, SimulatedFault, SimulatedOrderIntent
@@ -30,12 +30,12 @@ from app.simulation.simulator import ExchangeSimulator, FaultPlan
 def _confirmed_checkpoint() -> RecoveryCheckpoint:
     return RecoveryCheckpoint(
         positions=(
-            SimulatedOpenPosition(
+            SimulatedPositionCheckpoint(
                 plan_id="plan-recovery",
                 symbol="BTCUSDT",
                 quantity=Decimal("0.005"),
-                stop_protection=StopProtectionEvidence.REMOTE_CONFIRMED,
-                stop_reference="simulated-stop-1",
+                simulated_protection=SimulatedProtectionStatus.REHEARSAL_READY,
+                simulated_stop_reference="simulated-stop-1",
             ),
         ),
     )
@@ -66,7 +66,7 @@ def _reconciliation_snapshot() -> ReconciliationSnapshot:
     )
 
 
-def test_restart_recovers_a_partial_simulated_position_from_durable_checkpoint(
+def test_restart_restores_rehearsal_but_cannot_claim_exchange_reconciliation(
     tmp_path: Path,
     durable_intent_ledger: DurableIntentLedger,
     audit_repository: AuditRepository,
@@ -101,18 +101,22 @@ def test_restart_recovers_a_partial_simulated_position_from_durable_checkpoint(
         intent_ledger=durable_intent_ledger,
     )
 
-    assert result.disposition is RecoveryDisposition.RECONCILED
-    assert result.local_reconciliation_complete
-    assert result.stop_protection_invariant_holds
+    assert result.disposition is RecoveryDisposition.PAUSED
+    assert not result.local_reconciliation_complete
+    assert result.simulated_protection_invariant_holds
     assert result.entry_authority_enabled is False
-    assert result.actions == ()
+    assert result.actions == (
+        RecoveryAction.PAUSE_NEW_ENTRIES,
+        RecoveryAction.RECONCILE_REQUIRED,
+    )
+    assert result.reason == "RECONCILIATION_MISMATCH"
 
 
 def test_network_partition_pauses_entries_and_requires_stop_reverification() -> None:
     result = LocalRecoveryCoordinator().network_partition(_confirmed_checkpoint())
 
     assert result.disposition is RecoveryDisposition.PAUSED
-    assert result.stop_protection_invariant_holds
+    assert result.simulated_protection_invariant_holds
     assert result.entry_authority_enabled is False
     assert RecoveryAction.PAUSE_NEW_ENTRIES in result.actions
     assert RecoveryAction.RECONCILE_REQUIRED in result.actions
@@ -122,12 +126,12 @@ def test_network_partition_pauses_entries_and_requires_stop_reverification() -> 
 def test_missing_stop_hard_halts_recovery() -> None:
     missing_stop = RecoveryCheckpoint(
         positions=(
-            SimulatedOpenPosition(
+            SimulatedPositionCheckpoint(
                 plan_id="plan-unprotected",
                 symbol="BTCUSDT",
                 quantity=Decimal("0.005"),
-                stop_protection=StopProtectionEvidence.MISSING,
-                stop_reference=None,
+                simulated_protection=SimulatedProtectionStatus.MISSING,
+                simulated_stop_reference=None,
             ),
         ),
     )

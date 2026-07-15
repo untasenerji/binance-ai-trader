@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
+from urllib.parse import unquote
 
 
 class LogLevel(StrEnum):
@@ -43,6 +44,10 @@ _JSON_QUOTED_ASSIGNMENT_PATTERN = re.compile(
     rf'(?i)(?P<prefix>"(?P<key>{_SENSITIVE_ASSIGNMENT_NAME})"\s*:\s*")'
     r'(?P<value>(?:\\.|[^"])*)"'
 )
+_SINGLE_QUOTED_JSON_ASSIGNMENT_PATTERN = re.compile(
+    rf"(?i)(?P<prefix>'(?P<key>{_SENSITIVE_ASSIGNMENT_NAME})'\s*:\s*')"
+    r"(?P<value>(?:\\.|[^'])*)'"
+)
 _QUOTED_ASSIGNMENT_PATTERN = re.compile(
     rf"(?i)(?P<prefix>\b(?:{_SENSITIVE_ASSIGNMENT_NAME})\s*[:=]\s*(?P<quote>['\"]))"
     r"(?P<value>(?:\\.|(?!\2).)*)\2"
@@ -67,9 +72,20 @@ _CAMEL_CASE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 def redact_text(value: str) -> str:
     """Remove recognizable secret assignments without returning their original values."""
+    redacted = value
+    for _ in range(3):
+        decoded = unquote(redacted)
+        if decoded == redacted:
+            break
+        redacted = decoded
+    redacted = redacted.replace(r"\"", '"').replace(r"\'", "'")
     redacted = _JSON_QUOTED_ASSIGNMENT_PATTERN.sub(
         lambda match: f'{match.group("prefix")}[REDACTED]"',
-        value,
+        redacted,
+    )
+    redacted = _SINGLE_QUOTED_JSON_ASSIGNMENT_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]'",
+        redacted,
     )
     redacted = _QUOTED_ASSIGNMENT_PATTERN.sub(
         lambda match: f"{match.group('prefix')}[REDACTED]{match.group('quote')}",

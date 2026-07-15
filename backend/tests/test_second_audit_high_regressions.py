@@ -28,9 +28,13 @@ from app.simulation.intent_ledger import (
     BoundedAbsenceEvidenceError,
     DurableIntentLedger,
     DurableIntentStatus,
-    UnknownIntentObservation,
 )
 from app.simulation.models import OrderRole, SimulatedOrderIntent
+from app.simulation.simulator import (
+    ExchangeSimulator,
+    SimulatedUnknownQueryPlan,
+    SimulatedUnknownRemoteState,
+)
 
 
 @pytest.fixture
@@ -151,7 +155,8 @@ def _dirty_outcome_without_reason_codes() -> ReconciliationOutcome:
         unexpected_exchange_positions=(),
         missing_stop_symbols=(),
         unresolved_unknown_intent_ids=(),
-        reason_codes=(),
+        audit_chain_valid=True,
+        replay_valid=True,
     )
 
 
@@ -464,21 +469,16 @@ def test_unknown_absence_needs_durable_repeated_observations_from_every_source(
                 unknown_at_ms=0,
             )
         )
+    simulator = ExchangeSimulator.reopen_after_restart(
+        intent_ledger=ledger,
+        unknown_query_plan=SimulatedUnknownQueryPlan.from_states(
+            (SimulatedUnknownRemoteState.ABSENT,)
+        ),
+    )
     for observed_at_ms in (0, 1_000):
+        simulator.advance_to(observed_at_ms)
         for source in AbsenceEvidenceSource:
-            ledger.record_absence_observation(
-                intent.client_order_id,
-                UnknownIntentObservation(
-                    source=source,
-                    observed_at_ms=observed_at_ms,
-                    stream_watermark_ms=observed_at_ms,
-                    found=False,
-                    query_reference=f"{source.value}-{observed_at_ms}",
-                    query_client_order_id=intent.client_order_id,
-                    query_economic_key=intent.economic_key,
-                    query_started_at_ms=observed_at_ms,
-                ),
-            )
+            simulator.query_unknown_source(intent.client_order_id, source)
 
     evidence = ledger.bounded_absence_evidence(intent.client_order_id)
     resolved = ledger.reopen_after_restart().resolve_unknown_as_absent(intent.client_order_id)

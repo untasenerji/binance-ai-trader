@@ -37,7 +37,7 @@ def test_actual_fill_risk_cancels_partial_entry_and_blocks_remaining_stages(
         actual_risk_policy=actual_risk_policy_for(
             "actual-risk-plan",
             worst_stop_exit_price=Decimal("90"),
-            risk_budget=Decimal("0.01"),
+            risk_budget=Decimal("0.1"),
         ),
         fill_plan=FillSequencePlan.from_sequences(
             (
@@ -46,7 +46,7 @@ def test_actual_fill_risk_cancels_partial_entry_and_blocks_remaining_stages(
                         trade_id="actual-risk-partial",
                         last_quantity=Decimal("0.005"),
                         cumulative_quantity=Decimal("0.005"),
-                        fill_price=Decimal("100"),
+                        fill_price=Decimal("120"),
                         fee=Decimal("0"),
                         fee_asset="USDT",
                     ),

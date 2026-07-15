@@ -55,7 +55,9 @@ The total-coverage threshold and true branch-coverage threshold are intentionall
 
 ## Hosted CI Boundary
 
-The workflow configuration and its Linux installation sequence are locally verified. GitHub Actions itself has not run for this uncommitted remediation worktree, so hosted execution is **NOT VERIFIED** and is not reported as a pass.
+The workflow configuration and its Linux installation sequence are locally verified. GitHub Actions itself was not run for checkpoint `760ecb4` or its documentation follow-up `e19628e`, so hosted execution is **NOT VERIFIED** and is not reported as a pass.
+
+The fourth audit supersedes simulated protection terminology and the later coverage figures; see `docs/FOURTH_AUDIT_REMEDIATION_REPORT.md`. Historical commands and counts above remain the evidence produced at the third-audit checkpoint.
 
 ## Remaining Gate
 

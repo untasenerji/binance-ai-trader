@@ -51,7 +51,7 @@ The 80% pytest threshold is total coverage and is deliberately reported as such.
 
 The workflow now installs a pinned Gitleaks 8.30.0 release in the backend job, verifies its SHA-256, exposes it through `GITHUB_PATH`, and runs the backend secret-scan contract after installation. The exact installation sequence passed in a Linux container.
 
-GitHub Actions itself has **not** run for this uncommitted worktree; therefore hosted execution is **NOT VERIFIED** and is not recorded as a pass. A hosted run requires a later, explicit commit/push or equivalent CI submission. This does not authorize Phase 14.
+GitHub Actions itself was **not** run for the remediation later checkpointed as `bc05bac` with documentation follow-up `6296e85`; therefore hosted execution is **NOT VERIFIED** and is not recorded as a pass. A hosted run requires an explicit push or equivalent CI submission. This does not authorize Phase 14.
 
 ## Remaining Gate
 

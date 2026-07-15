@@ -49,6 +49,8 @@ from app.simulation.simulator import (
     ExchangeSimulator,
     FaultPlan,
     FillSequencePlan,
+    SimulatedUnknownQueryPlan,
+    SimulatedUnknownRemoteState,
     UnknownOrderOutcome,
 )
 
@@ -111,7 +113,6 @@ def _policy(
         effective_equity_usdt=effective_equity_usdt,
         protective_stop_reference=f"{plan_id}-stop",
         reduce_only_exit_reference=f"{plan_id}-reduce-only-exit",
-        stop_confirmed=True,
     )
 
 
@@ -173,7 +174,7 @@ def test_actual_risk_policy_block_confirmed_position_and_protection_survive_rest
             plan_id=plan_id,
             direction=Direction.LONG,
             worst_stop_exit_price=Decimal("90"),
-            risk_budget=Decimal("0.01"),
+            risk_budget=Decimal("0.1"),
         ),
         fill_plan=FillSequencePlan.from_sequences(
             (
@@ -182,7 +183,7 @@ def test_actual_risk_policy_block_confirmed_position_and_protection_survive_rest
                         trade_id="restart-risk-fill",
                         last_quantity=Decimal("0.005"),
                         cumulative_quantity=Decimal("0.005"),
-                        fill_price=Decimal("100"),
+                        fill_price=Decimal("120"),
                         fee=Decimal("0"),
                         fee_asset="USDT",
                     ),
@@ -194,15 +195,15 @@ def test_actual_risk_policy_block_confirmed_position_and_protection_survive_rest
         _intent(client_order_id="restart-risk-entry-1", plan_id=plan_id, stage_index=1)
     )
 
-    protection = durable_intent_ledger.protection_evidence(plan_id)
+    protection = durable_intent_ledger.simulated_protection_evidence(plan_id)
     restarted = ExchangeSimulator.reopen_after_restart(
         intent_ledger=durable_intent_ledger.reopen_after_restart()
     )
     recovered_risk = restarted.actual_risk(plan_id)
 
-    assert protection.stop_confirmed
-    assert protection.reduce_only_exit_confirmed
-    assert recovered_risk.confirmed_position_quantity == Decimal("0.005")
+    assert protection.stop_intent_ready
+    assert protection.reduce_only_exit_intent_ready
+    assert recovered_risk.position_quantity == Decimal("0.005")
     assert recovered_risk.pending_entries_blocked
     with pytest.raises(EntryRiskBlocked, match="ACTUAL_STOP_RISK_BREACH"):
         restarted.submit(
@@ -419,42 +420,18 @@ def test_unknown_absence_requires_causal_query_evidence_and_rehydrates_after_res
             risk_budget=Decimal("1"),
         ),
         fault_plan=FaultPlan.from_faults((SimulatedFault.UNKNOWN_503,)),
+        unknown_query_plan=SimulatedUnknownQueryPlan.from_states(
+            (SimulatedUnknownRemoteState.ABSENT,)
+        ),
         now_ms=10_000,
     )
     with pytest.raises(UnknownOrderOutcome):
         simulator.submit(intent)
 
-    with pytest.raises(BoundedAbsenceEvidenceError, match="UNKNOWN"):
+    for observed_at_ms in (10_000, 11_000):
+        simulator.advance_to(observed_at_ms)
         for source in AbsenceEvidenceSource:
-            simulator.record_unknown_absence_observation(
-                intent.client_order_id,
-                UnknownIntentObservation(
-                    source=source,
-                    observed_at_ms=0,
-                    stream_watermark_ms=0,
-                    found=False,
-                    query_reference=f"{source.value}-pre-unknown",
-                    query_client_order_id=intent.client_order_id,
-                    query_economic_key=intent.economic_key,
-                    query_started_at_ms=0,
-                ),
-            )
-
-    for source in AbsenceEvidenceSource:
-        for observed_at_ms in (10_000, 11_000):
-            simulator.record_unknown_absence_observation(
-                intent.client_order_id,
-                UnknownIntentObservation(
-                    source=source,
-                    observed_at_ms=observed_at_ms,
-                    stream_watermark_ms=observed_at_ms,
-                    found=False,
-                    query_reference=f"{source.value}-causal-{observed_at_ms}",
-                    query_client_order_id=intent.client_order_id,
-                    query_economic_key=intent.economic_key,
-                    query_started_at_ms=observed_at_ms,
-                ),
-            )
+            simulator.query_unknown_source(intent.client_order_id, source)
 
     restarted = ExchangeSimulator.reopen_after_restart(
         intent_ledger=durable_intent_ledger.reopen_after_restart(),
@@ -607,13 +584,13 @@ def test_durable_policy_protection_and_fill_conflict_fail_closed(
     with pytest.raises(DurableRiskPolicyError, match="must match"):
         durable_intent_ledger.record_simulated_protection(
             plan_id,
-            confirmed_position_quantity=Decimal("0.009"),
+            protected_position_quantity=Decimal("0.009"),
         )
 
     risk = durable_intent_ledger.actual_risk_state(plan_id)
 
     assert risk.pending_entries_blocked
-    assert risk.reason == "STOP_UNCONFIRMED"
+    assert risk.reason == "SIMULATED_PROTECTION_MISSING"
 
 
 def test_durable_outcomes_reject_unproven_or_invalid_fill_quantities(
@@ -650,19 +627,19 @@ def test_absence_recording_rejects_missing_timestamps_before_persisting(
     durable_intent_ledger.prepare(intent)
     durable_intent_ledger.mark_submitting(intent.client_order_id)
     durable_intent_ledger.mark_unknown(intent.client_order_id)
-    observation = UnknownIntentObservation(
-        source=AbsenceEvidenceSource.TRADE_HISTORY,
-        observed_at_ms=10,
-        stream_watermark_ms=10,
-        found=False,
-        query_reference="missing-times-query",
-        query_client_order_id=intent.client_order_id,
-        query_economic_key=intent.economic_key,
-        query_started_at_ms=10,
+    simulator = ExchangeSimulator.reopen_after_restart(
+        intent_ledger=durable_intent_ledger,
+        now_ms=10,
+        unknown_query_plan=SimulatedUnknownQueryPlan.from_states(
+            (SimulatedUnknownRemoteState.ABSENT,)
+        ),
     )
 
     with pytest.raises(BoundedAbsenceEvidenceError, match="timestamps"):
-        durable_intent_ledger.record_absence_observation(intent.client_order_id, observation)
+        simulator.query_unknown_source(
+            intent.client_order_id,
+            AbsenceEvidenceSource.TRADE_HISTORY,
+        )
 
 
 @pytest.mark.postgresql
@@ -688,7 +665,7 @@ def test_postgresql_restart_rebuilds_durable_short_risk_and_blocks_follow_on_ent
             plan_id=plan_id,
             direction=Direction.SHORT,
             worst_stop_exit_price=Decimal("101"),
-            risk_budget=Decimal("0.01"),
+            risk_budget=Decimal("0.02"),
         ),
         fill_plan=FillSequencePlan.from_sequences(
             (
@@ -697,7 +674,7 @@ def test_postgresql_restart_rebuilds_durable_short_risk_and_blocks_follow_on_ent
                         trade_id="postgresql-short-fill",
                         last_quantity=Decimal("0.011"),
                         cumulative_quantity=Decimal("0.011"),
-                        fill_price=Decimal("100"),
+                        fill_price=Decimal("99"),
                         fee=Decimal("0"),
                         fee_asset="USDT",
                     ),

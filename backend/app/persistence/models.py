@@ -159,6 +159,9 @@ class DurableIntentAbsenceObservation(Base):
     query_client_order_id: Mapped[str] = mapped_column(String(128))
     query_economic_key: Mapped[str] = mapped_column(String(256))
     query_started_at_ms: Mapped[int] = mapped_column(Integer)
+    attempt_number: Mapped[int] = mapped_column(Integer)
+    client_order_namespace: Mapped[str] = mapped_column(String(32))
+    provenance_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
     observed_at_ms: Mapped[int] = mapped_column(Integer)
     stream_watermark_ms: Mapped[int] = mapped_column(Integer)
     found: Mapped[bool] = mapped_column()
@@ -191,33 +194,62 @@ class DurableActualRiskPolicy(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
-class DurablePlanProtection(Base):
-    """Latest local-only protection evidence for a confirmed simulator position."""
+class DurableActualRiskPolicyVersion(Base):
+    """Append-only policy revisions; the base policy remains immutable version one."""
 
-    __tablename__ = "durable_plan_protections"
+    __tablename__ = "durable_actual_risk_policy_versions"
+    __table_args__ = (UniqueConstraint("plan_id", "version", name="uq_actual_risk_policy_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_id: Mapped[str] = mapped_column(String(128), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    symbol: Mapped[str] = mapped_column(String(32))
+    direction: Mapped[str] = mapped_column(String(16))
+    worst_stop_exit_price: Mapped[str] = mapped_column(String(64))
+    exit_fee_rate: Mapped[str] = mapped_column(String(64))
+    funding_buffer_rate: Mapped[str] = mapped_column(String(64))
+    funding_interval_count: Mapped[int] = mapped_column(Integer)
+    risk_budget: Mapped[str] = mapped_column(String(64))
+    max_symbol_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    max_total_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    existing_symbol_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    existing_total_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    effective_leverage: Mapped[int] = mapped_column(Integer)
+    required_reserve_usdt: Mapped[str] = mapped_column(String(64))
+    effective_equity_usdt: Mapped[str] = mapped_column(String(64))
+    protective_stop_reference: Mapped[str] = mapped_column(String(128))
+    reduce_only_exit_reference: Mapped[str] = mapped_column(String(128))
+    policy_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableSimulatedProtection(Base):
+    """Latest rehearsal-only intent coverage for a simulated position."""
+
+    __tablename__ = "durable_simulated_protections"
 
     plan_id: Mapped[str] = mapped_column(
         ForeignKey("durable_actual_risk_policies.plan_id"), primary_key=True
     )
-    protective_stop_reference: Mapped[str] = mapped_column(String(128))
-    reduce_only_exit_reference: Mapped[str] = mapped_column(String(128))
-    confirmed_position_quantity: Mapped[str] = mapped_column(String(64), default="0")
-    stop_confirmed: Mapped[bool] = mapped_column(default=False)
-    reduce_only_exit_confirmed: Mapped[bool] = mapped_column(default=False)
+    stop_intent_reference: Mapped[str] = mapped_column(String(128))
+    reduce_only_exit_intent_reference: Mapped[str] = mapped_column(String(128))
+    protected_position_quantity: Mapped[str] = mapped_column(String(64), default="0")
+    stop_intent_ready: Mapped[bool] = mapped_column(default=False)
+    reduce_only_exit_intent_ready: Mapped[bool] = mapped_column(default=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
 
 
 class DurableActualRiskState(Base):
-    """Durable post-fill position/risk state re-evaluated from immutable fills."""
+    """Durable rehearsal position/risk state re-evaluated from immutable fills."""
 
     __tablename__ = "durable_actual_risk_states"
 
     plan_id: Mapped[str] = mapped_column(
         ForeignKey("durable_actual_risk_policies.plan_id"), primary_key=True
     )
-    confirmed_position_quantity: Mapped[str] = mapped_column(String(64), default="0")
+    position_quantity: Mapped[str] = mapped_column(String(64), default="0")
     average_entry_price: Mapped[str | None] = mapped_column(String(64), nullable=True)
     actual_notional_usdt: Mapped[str] = mapped_column(String(64), default="0")
     actual_required_margin_usdt: Mapped[str] = mapped_column(String(64), default="0")
@@ -225,6 +257,25 @@ class DurableActualRiskState(Base):
     pending_entries_blocked: Mapped[bool] = mapped_column(default=False)
     hard_halted: Mapped[bool] = mapped_column(default=False)
     reason: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class DurableRiskReductionRequirement(Base):
+    """Typed fail-closed requirement created when a filled position must be reduced."""
+
+    __tablename__ = "durable_risk_reduction_requirements"
+
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("durable_actual_risk_policies.plan_id"), primary_key=True
+    )
+    symbol: Mapped[str] = mapped_column(String(32))
+    direction: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str] = mapped_column(String(96))
+    required_reduction_quantity: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
@@ -252,3 +303,11 @@ def _reject_processed_event_mutation(*_: object) -> None:
 @event.listens_for(DurableIntentAbsenceObservation, "before_delete")
 def _reject_durable_evidence_mutation(*_: object) -> None:
     raise AppendOnlyViolation("durable reconciliation evidence is append-only")
+
+
+@event.listens_for(DurableActualRiskPolicy, "before_update")
+@event.listens_for(DurableActualRiskPolicy, "before_delete")
+@event.listens_for(DurableActualRiskPolicyVersion, "before_update")
+@event.listens_for(DurableActualRiskPolicyVersion, "before_delete")
+def _reject_durable_policy_mutation(*_: object) -> None:
+    raise AppendOnlyViolation("durable actual-risk policies are append-only")

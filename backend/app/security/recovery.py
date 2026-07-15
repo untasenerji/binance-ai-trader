@@ -16,11 +16,11 @@ from app.persistence.replay import ReplayRunner
 from app.simulation.intent_ledger import DurableIntentLedger, DurableIntentStatus
 
 
-class StopProtectionEvidence(StrEnum):
-    """Last locally recorded protection state; this module never queries an exchange."""
+class SimulatedProtectionStatus(StrEnum):
+    """Local rehearsal state; never exchange-confirmed protection evidence."""
 
-    REMOTE_CONFIRMED = "REMOTE_CONFIRMED"
-    UNCONFIRMED = "UNCONFIRMED"
+    REHEARSAL_READY = "REHEARSAL_READY"
+    UNPROTECTED = "UNPROTECTED"
     MISSING = "MISSING"
 
 
@@ -35,29 +35,29 @@ class RecoveryCheckpointError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class SimulatedOpenPosition:
+class SimulatedPositionCheckpoint:
     plan_id: str
     symbol: str
     quantity: Decimal
-    stop_protection: StopProtectionEvidence
-    stop_reference: str | None
+    simulated_protection: SimulatedProtectionStatus
+    simulated_stop_reference: str | None
 
     def __post_init__(self) -> None:
         if not self.plan_id or not self.symbol or self.quantity <= ZERO:
             raise ValueError("simulated position needs plan, symbol, and positive quantity")
-        if self.stop_protection is StopProtectionEvidence.REMOTE_CONFIRMED:
-            if not self.stop_reference:
-                raise ValueError("confirmed stop protection requires a reference")
-        elif self.stop_reference is not None:
-            raise ValueError("only confirmed stop protection may retain a reference")
+        if self.simulated_protection is SimulatedProtectionStatus.REHEARSAL_READY:
+            if not self.simulated_stop_reference:
+                raise ValueError("ready simulated protection requires a rehearsal reference")
+        elif self.simulated_stop_reference is not None:
+            raise ValueError("only ready simulated protection may retain a reference")
 
 
 @dataclass(frozen=True, slots=True)
 class RecoveryCheckpoint:
-    """Only position/stop facts are checkpointed; audit health is recomputed on restart."""
+    """Only simulated rehearsal facts are checkpointed; they are not exchange evidence."""
 
-    positions: tuple[SimulatedOpenPosition, ...]
-    schema_version: Literal[2] = 2
+    positions: tuple[SimulatedPositionCheckpoint, ...]
+    schema_version: Literal[3] = 3
 
     def __post_init__(self) -> None:
         plan_ids = tuple(position.plan_id for position in self.positions)
@@ -69,7 +69,7 @@ class RecoveryCheckpoint:
 class RecoveryResult:
     disposition: RecoveryDisposition
     local_reconciliation_complete: bool
-    stop_protection_invariant_holds: bool
+    simulated_protection_invariant_holds: bool
     entry_authority_enabled: Literal[False]
     actions: tuple[RecoveryAction, ...]
     reason: str | None
@@ -112,8 +112,8 @@ class RecoveryJournal:
                 {
                     "plan_id": position.plan_id,
                     "quantity": format(position.quantity, "f"),
-                    "stop_protection": position.stop_protection.value,
-                    "stop_reference": position.stop_reference,
+                    "simulated_protection": position.simulated_protection.value,
+                    "simulated_stop_reference": position.simulated_stop_reference,
                     "symbol": position.symbol,
                 }
                 for position in checkpoint.positions
@@ -126,7 +126,7 @@ class RecoveryJournal:
         if not isinstance(payload, dict):
             raise RecoveryCheckpointError("recovery checkpoint must be an object")
         expected_keys = {"positions", "schema_version"}
-        if set(payload) != expected_keys or payload["schema_version"] != 2:
+        if set(payload) != expected_keys or payload["schema_version"] != 3:
             raise RecoveryCheckpointError("recovery checkpoint schema is not supported")
         positions_payload = payload["positions"]
         if not isinstance(positions_payload, list):
@@ -140,18 +140,24 @@ class RecoveryJournal:
             raise RecoveryCheckpointError("recovery checkpoint failed validation") from error
 
     @staticmethod
-    def _decode_position(payload: object) -> SimulatedOpenPosition:
+    def _decode_position(payload: object) -> SimulatedPositionCheckpoint:
         if not isinstance(payload, dict):
             raise RecoveryCheckpointError("recovery position must be an object")
-        expected_keys = {"plan_id", "quantity", "stop_protection", "stop_reference", "symbol"}
+        expected_keys = {
+            "plan_id",
+            "quantity",
+            "simulated_protection",
+            "simulated_stop_reference",
+            "symbol",
+        }
         if set(payload) != expected_keys:
             raise RecoveryCheckpointError("recovery position schema is not supported")
 
         plan_id = payload["plan_id"]
         symbol = payload["symbol"]
         quantity = payload["quantity"]
-        protection = payload["stop_protection"]
-        stop_reference = payload["stop_reference"]
+        protection = payload["simulated_protection"]
+        stop_reference = payload["simulated_stop_reference"]
         if (
             not isinstance(plan_id, str)
             or not isinstance(symbol, str)
@@ -162,15 +168,15 @@ class RecoveryJournal:
             raise RecoveryCheckpointError("recovery stop evidence is invalid")
         try:
             parsed_quantity = Decimal(quantity)
-            parsed_protection = StopProtectionEvidence(protection)
+            parsed_protection = SimulatedProtectionStatus(protection)
         except (InvalidOperation, ValueError) as error:
             raise RecoveryCheckpointError("recovery position values are invalid") from error
-        return SimulatedOpenPosition(
+        return SimulatedPositionCheckpoint(
             plan_id=plan_id,
             symbol=symbol,
             quantity=parsed_quantity,
-            stop_protection=parsed_protection,
-            stop_reference=stop_reference,
+            simulated_protection=parsed_protection,
+            simulated_stop_reference=stop_reference,
         )
 
 
@@ -201,7 +207,9 @@ class LocalRecoveryCoordinator:
             return RecoveryResult(
                 disposition=RecoveryDisposition.PAUSED,
                 local_reconciliation_complete=False,
-                stop_protection_invariant_holds=self._all_stops_confirmed(checkpoint),
+                simulated_protection_invariant_holds=self._all_simulated_protections_ready(
+                    checkpoint
+                ),
                 entry_authority_enabled=False,
                 actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
                 reason="LOCAL_PROJECTION_MISMATCH",
@@ -216,13 +224,15 @@ class LocalRecoveryCoordinator:
             return RecoveryResult(
                 disposition=RecoveryDisposition.PAUSED,
                 local_reconciliation_complete=False,
-                stop_protection_invariant_holds=self._all_stops_confirmed(checkpoint),
+                simulated_protection_invariant_holds=self._all_simulated_protections_ready(
+                    checkpoint
+                ),
                 entry_authority_enabled=False,
                 actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
                 reason=reason,
             )
-        if not self._all_stops_confirmed(checkpoint):
-            return self._hard_halt("STOP_PROTECTION_UNCONFIRMED", checkpoint)
+        if not self._all_simulated_protections_ready(checkpoint):
+            return self._hard_halt("SIMULATED_PROTECTION_NOT_READY", checkpoint)
         durable_facts = intent_ledger.reconciliation_facts()
         if self._checkpoint_positions(checkpoint) != {
             symbol: abs(quantity) for symbol, quantity in durable_facts.positions_by_symbol.items()
@@ -230,7 +240,7 @@ class LocalRecoveryCoordinator:
             return RecoveryResult(
                 disposition=RecoveryDisposition.PAUSED,
                 local_reconciliation_complete=False,
-                stop_protection_invariant_holds=True,
+                simulated_protection_invariant_holds=True,
                 entry_authority_enabled=False,
                 actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
                 reason="DURABLE_POSITION_CHECKPOINT_MISMATCH",
@@ -243,7 +253,9 @@ class LocalRecoveryCoordinator:
             return RecoveryResult(
                 disposition=RecoveryDisposition.PAUSED,
                 local_reconciliation_complete=False,
-                stop_protection_invariant_holds=self._all_stops_confirmed(checkpoint),
+                simulated_protection_invariant_holds=self._all_simulated_protections_ready(
+                    checkpoint
+                ),
                 entry_authority_enabled=False,
                 actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
                 reason="RECONCILIATION_MISMATCH",
@@ -251,15 +263,15 @@ class LocalRecoveryCoordinator:
         return RecoveryResult(
             disposition=RecoveryDisposition.RECONCILED,
             local_reconciliation_complete=True,
-            stop_protection_invariant_holds=True,
+            simulated_protection_invariant_holds=True,
             entry_authority_enabled=False,
             actions=(),
             reason=None,
         )
 
     def network_partition(self, checkpoint: RecoveryCheckpoint) -> RecoveryResult:
-        if not self._all_stops_confirmed(checkpoint):
-            return self._hard_halt("NETWORK_PARTITION_STOP_UNCONFIRMED", checkpoint)
+        if not self._all_simulated_protections_ready(checkpoint):
+            return self._hard_halt("NETWORK_PARTITION_SIMULATED_PROTECTION_NOT_READY", checkpoint)
         actions: tuple[RecoveryAction, ...] = (
             RecoveryAction.PAUSE_NEW_ENTRIES,
             RecoveryAction.RECONCILE_REQUIRED,
@@ -268,16 +280,16 @@ class LocalRecoveryCoordinator:
         return RecoveryResult(
             disposition=RecoveryDisposition.PAUSED,
             local_reconciliation_complete=False,
-            stop_protection_invariant_holds=True,
+            simulated_protection_invariant_holds=True,
             entry_authority_enabled=False,
             actions=actions,
             reason="NETWORK_PARTITION",
         )
 
     @staticmethod
-    def _all_stops_confirmed(checkpoint: RecoveryCheckpoint) -> bool:
+    def _all_simulated_protections_ready(checkpoint: RecoveryCheckpoint) -> bool:
         return all(
-            position.stop_protection is StopProtectionEvidence.REMOTE_CONFIRMED
+            position.simulated_protection is SimulatedProtectionStatus.REHEARSAL_READY
             for position in checkpoint.positions
         )
 
@@ -294,7 +306,7 @@ class LocalRecoveryCoordinator:
         return RecoveryResult(
             disposition=RecoveryDisposition.HARD_HALTED,
             local_reconciliation_complete=False,
-            stop_protection_invariant_holds=self._all_stops_confirmed(checkpoint),
+            simulated_protection_invariant_holds=self._all_simulated_protections_ready(checkpoint),
             entry_authority_enabled=False,
             actions=(
                 RecoveryAction.PAUSE_NEW_ENTRIES,

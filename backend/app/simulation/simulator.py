@@ -5,20 +5,22 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
 from app.planning.fills import (
     ActualRiskPolicy,
-    ConfirmedPositionRisk,
     FillEvent,
+    PositionRiskAssessment,
 )
 from app.simulation.intent_ledger import (
+    _SIMULATED_QUERY_WRITE_CAPABILITY,
+    AbsenceEvidenceSource,
     BoundedAbsenceEvidence,
     DurableIntentLedger,
     DurableIntentRecord,
     DurableIntentStatus,
-    UnknownIntentObservation,
 )
 from app.simulation.models import (
     OrderRole,
@@ -65,6 +67,29 @@ class FaultPlan:
 
     def consume(self) -> SimulatedFault | None:
         return self.faults.popleft() if self.faults else None
+
+
+class SimulatedUnknownRemoteState(StrEnum):
+    """Injected rehearsal state; it is never exchange-confirmed evidence."""
+
+    UNRESOLVED = "UNRESOLVED"
+    ABSENT = "ABSENT"
+    PRESENT = "PRESENT"
+
+
+@dataclass(slots=True)
+class SimulatedUnknownQueryPlan:
+    states: deque[SimulatedUnknownRemoteState] = field(default_factory=deque)
+
+    @classmethod
+    def from_states(
+        cls,
+        states: Iterable[SimulatedUnknownRemoteState],
+    ) -> "SimulatedUnknownQueryPlan":
+        return cls(states=deque(states))
+
+    def consume(self) -> SimulatedUnknownRemoteState:
+        return self.states.popleft() if self.states else SimulatedUnknownRemoteState.UNRESOLVED
 
 
 @dataclass(slots=True)
@@ -118,6 +143,7 @@ class SpreadSlippageModel:
 class ExchangeSimulator:
     fault_plan: FaultPlan = field(default_factory=FaultPlan)
     fill_plan: FillSequencePlan = field(default_factory=FillSequencePlan)
+    unknown_query_plan: SimulatedUnknownQueryPlan = field(default_factory=SimulatedUnknownQueryPlan)
     intent_ledger: DurableIntentLedger | None = None
     actual_risk_policy: ActualRiskPolicy | None = None
     now_ms: int = 0
@@ -125,7 +151,9 @@ class ExchangeSimulator:
     _economic_keys: dict[str, str] = field(default_factory=dict)
     _events: list[SimulatorEvent] = field(default_factory=list)
     _event_counter: int = 0
-    _actual_risk_by_plan: dict[str, ConfirmedPositionRisk] = field(default_factory=dict)
+    _unknown_query_counter: int = 0
+    _unknown_remote_states: dict[str, SimulatedUnknownRemoteState] = field(default_factory=dict)
+    _actual_risk_by_plan: dict[str, PositionRiskAssessment] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.actual_risk_policy is None:
@@ -140,9 +168,14 @@ class ExchangeSimulator:
         *,
         intent_ledger: DurableIntentLedger,
         now_ms: int = 0,
+        unknown_query_plan: SimulatedUnknownQueryPlan | None = None,
     ) -> "ExchangeSimulator":
         """Rebuild local simulator state solely from durable intent and risk evidence."""
-        simulator = cls(intent_ledger=intent_ledger, now_ms=now_ms)
+        simulator = cls(
+            intent_ledger=intent_ledger,
+            now_ms=now_ms,
+            unknown_query_plan=unknown_query_plan or SimulatedUnknownQueryPlan(),
+        )
         for record in intent_ledger.list_intents():
             simulator._rehydrate_order(record)
         return simulator
@@ -184,6 +217,7 @@ class ExchangeSimulator:
         self._economic_keys[intent.economic_key] = intent.client_order_id
         if fault is SimulatedFault.UNKNOWN_503:
             order.status = SimulatedOrderStatus.UNKNOWN
+            self._unknown_remote_states[intent.client_order_id] = self.unknown_query_plan.consume()
             self.intent_ledger.mark_unknown(intent.client_order_id, unknown_at_ms=self.now_ms)
             raise UnknownOrderOutcome("unknown exchange outcome must be reconciled before retry")
 
@@ -263,16 +297,38 @@ class ExchangeSimulator:
         self._economic_keys.pop(order.intent.economic_key, None)
         self._schedule_event(order)
 
-    def record_unknown_absence_observation(
+    def query_unknown_source(
         self,
         client_order_id: str,
-        observation: UnknownIntentObservation,
+        source: AbsenceEvidenceSource,
     ) -> None:
+        if not isinstance(source, AbsenceEvidenceSource):
+            raise TypeError("unknown query source must be typed")
+        order = self._require_order(client_order_id)
+        if order.status is not SimulatedOrderStatus.UNKNOWN:
+            raise SimulatorError("only unknown orders can be queried")
         if self.intent_ledger is None:
             raise DurableIntentLedgerRequired(
-                "simulated absence observation requires a durable intent ledger"
+                "simulated unknown queries require a durable intent ledger"
             )
-        self.intent_ledger.record_absence_observation(client_order_id, observation)
+        remote_state = self._unknown_remote_states.get(
+            client_order_id,
+            SimulatedUnknownRemoteState.UNRESOLVED,
+        )
+        if remote_state is SimulatedUnknownRemoteState.UNRESOLVED:
+            raise SimulatorError("simulated remote state is unresolved; absence cannot be proven")
+        self._unknown_query_counter += 1
+        self.intent_ledger._record_simulated_query_observation(
+            client_order_id,
+            source=source,
+            found=remote_state is SimulatedUnknownRemoteState.PRESENT,
+            observed_at_ms=self.now_ms,
+            query_reference=(
+                f"sim-query:{client_order_id}:{source.value}:"
+                f"{self.now_ms}:{self._unknown_query_counter}"
+            ),
+            capability=_SIMULATED_QUERY_WRITE_CAPABILITY,
+        )
 
     def reconcile_unknown(
         self,
@@ -343,7 +399,7 @@ class ExchangeSimulator:
     def order(self, client_order_id: str) -> SimulatedOrder:
         return self._require_order(client_order_id)
 
-    def actual_risk(self, plan_id: str) -> ConfirmedPositionRisk:
+    def actual_risk(self, plan_id: str) -> PositionRiskAssessment:
         policy = self._risk_policy_for(plan_id)
         if policy is None:
             raise SimulatorError("no actual-risk policy is configured for this plan")
@@ -458,6 +514,10 @@ class ExchangeSimulator:
         )
 
     def _authorize_entry_risk(self, intent: SimulatedOrderIntent) -> None:
+        if self.intent_ledger is None:
+            raise DurableIntentLedgerRequired(
+                "simulated entry authorization requires a durable intent ledger"
+            )
         policy = self._risk_policy_for(intent.plan_id)
         if policy is None:
             raise EntryRiskBlocked("RISK_POLICY_MISSING")
@@ -467,6 +527,9 @@ class ExchangeSimulator:
         self._actual_risk_by_plan[intent.plan_id] = result
         if result.pending_entries_blocked:
             raise EntryRiskBlocked(result.reason or "ACTUAL_ENTRY_RISK_BLOCKED")
+        projected = self.intent_ledger.projected_entry_risk(intent)
+        if projected.blocked:
+            raise EntryRiskBlocked(projected.reason or "PROJECTED_ENTRY_RISK_BLOCKED")
 
     def _enforce_actual_entry_risk(
         self,
@@ -483,12 +546,10 @@ class ExchangeSimulator:
             return frozenset()
         cancelled_ids: set[str] = set()
         for order in self._orders.values():
-            if (
-                order.intent.plan_id != plan_id
-                or order.intent.role is not OrderRole.ENTRY
-                or order.status
-                not in {SimulatedOrderStatus.NEW, SimulatedOrderStatus.PARTIALLY_FILLED}
-            ):
+            if order.intent.role is not OrderRole.ENTRY or order.status not in {
+                SimulatedOrderStatus.NEW,
+                SimulatedOrderStatus.PARTIALLY_FILLED,
+            }:
                 continue
             order.status = SimulatedOrderStatus.CANCELLED
             cancelled_ids.add(order.intent.client_order_id)
@@ -505,7 +566,7 @@ class ExchangeSimulator:
             self._schedule_event(order, include_fill=False)
         return frozenset(cancelled_ids)
 
-    def _evaluate_actual_risk(self, policy: ActualRiskPolicy) -> ConfirmedPositionRisk:
+    def _evaluate_actual_risk(self, policy: ActualRiskPolicy) -> PositionRiskAssessment:
         if self.intent_ledger is None:
             raise DurableIntentLedgerRequired(
                 "actual-risk evaluation requires a durable intent ledger"
@@ -532,7 +593,7 @@ class ExchangeSimulator:
             return
         self.intent_ledger.record_simulated_protection(
             plan_id,
-            confirmed_position_quantity=fills.filled_quantity,
+            protected_position_quantity=fills.filled_quantity,
         )
 
     def _rehydrate_order(self, record: DurableIntentRecord) -> None:
@@ -563,6 +624,12 @@ class ExchangeSimulator:
             filled_quantity=record.filled_quantity,
         )
         self._economic_keys[record.economic_key] = record.client_order_id
+        if record.status in {
+            DurableIntentStatus.PREPARED,
+            DurableIntentStatus.SUBMITTING,
+            DurableIntentStatus.UNKNOWN,
+        }:
+            self._unknown_remote_states[record.client_order_id] = self.unknown_query_plan.consume()
 
     def _require_order(self, client_order_id: str) -> SimulatedOrder:
         order = self._orders.get(client_order_id)

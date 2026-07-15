@@ -28,7 +28,7 @@
 - Base revision: `022631d`; the second remediation worktree was checkpointed locally without a push.
 - Checkpoint commit: `bc05bac` (`fix: remediate second independent audit findings`).
 - `docs/SECOND_AUDIT_REMEDIATION_REPORT.md` records local PASS evidence for all code findings: 200 PostgreSQL-inclusive backend tests, true branch coverage 65.49% (`702/1072`), PostgreSQL populated-0001 migration/role tests, full Windows validation, and pre-commit.
-- The hosted GitHub Actions run for the new Gitleaks install has not executed from this uncommitted worktree. It is explicitly **NOT VERIFIED**, not a PASS.
+- The hosted GitHub Actions run for the Gitleaks install did not execute for checkpoint `bc05bac`. It is explicitly **NOT VERIFIED**, not a PASS.
 - Phase 14 remains **LOCKED**.
 
 ## Third Independent Audit Remediation
@@ -38,4 +38,12 @@
 - PostgreSQL-inclusive validation: 225 passed, 1 deliberate public-live deselection, 84.10% total coverage, and 68.40% true branch coverage (`844/1234`).
 - Windows full validation: 215 passed, 11 deliberate PostgreSQL/public-live deselections, 83.81% total coverage, and 67.83% true branch coverage (`837/1234`); frontend and security checks passed.
 - The CI Gitleaks install sequence passed in a Linux container. Hosted GitHub Actions remains **NOT VERIFIED**.
+- Phase 14 remains **LOCKED**.
+
+## Fourth Independent Audit Remediation
+
+- Base revision: `e19628e`; remediation remains uncommitted by explicit instruction.
+- `docs/FOURTH_AUDIT_REMEDIATION_REPORT.md` records red-first regressions, local SQLite/PostgreSQL evidence, exact test commands, and true branch-only module coverage.
+- Simulation protection and future exchange evidence are non-substitutable; no credential, signer, authenticated transport, test-order path, or real-order path was added.
+- Hosted GitHub Actions remains **NOT VERIFIED**.
 - Phase 14 remains **LOCKED**.

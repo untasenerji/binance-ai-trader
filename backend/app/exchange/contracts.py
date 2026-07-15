@@ -74,16 +74,78 @@ class AlgoOrderIntent:
     algo_type: AlgoOrderType
     trigger_price: Decimal
     close_position: bool
+    quantity: Decimal | None = None
 
     def __post_init__(self) -> None:
         if not self.client_algo_id or not self.symbol or self.trigger_price <= ZERO:
             raise ValueError("algo order fields are invalid")
-        if self.algo_type is AlgoOrderType.STOP_MARKET and not self.close_position:
-            raise ValueError("protective STOP_MARKET must close the full position")
+        if self.quantity is not None and (
+            not isinstance(self.quantity, Decimal)
+            or not self.quantity.is_finite()
+            or self.quantity <= ZERO
+        ):
+            raise ValueError("algo order quantity must be a positive finite Decimal")
+        if self.algo_type is AlgoOrderType.STOP_MARKET:
+            if not self.close_position:
+                raise ValueError("protective STOP_MARKET must use closePosition")
+            if self.quantity is not None:
+                raise ValueError("closePosition STOP_MARKET must not carry a quantity")
 
     @property
     def side(self) -> OrderSide:
         return OrderSide.SELL if self.direction is Direction.LONG else OrderSide.BUY
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeProtectionEvidence:
+    """Exchange-observed position and protective orders for a future live gate."""
+
+    plan_id: str
+    symbol: str
+    direction: Direction
+    position_quantity: Decimal
+    stop_order: AlgoOrderIntent
+    reduce_only_exit_reference: str
+    position_observed_at_ms: int
+    protection_observed_at_ms: int
+
+    def __post_init__(self) -> None:
+        if not self.plan_id or not self.symbol or not self.reduce_only_exit_reference:
+            raise ValueError("exchange protection evidence needs durable identifiers")
+        if (
+            not isinstance(self.position_quantity, Decimal)
+            or not self.position_quantity.is_finite()
+            or self.position_quantity <= ZERO
+        ):
+            raise ValueError("exchange position quantity must be a positive Decimal")
+        if not isinstance(self.direction, Direction):
+            raise TypeError("exchange protection direction must be typed")
+        if type(self.stop_order) is not AlgoOrderIntent:
+            raise TypeError("exchange protection requires a concrete algo stop record")
+        if (
+            self.stop_order.symbol != self.symbol
+            or self.stop_order.direction is not self.direction
+            or self.stop_order.algo_type is not AlgoOrderType.STOP_MARKET
+            or not self.stop_order.close_position
+            or self.stop_order.quantity is not None
+        ):
+            raise ValueError("exchange stop evidence does not protect the observed position")
+        timestamps = (self.position_observed_at_ms, self.protection_observed_at_ms)
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in timestamps
+        ):
+            raise ValueError("exchange protection timestamps must be non-negative integers")
+
+
+@dataclass(frozen=True, slots=True)
+class LiveProtectionEvidenceGate:
+    """Pure Phase-14 prerequisite; it cannot activate or submit anything."""
+
+    def require(self, evidence: object) -> ExchangeProtectionEvidence:
+        if type(evidence) is not ExchangeProtectionEvidence:
+            raise TypeError("live activation requires exchange protection evidence")
+        return evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,12 +268,22 @@ class ReconciliationSnapshot:
 
     @property
     def verified_stop_protected_symbols(self) -> frozenset[str]:
-        """Only close-position STOP_MARKET records can prove a protected position."""
-        return frozenset(
-            order.symbol
-            for order in self.algo_orders
-            if order.algo_type is AlgoOrderType.STOP_MARKET and order.close_position
-        )
+        """Require side-correct full-position stops for each observed nonzero position."""
+        verified: set[str] = set()
+        for symbol, position_quantity in self.positions_by_symbol.items():
+            if position_quantity == ZERO:
+                continue
+            expected_direction = Direction.LONG if position_quantity > ZERO else Direction.SHORT
+            if any(
+                order.symbol == symbol
+                and order.direction is expected_direction
+                and order.algo_type is AlgoOrderType.STOP_MARKET
+                and order.close_position
+                and order.quantity is None
+                for order in self.algo_orders
+            ):
+                verified.add(symbol)
+        return frozenset(verified)
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,7 +342,48 @@ class ReconciliationOutcome:
     unexpected_exchange_positions: tuple[PositionAmount, ...]
     missing_stop_symbols: tuple[str, ...]
     unresolved_unknown_intent_ids: tuple[str, ...]
-    reason_codes: tuple[ReconciliationReasonCode, ...]
+    audit_chain_valid: bool
+    replay_valid: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.audit_chain_valid, bool) or not isinstance(self.replay_valid, bool):
+            raise TypeError("reconciliation audit and replay health must be boolean")
+
+    @property
+    def reason_codes(self) -> tuple[ReconciliationReasonCode, ...]:
+        reasons: list[ReconciliationReasonCode] = []
+        typed_fields = (
+            (self.missing_normal_order_ids, ReconciliationReasonCode.MISSING_NORMAL_ORDER),
+            (
+                self.unexpected_normal_order_ids,
+                ReconciliationReasonCode.UNEXPECTED_NORMAL_ORDER,
+            ),
+            (self.missing_algo_order_ids, ReconciliationReasonCode.MISSING_ALGO_ORDER),
+            (self.unexpected_algo_order_ids, ReconciliationReasonCode.UNEXPECTED_ALGO_ORDER),
+            (
+                self.position_quantity_mismatches,
+                ReconciliationReasonCode.POSITION_QUANTITY_MISMATCH,
+            ),
+            (
+                self.missing_expected_positions,
+                ReconciliationReasonCode.MISSING_EXPECTED_POSITION,
+            ),
+            (
+                self.unexpected_exchange_positions,
+                ReconciliationReasonCode.UNEXPECTED_EXCHANGE_POSITION,
+            ),
+            (self.missing_stop_symbols, ReconciliationReasonCode.MISSING_STOP_PROTECTION),
+            (
+                self.unresolved_unknown_intent_ids,
+                ReconciliationReasonCode.UNRESOLVED_UNKNOWN_INTENT,
+            ),
+        )
+        reasons.extend(reason for values, reason in typed_fields if values)
+        if not self.audit_chain_valid:
+            reasons.append(ReconciliationReasonCode.AUDIT_CHAIN_INVALID)
+        if not self.replay_valid:
+            reasons.append(ReconciliationReasonCode.REPLAY_INVALID)
+        return tuple(reasons)
 
     @property
     def is_clean(self) -> bool:
@@ -285,7 +398,8 @@ class ReconciliationOutcome:
                 self.unexpected_exchange_positions,
                 self.missing_stop_symbols,
                 self.unresolved_unknown_intent_ids,
-                self.reason_codes,
+                not self.audit_chain_valid,
+                not self.replay_valid,
             )
         )
 
@@ -340,30 +454,6 @@ def reconcile_local_state(
         sorted(local.required_stop_symbols - snapshot.verified_stop_protected_symbols)
     )
     unresolved_unknowns = tuple(sorted(local.unresolved_unknown_intent_ids))
-    reason_codes: list[ReconciliationReasonCode] = []
-    if missing_normal:
-        reason_codes.append(ReconciliationReasonCode.MISSING_NORMAL_ORDER)
-    if unexpected_normal:
-        reason_codes.append(ReconciliationReasonCode.UNEXPECTED_NORMAL_ORDER)
-    if missing_algo:
-        reason_codes.append(ReconciliationReasonCode.MISSING_ALGO_ORDER)
-    if unexpected_algo:
-        reason_codes.append(ReconciliationReasonCode.UNEXPECTED_ALGO_ORDER)
-    if mismatches:
-        reason_codes.append(ReconciliationReasonCode.POSITION_QUANTITY_MISMATCH)
-    if missing_positions:
-        reason_codes.append(ReconciliationReasonCode.MISSING_EXPECTED_POSITION)
-    if unexpected_positions:
-        reason_codes.append(ReconciliationReasonCode.UNEXPECTED_EXCHANGE_POSITION)
-    if missing_stops:
-        reason_codes.append(ReconciliationReasonCode.MISSING_STOP_PROTECTION)
-    if unresolved_unknowns:
-        reason_codes.append(ReconciliationReasonCode.UNRESOLVED_UNKNOWN_INTENT)
-    if not local.audit_chain_valid:
-        reason_codes.append(ReconciliationReasonCode.AUDIT_CHAIN_INVALID)
-    if not local.replay_valid:
-        reason_codes.append(ReconciliationReasonCode.REPLAY_INVALID)
-
     return ReconciliationOutcome(
         missing_normal_order_ids=missing_normal,
         unexpected_normal_order_ids=unexpected_normal,
@@ -374,7 +464,8 @@ def reconcile_local_state(
         unexpected_exchange_positions=tuple(unexpected_positions),
         missing_stop_symbols=missing_stops,
         unresolved_unknown_intent_ids=unresolved_unknowns,
-        reason_codes=tuple(reason_codes),
+        audit_chain_valid=local.audit_chain_valid,
+        replay_valid=local.replay_valid,
     )
 
 

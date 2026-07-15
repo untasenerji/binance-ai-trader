@@ -295,7 +295,7 @@ def _repair_legacy_audit(bind: sa.Connection) -> None:
     canonical_by_event_id: dict[str, dict[str, Any]] = {}
     projection_states: dict[str, ProjectionState] = {}
     repaired_rows: list[dict[str, Any]] = []
-    reconciliation_rows: list[dict[str, str]] = []
+    reconciliation_rows: list[dict[str, Any]] = []
     for sequence, row in enumerate(rows, start=1):
         event_id = str(row["event_id"])
         source = str(row["source"])
@@ -350,6 +350,7 @@ def _repair_legacy_audit(bind: sa.Connection) -> None:
                             ).hexdigest(),
                             "status": "RECONCILIATION_REQUIRED",
                             "reason": "LEGACY_TRANSITION_UNREPLAYABLE",
+                            "created_at": datetime.now(UTC),
                         }
                     )
             final_fingerprint = _semantic_fingerprint(

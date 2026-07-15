@@ -24,7 +24,7 @@
 
 - Historical reports mislabeled 83.73% and 84.06% combined total coverage as branch coverage. Current PostgreSQL-inclusive local validation produced 200 passed, 1 public-live deselection, 83.01% total coverage, 65.49% true branch coverage (`702/1072`), JUnit XML, and coverage JSON/XML.
 - CI now provisions PostgreSQL and uploads JUnit/coverage artifacts. Hosted GitHub Actions execution is **NOT VERIFIED** locally and is not recorded as a pass.
-- `docs/AUDIT_REMEDIATION_REPORT.md` and `docs/SECOND_AUDIT_REMEDIATION_REPORT.md` record the exact commands and evidence. The second-audit base revision is `022631d`; its worktree remains intentionally uncommitted.
+- `docs/AUDIT_REMEDIATION_REPORT.md` and `docs/SECOND_AUDIT_REMEDIATION_REPORT.md` record the exact commands and evidence. The second-audit base revision is `022631d`; its implementation was subsequently checkpointed as `bc05bac`.
 
 ## Safety Confirmation
 

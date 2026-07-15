@@ -7,7 +7,7 @@
 
 - `docs/THREAT_MODEL.md` covering assets, trust boundaries, threats, controls, residual risk, and Phase 14 gates.
 - `scripts/dependency-scan.ps1`, enforced by `scripts/check.ps1`, using `pip-audit` and a full `npm audit --audit-level=high` scan.
-- A durable atomic `RecoveryJournal` with strict schema decoding for local simulated recovery evidence.
+- A durable atomic `RecoveryJournal` with strict schema decoding for rehearsal-only simulated recovery evidence.
 - `LocalRecoveryCoordinator`, which never grants entry authority and hard-halts when audit evidence or stop protection is invalid.
 - Network-partition handling that pauses entries and requires reconciliation plus stop re-verification.
 
@@ -32,7 +32,7 @@
 
 ## Scope Boundary
 
-`REMOTE_CONFIRMED` is a local simulated recovery certificate, never an authenticated Binance query. The project did not inspect credentials, open a user stream, send `/order/test`, or send a real order. Actual exchange-side stop confirmation remains a required Phase 14 check after explicit local consent.
+`REHEARSAL_READY` and `SimulatedProtectionEvidence` describe only local simulated stop/reduce intent readiness. They are structurally distinct from `ExchangeProtectionEvidence` and can never satisfy the future live evidence gate. The project did not inspect credentials, open a user stream, send `/order/test`, or send a real order. Actual exchange-side position and stop confirmation remains a required Phase 14 check after explicit local consent.
 
 ## Outcome
 

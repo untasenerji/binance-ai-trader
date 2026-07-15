@@ -46,7 +46,6 @@ def actual_risk_policy_for(
         effective_equity_usdt=Decimal("100000"),
         protective_stop_reference=f"{plan_id}-simulated-stop",
         reduce_only_exit_reference=f"{plan_id}-simulated-reduce-only-exit",
-        stop_confirmed=True,
     )
 
 
