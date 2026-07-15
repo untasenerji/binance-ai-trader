@@ -7,8 +7,7 @@ import pytest
 
 from app.domain.types import Direction
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner, WalkForwardTrainingError
-from app.strategy.models import Candle, FrozenStrategy, SignalCandidate
-from app.strategy.strategies import VolatilityBreakoutStrategy
+from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, StrategySpecification
 
 
 def _candle(index: int, close: Decimal) -> Candle:
@@ -96,7 +95,7 @@ def test_walk_forward_fits_only_the_train_slice_then_uses_a_frozen_snapshot() ->
         )
     )
     windows = WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-        lambda: VolatilityBreakoutStrategy(lookback=2),
+        StrategySpecification.volatility_breakout(lookback=2),
         candles,
         timeframe="1m",
         costs=_costs(),
@@ -105,7 +104,7 @@ def test_walk_forward_fits_only_the_train_slice_then_uses_a_frozen_snapshot() ->
         _candle(index, Decimal("500") + Decimal(index)) for index in range(4, 7)
     )
     changed_windows = WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-        lambda: VolatilityBreakoutStrategy(lookback=2),
+        StrategySpecification.volatility_breakout(lookback=2),
         changed_held_out,
         timeframe="1m",
         costs=_costs(),

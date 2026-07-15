@@ -17,7 +17,6 @@ from alembic import command
 from app.domain.types import Direction
 from app.exchange.contracts import (
     AlgoOrderIntent,
-    AlgoOrderType,
     LocalReconciliationState,
     ReconciliationSnapshot,
     reconcile_local_state,
@@ -31,7 +30,7 @@ from app.persistence.models import (
     DurableOrderIntent,
 )
 from app.persistence.replay import ReplayRunner
-from app.planning.fills import ActualRiskPolicy, FillEvent
+from app.planning.fills import AccountPortfolioEnvelope, ActualRiskPolicy, FillEvent
 from app.simulation.intent_ledger import (
     BoundedAbsenceEvidenceError,
     ClientOrderNamespace,
@@ -82,15 +81,23 @@ def _policy(
         funding_buffer_rate=Decimal("0"),
         funding_interval_count=0,
         risk_budget=risk_budget,
-        max_symbol_exposure_usdt=max_symbol_exposure,
-        max_total_exposure_usdt=max_total_exposure,
-        existing_symbol_exposure_usdt=Decimal("0"),
-        existing_total_exposure_usdt=Decimal("0"),
         effective_leverage=leverage,
-        required_reserve_usdt=Decimal("0"),
-        effective_equity_usdt=equity,
         protective_stop_reference=f"{plan_id}-expected-algo-stop",
         reduce_only_exit_reference=f"{plan_id}-expected-reduce-exit",
+        portfolio_envelope=AccountPortfolioEnvelope(
+            account_scope="fifth-audit-account",
+            version=1,
+            verified_account_equity_usdt=equity,
+            bot_equity_cap_usdt=equity,
+            required_reserve_usdt=Decimal("0"),
+            max_total_exposure_usdt=max_total_exposure,
+            max_symbol_exposure_usdt=max_symbol_exposure,
+            max_required_margin_usdt=equity,
+            daily_remaining_risk_usdt=Decimal("1000000"),
+            weekly_remaining_risk_usdt=Decimal("1000000"),
+            open_position_count=0,
+            pending_order_count=0,
+        ),
     )
 
 
@@ -236,7 +243,7 @@ def test_fill_risk_block_and_pending_stage_cancellation_commit_atomically(
     restarted = durable_intent_ledger.reopen_after_restart()
 
     assert restarted.intent(f"{plan_id}-stage-1").status is DurableIntentStatus.FILLED
-    assert restarted.intent(f"{plan_id}-stage-2").status is DurableIntentStatus.CANCELLED
+    assert restarted.intent(f"{plan_id}-stage-2").status is DurableIntentStatus.CANCEL_REQUIRED
     assert restarted.actual_risk_state(plan_id).pending_entries_blocked
     assert restarted.risk_reduction_requirement(plan_id).reason
 
@@ -458,7 +465,7 @@ def _candles() -> tuple[Candle, ...]:
 def test_walk_forward_rejects_unprovable_custom_trainer_global_scalar() -> None:
     with pytest.raises(WalkForwardTrainingError, match="trusted|custom|isolate"):
         WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-            _GlobalsBypassTrainer,
+            _GlobalsBypassTrainer,  # type: ignore[arg-type]
             _candles(),
             timeframe="1m",
             costs=BacktestCosts(
@@ -503,13 +510,22 @@ def test_reconciliation_matches_durable_expected_algo_stop(
     )
     facts = durable_intent_ledger.reopen_after_restart().reconciliation_facts()
     expected_quantity = Decimal("0.01") if direction is Direction.LONG else Decimal("-0.01")
+    contract = facts.expected_stop_contracts[0]
     stop = AlgoOrderIntent(
-        client_algo_id=policy.protective_stop_reference,
-        symbol=policy.symbol,
-        direction=direction,
-        algo_type=AlgoOrderType.STOP_MARKET,
-        trigger_price=policy.worst_stop_exit_price,
-        close_position=True,
+        client_algo_id=contract.client_algo_id,
+        symbol=contract.symbol,
+        direction=contract.position_side,
+        algo_type=contract.algo_type,
+        trigger_price=contract.trigger_price,
+        close_position=contract.close_position,
+        working_type=contract.working_type,
+        status=contract.active_status,
+        plan_id=contract.plan_id,
+        policy_version=contract.policy_version,
+        account_envelope_version=contract.account_envelope_version,
+        policy_fingerprint=contract.policy_fingerprint,
+        account_envelope_fingerprint=contract.account_envelope_fingerprint,
+        stop_contract_fingerprint=contract.fingerprint,
     )
     local = LocalReconciliationState(
         positions_by_symbol=facts.positions_by_symbol,
@@ -519,6 +535,7 @@ def test_reconciliation_matches_durable_expected_algo_stop(
         unresolved_unknown_intent_ids=facts.unresolved_unknown_intent_ids,
         audit_chain_valid=True,
         replay_valid=True,
+        expected_stop_contracts=facts.expected_stop_contracts,
     )
     clean = reconcile_local_state(
         local=local,
@@ -679,7 +696,7 @@ def test_sqlite_policy_owner_migration_downgrades_and_reapplies(tmp_path: Path) 
     try:
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0010_runtime_policy_owner"
+                "0011_forward_invariants"
             )
     finally:
         engine.dispose()

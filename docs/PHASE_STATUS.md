@@ -57,3 +57,13 @@
 - Hosted GitHub Actions and external `live_public` connectivity remain **NOT VERIFIED**.
 - No API key, signer, authenticated transport, testnet path, test order, or live-order path was added.
 - Phase 14 remains **LOCKED**.
+
+## Sixth Independent Audit Remediation
+
+- Base revision: `cd3b4dc48dd4fd571654acd56aa901cf0d708ec3`; no remediation commit was created because the audit requires results first.
+- `docs/SIXTH_AUDIT_REMEDIATION_REPORT.md` records red-first closure evidence for all five HIGH and three MEDIUM findings.
+- Deterministic backend validation: 356 non-PostgreSQL tests and 24 real-PostgreSQL tests passed; the credential-free `live_public` test remains deliberately **NOT VERIFIED**.
+- True app branch coverage is 66.36% (`1136/1712`); all configured high-risk module gates are at or above 70%.
+- Populated published-`0009` and populated-`0008` upgrades, replay/recovery, SQLite retry, PostgreSQL role graphs, transaction crash/restart, financial properties, stop contracts, walk-forward isolation, and adversarial redaction passed locally.
+- Hosted GitHub Actions remains **NOT VERIFIED**. No API key, signer, authenticated transport, testnet path, test order, or live-order path was added.
+- Phase 14 remains **LOCKED**.

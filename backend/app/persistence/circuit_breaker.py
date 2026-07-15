@@ -1,12 +1,52 @@
 """Fail-closed persistence authorization for any future entry-intent path."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from app.exchange.contracts import ReconciliationOutcome, ReconciliationSnapshot
 
 
 class PersistenceUnavailable(RuntimeError):
     code = "DATABASE_AUDIT_FAILURE"
+
+
+@dataclass(frozen=True, slots=True)
+class EntryAuthorizationCapability:
+    """A short-lived authorization derived from durable evidence for one check."""
+
+    grant_id: str
+    issued_at: datetime
+    expires_at: datetime
+    audit_last_record_hash: str
+    reconciliation_fingerprint: str
+    exchange_snapshot_fingerprint: str
+    account_envelope_fingerprints: tuple[str, ...]
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not self.grant_id:
+            raise ValueError("entry capability grant ID is required")
+        if self.issued_at.tzinfo is None or self.expires_at.tzinfo is None:
+            raise ValueError("entry capability timestamps must be timezone-aware")
+        if self.expires_at <= self.issued_at:
+            raise ValueError("entry capability expiry must follow issuance")
+        for value in (
+            self.audit_last_record_hash,
+            self.reconciliation_fingerprint,
+            self.exchange_snapshot_fingerprint,
+            self.fingerprint,
+            *self.account_envelope_fingerprints,
+        ):
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError("entry capability fingerprints must be SHA-256 values")
+
+    def require_current(self, now: datetime | None = None) -> None:
+        checked_at = now or datetime.now(UTC)
+        if checked_at.tzinfo is None:
+            raise ValueError("entry capability check time must be timezone-aware")
+        if checked_at.astimezone(UTC) >= self.expires_at.astimezone(UTC):
+            raise PersistenceUnavailable("ENTRY_AUTHORIZATION_CAPABILITY_EXPIRED")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,10 +95,11 @@ class PersistenceRecoveryEvidence:
 class PersistenceCircuitBreaker:
     """Starts closed and can reopen only from repository-derived recovery evidence."""
 
-    __slots__ = ("__halted_reason",)
+    __slots__ = ("__durable_revokers", "__halted_reason")
 
     def __init__(self) -> None:
         self.__halted_reason: str | None = "STARTUP_RECONCILIATION_REQUIRED"
+        self.__durable_revokers: list[Callable[[str], None]] = []
 
     @property
     def halted_reason(self) -> str | None:
@@ -70,6 +111,17 @@ class PersistenceCircuitBreaker:
 
     def record_write_failure(self, error: Exception) -> None:
         self.__halted_reason = f"{PersistenceUnavailable.code}: {type(error).__name__}"
+        for revoke in tuple(self.__durable_revokers):
+            try:
+                revoke(self.__halted_reason)
+            except Exception:
+                # The in-memory halt remains closed if durable storage is unavailable.
+                continue
+
+    def _bind_durable_revoker(self, revoke: Callable[[str], None]) -> None:
+        """Bind a deny-only persistence callback; it cannot issue authorization."""
+        if revoke not in self.__durable_revokers:
+            self.__durable_revokers.append(revoke)
 
     def require_new_entries_allowed(self) -> None:
         if not self.new_entries_allowed:
@@ -104,15 +156,23 @@ class PersistenceCircuitBreaker:
             raise TypeError("audit repository did not return PersistenceRecoveryEvidence")
         if not evidence.is_complete:
             raise PersistenceUnavailable("RECOVERY_EVIDENCE_INCOMPLETE")
+        intent_ledger.issue_entry_authorization_capability(
+            evidence=evidence,
+            reconciliation_snapshot=reconciliation_snapshot,
+        )
         self.__halted_reason = None
         return evidence
 
 
 @dataclass(frozen=True, slots=True)
 class EntryIntentAuthorizationGate:
-    """Local-only gate; it deliberately has no order, network, or exchange behavior."""
+    """Requests a freshly derived durable capability for every entry check."""
 
-    persistence_breaker: PersistenceCircuitBreaker
+    capability_provider: Callable[[], EntryAuthorizationCapability]
 
-    def authorize_new_entry_intent(self) -> None:
-        self.persistence_breaker.require_new_entries_allowed()
+    def authorize_new_entry_intent(self) -> EntryAuthorizationCapability:
+        capability = self.capability_provider()
+        if type(capability) is not EntryAuthorizationCapability:
+            raise PersistenceUnavailable("ENTRY_AUTHORIZATION_CAPABILITY_INVALID")
+        capability.require_current()
+        return capability

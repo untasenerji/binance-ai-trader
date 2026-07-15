@@ -4,10 +4,11 @@ import hashlib
 import json
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import ClassVar
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -15,23 +16,53 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
-from app.persistence.circuit_breaker import EntryIntentAuthorizationGate, PersistenceCircuitBreaker
+from app.exchange.contracts import (
+    AlgoOrderIntent,
+    AlgoOrderStatus,
+    AlgoOrderType,
+    ExpectedStopContract,
+    LocalReconciliationState,
+    OrderSide,
+    ReconciliationOutcome,
+    ReconciliationSnapshot,
+    StopQuantitySemantics,
+    StopWorkingType,
+    reconcile_local_state,
+)
+from app.persistence.audit import AuditChainHeadSnapshot, verify_hash_chain
+from app.persistence.circuit_breaker import (
+    EntryAuthorizationCapability,
+    EntryIntentAuthorizationGate,
+    PersistenceCircuitBreaker,
+    PersistenceRecoveryEvidence,
+    PersistenceUnavailable,
+)
 from app.persistence.models import (
+    AuditChainHead,
+    AuditEvent,
+    DurableAccountPortfolioEnvelope,
     DurableActualRiskPolicy,
     DurableActualRiskPolicyVersion,
     DurableActualRiskState,
+    DurableEntryAuthorizationGrant,
+    DurableEntryAuthorizationRevocation,
     DurableIntentAbsenceObservation,
     DurableIntentFill,
     DurableOrderIntent,
     DurableRiskReductionRequirement,
     DurableSimulatedProtection,
+    TradePlanProjection,
 )
+from app.persistence.replay import ReplayRunner
 from app.planning.fills import (
+    AccountPortfolioEnvelope,
     ActualRiskPolicy,
+    ExposureSourceState,
     FillEvent,
     FillLedger,
     FillLedgerError,
     FillLedgerReceipt,
+    PortfolioExposureSlice,
     PortfolioRiskAssessment,
     PositionRiskAssessment,
     RiskReductionRequirement,
@@ -47,6 +78,7 @@ class DurableIntentStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
     NEW = "NEW"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    CANCEL_REQUIRED = "CANCEL_REQUIRED"
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
     ABSENT = "ABSENT"
@@ -71,6 +103,7 @@ _UNRESOLVED_STATUSES = frozenset(
         DurableIntentStatus.PREPARED,
         DurableIntentStatus.SUBMITTING,
         DurableIntentStatus.UNKNOWN,
+        DurableIntentStatus.CANCEL_REQUIRED,
     }
 )
 _KNOWN_OUTCOME_STATUSES = frozenset(
@@ -92,6 +125,7 @@ _TERMINAL_STATUSES = frozenset(
 )
 _REQUIRED_ABSENCE_SOURCES = frozenset(AbsenceEvidenceSource)
 _SIMULATED_QUERY_WRITE_CAPABILITY = object()
+_ENTRY_CAPABILITY_TTL = timedelta(minutes=5)
 
 
 class IntentLedgerError(RuntimeError):
@@ -293,6 +327,7 @@ class DurableReconciliationFacts:
     algo_order_client_ids: frozenset[str]
     required_stop_symbols: frozenset[str]
     unresolved_unknown_intent_ids: frozenset[str]
+    expected_stop_contracts: tuple[ExpectedStopContract, ...]
 
 
 class DurableIntentLedger:
@@ -308,17 +343,633 @@ class DurableIntentLedger:
         self._persistence_breaker = (
             persistence_breaker if persistence_breaker is not None else PersistenceCircuitBreaker()
         )
-        self._entry_gate = EntryIntentAuthorizationGate(self._persistence_breaker)
-
-    @property
-    def persistence_breaker(self) -> PersistenceCircuitBreaker:
-        return self._persistence_breaker
+        self._entry_gate = EntryIntentAuthorizationGate(self._derive_entry_authorization_capability)
+        self._persistence_breaker._bind_durable_revoker(  # noqa: SLF001
+            self._record_entry_authorization_revocation
+        )
 
     def reopen_after_restart(self) -> "DurableIntentLedger":
         """Return a fresh local ledger instance over the same durable store."""
         return DurableIntentLedger(
-            self._session_factory, persistence_breaker=self._persistence_breaker
+            self._session_factory,
+            persistence_breaker=PersistenceCircuitBreaker(),
         )
+
+    def issue_entry_authorization_capability(
+        self,
+        *,
+        evidence: PersistenceRecoveryEvidence,
+        reconciliation_snapshot: ReconciliationSnapshot,
+    ) -> EntryAuthorizationCapability:
+        """Persist a time-bounded grant only after rechecking repository facts."""
+        if type(evidence) is not PersistenceRecoveryEvidence:
+            raise TypeError("entry authorization requires typed recovery evidence")
+        if type(reconciliation_snapshot) is not ReconciliationSnapshot:
+            raise TypeError("entry authorization requires a typed exchange snapshot")
+        if not evidence.is_complete:
+            raise PersistenceUnavailable("RECOVERY_EVIDENCE_INCOMPLETE")
+
+        issued_at = datetime.now(UTC)
+        expires_at = issued_at + _ENTRY_CAPABILITY_TTL
+        grant_id = f"entry-capability-{uuid4().hex}"
+        try:
+            with self._session_factory.begin() as session:
+                events, head, replay_valid, projection_matches = self._audit_replay_state(session)
+                if (
+                    not replay_valid
+                    or not projection_matches
+                    or head.event_count != evidence.audit_event_count
+                    or head.last_sequence != evidence.audit_last_sequence
+                    or head.last_record_hash != evidence.audit_last_record_hash
+                ):
+                    raise PersistenceUnavailable("RECOVERY_AUDIT_STATE_CHANGED")
+                probe = next(
+                    (
+                        event
+                        for event in events
+                        if event.event_id == evidence.write_probe_event_id
+                        and event.source == "persistence"
+                        and event.event_type == "persistence_recovery_probe"
+                    ),
+                    None,
+                )
+                if probe is None:
+                    raise PersistenceUnavailable("RECOVERY_WRITE_PROBE_MISSING")
+                prior_grant = session.scalar(
+                    select(DurableEntryAuthorizationGrant)
+                    .order_by(DurableEntryAuthorizationGrant.id.desc())
+                    .limit(1)
+                )
+                if prior_grant is not None:
+                    prior_probe_sequence = session.scalar(
+                        select(AuditEvent.chain_sequence).where(
+                            AuditEvent.event_id == prior_grant.recovery_probe_event_id
+                        )
+                    )
+                    if prior_probe_sequence is None or probe.chain_sequence <= prior_probe_sequence:
+                        raise PersistenceUnavailable("RECOVERY_WRITE_PROBE_NOT_FRESH")
+
+                facts = self._reconciliation_facts_from_session(session)
+                if facts.unresolved_unknown_intent_ids:
+                    raise PersistenceUnavailable("RECOVERY_UNRESOLVED_INTENTS_PRESENT")
+                local = self._local_reconciliation_state(
+                    facts,
+                    audit_chain_valid=True,
+                    replay_valid=replay_valid,
+                )
+                outcome = reconcile_local_state(
+                    local=local,
+                    snapshot=reconciliation_snapshot,
+                )
+                if not outcome.is_clean:
+                    raise PersistenceUnavailable("RECOVERY_RECONCILIATION_NOT_CLEAN")
+                reconciliation_fingerprint = self._reconciliation_fingerprint(outcome)
+                if reconciliation_fingerprint != self._reconciliation_fingerprint(
+                    evidence.reconciliation_outcome
+                ):
+                    raise PersistenceUnavailable("RECOVERY_RECONCILIATION_CHANGED")
+
+                snapshot_payload = self._snapshot_payload(reconciliation_snapshot)
+                snapshot_fingerprint = self._canonical_fingerprint(snapshot_payload)
+                local_state_payload = self._local_state_payload(facts)
+                local_state_fingerprint = self._canonical_fingerprint(local_state_payload)
+                grant_payload = {
+                    "audit_event_count": head.event_count,
+                    "audit_last_record_hash": head.last_record_hash,
+                    "audit_last_sequence": head.last_sequence,
+                    "exchange_snapshot_fingerprint": snapshot_fingerprint,
+                    "expires_at": expires_at.isoformat(),
+                    "grant_id": grant_id,
+                    "issued_at": issued_at.isoformat(),
+                    "local_state_fingerprint": local_state_fingerprint,
+                    "projection_matches_replay": projection_matches,
+                    "reconciliation_clean": outcome.is_clean,
+                    "reconciliation_fingerprint": reconciliation_fingerprint,
+                    "recovery_probe_event_id": evidence.write_probe_event_id,
+                    "recovery_status": "VERIFIED",
+                    "replay_valid": replay_valid,
+                    "unresolved_intent_count": len(facts.unresolved_unknown_intent_ids),
+                }
+                capability_fingerprint = self._canonical_fingerprint(grant_payload)
+                session.add(
+                    DurableEntryAuthorizationGrant(
+                        grant_id=grant_id,
+                        recovery_probe_event_id=evidence.write_probe_event_id,
+                        recovery_status="VERIFIED",
+                        issued_at=issued_at,
+                        expires_at=expires_at,
+                        audit_event_count=head.event_count,
+                        audit_last_sequence=head.last_sequence,
+                        audit_last_record_hash=head.last_record_hash,
+                        replay_valid=replay_valid,
+                        projection_matches_replay=projection_matches,
+                        unresolved_intent_count=len(facts.unresolved_unknown_intent_ids),
+                        reconciliation_clean=outcome.is_clean,
+                        reconciliation_fingerprint=reconciliation_fingerprint,
+                        exchange_snapshot=snapshot_payload,
+                        exchange_snapshot_fingerprint=snapshot_fingerprint,
+                        local_state_snapshot=local_state_payload,
+                        local_state_fingerprint=local_state_fingerprint,
+                        capability_fingerprint=capability_fingerprint,
+                    )
+                )
+                session.flush()
+        except PersistenceUnavailable:
+            raise
+        except Exception as error:
+            self._persistence_breaker.record_write_failure(error)
+            raise
+        return self._derive_entry_authorization_capability()
+
+    def _derive_entry_authorization_capability(self) -> EntryAuthorizationCapability:
+        """Revalidate every durable authority dimension for the current entry check."""
+        with self._session_factory() as session:
+            grant = session.scalar(
+                select(DurableEntryAuthorizationGrant)
+                .order_by(DurableEntryAuthorizationGrant.id.desc())
+                .limit(1)
+            )
+            if grant is None:
+                raise PersistenceUnavailable("DURABLE_ENTRY_AUTHORIZATION_MISSING")
+            revoked = session.scalar(
+                select(DurableEntryAuthorizationRevocation.id)
+                .where(DurableEntryAuthorizationRevocation.grant_id == grant.grant_id)
+                .limit(1)
+            )
+            if revoked is not None:
+                raise PersistenceUnavailable("DURABLE_ENTRY_AUTHORIZATION_REVOKED")
+            if (
+                grant.recovery_status != "VERIFIED"
+                or not grant.replay_valid
+                or not grant.projection_matches_replay
+                or not grant.reconciliation_clean
+                or grant.unresolved_intent_count != 0
+            ):
+                raise PersistenceUnavailable("DURABLE_RECOVERY_STATUS_INVALID")
+
+            issued_at = self._as_utc(grant.issued_at)
+            expires_at = self._as_utc(grant.expires_at)
+            if datetime.now(UTC) >= expires_at:
+                raise PersistenceUnavailable("ENTRY_AUTHORIZATION_CAPABILITY_EXPIRED")
+            expected_grant_fingerprint = self._canonical_fingerprint(
+                {
+                    "audit_event_count": grant.audit_event_count,
+                    "audit_last_record_hash": grant.audit_last_record_hash,
+                    "audit_last_sequence": grant.audit_last_sequence,
+                    "exchange_snapshot_fingerprint": (grant.exchange_snapshot_fingerprint),
+                    "expires_at": expires_at.isoformat(),
+                    "grant_id": grant.grant_id,
+                    "issued_at": issued_at.isoformat(),
+                    "local_state_fingerprint": grant.local_state_fingerprint,
+                    "projection_matches_replay": grant.projection_matches_replay,
+                    "reconciliation_clean": grant.reconciliation_clean,
+                    "reconciliation_fingerprint": (grant.reconciliation_fingerprint),
+                    "recovery_probe_event_id": grant.recovery_probe_event_id,
+                    "recovery_status": grant.recovery_status,
+                    "replay_valid": grant.replay_valid,
+                    "unresolved_intent_count": grant.unresolved_intent_count,
+                }
+            )
+            if expected_grant_fingerprint != grant.capability_fingerprint:
+                raise PersistenceUnavailable("DURABLE_ENTRY_AUTHORIZATION_TAMPERED")
+
+            _, head, replay_valid, projection_matches = self._audit_replay_state(session)
+            if (
+                not replay_valid
+                or not projection_matches
+                or head.event_count != grant.audit_event_count
+                or head.last_sequence != grant.audit_last_sequence
+                or head.last_record_hash != grant.audit_last_record_hash
+            ):
+                raise PersistenceUnavailable("DURABLE_AUDIT_REPLAY_CHANGED")
+
+            facts = self._reconciliation_facts_from_session(session)
+            if facts.unresolved_unknown_intent_ids:
+                raise PersistenceUnavailable("DURABLE_UNRESOLVED_INTENT_PRESENT")
+            snapshot_payload = dict(grant.exchange_snapshot)
+            if self._canonical_fingerprint(snapshot_payload) != grant.exchange_snapshot_fingerprint:
+                raise PersistenceUnavailable("EXCHANGE_SNAPSHOT_EVIDENCE_TAMPERED")
+            snapshot = self._snapshot_from_payload(snapshot_payload)
+            local_state_payload = dict(grant.local_state_snapshot)
+            if self._canonical_fingerprint(local_state_payload) != grant.local_state_fingerprint:
+                raise PersistenceUnavailable("LOCAL_RECONCILIATION_EVIDENCE_TAMPERED")
+            baseline_local = self._local_state_from_payload(
+                local_state_payload,
+                audit_chain_valid=replay_valid,
+                replay_valid=replay_valid,
+            )
+            outcome = reconcile_local_state(
+                local=baseline_local,
+                snapshot=snapshot,
+            )
+            if (
+                not outcome.is_clean
+                or self._reconciliation_fingerprint(outcome) != grant.reconciliation_fingerprint
+            ):
+                raise PersistenceUnavailable("DURABLE_RECONCILIATION_NOT_CLEAN")
+
+            envelope_fingerprints = self._current_envelope_fingerprints(session)
+            capability_fingerprint = self._canonical_fingerprint(
+                {
+                    "account_envelope_fingerprints": envelope_fingerprints,
+                    "current_local_state_fingerprint": self._local_state_fingerprint(facts),
+                    "current_unresolved_intent_count": len(facts.unresolved_unknown_intent_ids),
+                    "durable_grant_fingerprint": grant.capability_fingerprint,
+                }
+            )
+            return EntryAuthorizationCapability(
+                grant_id=grant.grant_id,
+                issued_at=issued_at,
+                expires_at=expires_at,
+                audit_last_record_hash=grant.audit_last_record_hash,
+                reconciliation_fingerprint=grant.reconciliation_fingerprint,
+                exchange_snapshot_fingerprint=grant.exchange_snapshot_fingerprint,
+                account_envelope_fingerprints=envelope_fingerprints,
+                fingerprint=capability_fingerprint,
+            )
+
+    def _record_entry_authorization_revocation(self, reason: str) -> None:
+        with self._session_factory.begin() as session:
+            grant = session.scalar(
+                select(DurableEntryAuthorizationGrant)
+                .order_by(DurableEntryAuthorizationGrant.id.desc())
+                .limit(1)
+            )
+            if grant is None:
+                return
+            existing = session.scalar(
+                select(DurableEntryAuthorizationRevocation.id)
+                .where(DurableEntryAuthorizationRevocation.grant_id == grant.grant_id)
+                .limit(1)
+            )
+            if existing is not None:
+                return
+            session.add(
+                DurableEntryAuthorizationRevocation(
+                    revocation_id=f"entry-revocation-{uuid4().hex}",
+                    grant_id=grant.grant_id,
+                    reason=reason[:128],
+                )
+            )
+
+    @staticmethod
+    def _canonical_fingerprint(payload: object) -> str:
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+    @classmethod
+    def _snapshot_payload(cls, snapshot: ReconciliationSnapshot) -> dict[str, object]:
+        return {
+            "algo_order_client_ids": sorted(snapshot.algo_order_client_ids),
+            "algo_orders": [
+                {
+                    "account_envelope_fingerprint": order.account_envelope_fingerprint,
+                    "account_envelope_version": order.account_envelope_version,
+                    "algo_type": order.algo_type.value,
+                    "client_algo_id": order.client_algo_id,
+                    "close_position": order.close_position,
+                    "direction": order.direction.value,
+                    "plan_id": order.plan_id,
+                    "policy_fingerprint": order.policy_fingerprint,
+                    "policy_version": order.policy_version,
+                    "quantity": (None if order.quantity is None else format(order.quantity, "f")),
+                    "status": order.status.value,
+                    "stop_contract_fingerprint": order.stop_contract_fingerprint,
+                    "symbol": order.symbol,
+                    "trigger_price": format(order.trigger_price, "f"),
+                    "working_type": order.working_type.value,
+                }
+                for order in sorted(snapshot.algo_orders, key=lambda item: item.client_algo_id)
+            ],
+            "normal_order_client_ids": sorted(snapshot.normal_order_client_ids),
+            "positions_by_symbol": {
+                symbol: format(quantity, "f")
+                for symbol, quantity in sorted(snapshot.positions_by_symbol.items())
+            },
+            "stop_protected_symbols": sorted(snapshot.stop_protected_symbols),
+        }
+
+    @staticmethod
+    def _snapshot_from_payload(payload: dict[str, object]) -> ReconciliationSnapshot:
+        raw_positions = payload.get("positions_by_symbol")
+        raw_orders = payload.get("algo_orders")
+        if not isinstance(raw_positions, dict) or not isinstance(raw_orders, list):
+            raise PersistenceUnavailable("EXCHANGE_SNAPSHOT_EVIDENCE_INVALID")
+        try:
+            positions = {
+                str(symbol): Decimal(str(quantity)) for symbol, quantity in raw_positions.items()
+            }
+            orders = tuple(
+                AlgoOrderIntent(
+                    client_algo_id=str(item["client_algo_id"]),
+                    symbol=str(item["symbol"]),
+                    direction=Direction(str(item["direction"])),
+                    algo_type=AlgoOrderType(str(item["algo_type"])),
+                    trigger_price=Decimal(str(item["trigger_price"])),
+                    close_position=bool(item["close_position"]),
+                    quantity=(
+                        None if item.get("quantity") is None else Decimal(str(item["quantity"]))
+                    ),
+                    working_type=StopWorkingType(str(item["working_type"])),
+                    status=AlgoOrderStatus(str(item["status"])),
+                    plan_id=(None if item.get("plan_id") is None else str(item["plan_id"])),
+                    policy_version=(
+                        None if item.get("policy_version") is None else int(item["policy_version"])
+                    ),
+                    account_envelope_version=(
+                        None
+                        if item.get("account_envelope_version") is None
+                        else int(item["account_envelope_version"])
+                    ),
+                    policy_fingerprint=(
+                        None
+                        if item.get("policy_fingerprint") is None
+                        else str(item["policy_fingerprint"])
+                    ),
+                    account_envelope_fingerprint=(
+                        None
+                        if item.get("account_envelope_fingerprint") is None
+                        else str(item["account_envelope_fingerprint"])
+                    ),
+                    stop_contract_fingerprint=(
+                        None
+                        if item.get("stop_contract_fingerprint") is None
+                        else str(item["stop_contract_fingerprint"])
+                    ),
+                )
+                for raw_item in raw_orders
+                if isinstance(raw_item, dict)
+                for item in (raw_item,)
+            )
+            if len(orders) != len(raw_orders):
+                raise ValueError("all Algo observations must be structured")
+            return ReconciliationSnapshot(
+                positions_by_symbol=positions,
+                normal_order_client_ids=DurableIntentLedger._string_set_from_payload(
+                    payload,
+                    "normal_order_client_ids",
+                    "EXCHANGE_SNAPSHOT_EVIDENCE_INVALID",
+                ),
+                algo_order_client_ids=DurableIntentLedger._string_set_from_payload(
+                    payload,
+                    "algo_order_client_ids",
+                    "EXCHANGE_SNAPSHOT_EVIDENCE_INVALID",
+                ),
+                algo_orders=orders,
+                stop_protected_symbols=DurableIntentLedger._string_set_from_payload(
+                    payload,
+                    "stop_protected_symbols",
+                    "EXCHANGE_SNAPSHOT_EVIDENCE_INVALID",
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise PersistenceUnavailable("EXCHANGE_SNAPSHOT_EVIDENCE_INVALID") from error
+
+    @classmethod
+    def _local_state_fingerprint(cls, facts: DurableReconciliationFacts) -> str:
+        return cls._canonical_fingerprint(cls._local_state_payload(facts))
+
+    @staticmethod
+    def _local_state_payload(facts: DurableReconciliationFacts) -> dict[str, object]:
+        return {
+            "algo_order_client_ids": sorted(facts.algo_order_client_ids),
+            "expected_stop_contracts": [
+                {
+                    "account_envelope_fingerprint": (contract.account_envelope_fingerprint),
+                    "account_envelope_version": contract.account_envelope_version,
+                    "active_status": contract.active_status.value,
+                    "algo_type": contract.algo_type.value,
+                    "client_algo_id": contract.client_algo_id,
+                    "close_position": contract.close_position,
+                    "expected_order_side": contract.expected_order_side.value,
+                    "fingerprint": contract.fingerprint,
+                    "plan_id": contract.plan_id,
+                    "policy_fingerprint": contract.policy_fingerprint,
+                    "policy_version": contract.policy_version,
+                    "position_side": contract.position_side.value,
+                    "quantity_semantics": contract.quantity_semantics.value,
+                    "symbol": contract.symbol,
+                    "trigger_price": format(contract.trigger_price, "f"),
+                    "working_type": contract.working_type.value,
+                }
+                for contract in sorted(
+                    facts.expected_stop_contracts,
+                    key=lambda item: item.client_algo_id,
+                )
+            ],
+            "normal_order_client_ids": sorted(facts.normal_order_client_ids),
+            "positions_by_symbol": {
+                symbol: format(quantity, "f")
+                for symbol, quantity in sorted(facts.positions_by_symbol.items())
+            },
+            "required_stop_symbols": sorted(facts.required_stop_symbols),
+            "unresolved_unknown_intent_ids": sorted(facts.unresolved_unknown_intent_ids),
+        }
+
+    @staticmethod
+    def _local_state_from_payload(
+        payload: dict[str, object],
+        *,
+        audit_chain_valid: bool,
+        replay_valid: bool,
+    ) -> LocalReconciliationState:
+        raw_positions = payload.get("positions_by_symbol")
+        raw_contracts = payload.get("expected_stop_contracts")
+        if not isinstance(raw_positions, dict) or not isinstance(raw_contracts, list):
+            raise PersistenceUnavailable("LOCAL_RECONCILIATION_EVIDENCE_INVALID")
+        try:
+            contracts = tuple(
+                ExpectedStopContract(
+                    plan_id=str(item["plan_id"]),
+                    symbol=str(item["symbol"]),
+                    position_side=Direction(str(item["position_side"])),
+                    expected_order_side=OrderSide(str(item["expected_order_side"])),
+                    client_algo_id=str(item["client_algo_id"]),
+                    algo_type=AlgoOrderType(str(item["algo_type"])),
+                    trigger_price=Decimal(str(item["trigger_price"])),
+                    working_type=StopWorkingType(str(item["working_type"])),
+                    close_position=bool(item["close_position"]),
+                    quantity_semantics=StopQuantitySemantics(str(item["quantity_semantics"])),
+                    active_status=AlgoOrderStatus(str(item["active_status"])),
+                    policy_version=int(item["policy_version"]),
+                    account_envelope_version=int(item["account_envelope_version"]),
+                    policy_fingerprint=str(item["policy_fingerprint"]),
+                    account_envelope_fingerprint=str(item["account_envelope_fingerprint"]),
+                    fingerprint=str(item["fingerprint"]),
+                )
+                for raw_item in raw_contracts
+                if isinstance(raw_item, dict)
+                for item in (raw_item,)
+            )
+            if len(contracts) != len(raw_contracts):
+                raise ValueError("all local stop contracts must be structured")
+            return LocalReconciliationState(
+                positions_by_symbol={
+                    str(symbol): Decimal(str(quantity))
+                    for symbol, quantity in raw_positions.items()
+                },
+                normal_order_client_ids=DurableIntentLedger._string_set_from_payload(
+                    payload,
+                    "normal_order_client_ids",
+                    "LOCAL_RECONCILIATION_EVIDENCE_INVALID",
+                ),
+                algo_order_client_ids=DurableIntentLedger._string_set_from_payload(
+                    payload,
+                    "algo_order_client_ids",
+                    "LOCAL_RECONCILIATION_EVIDENCE_INVALID",
+                ),
+                required_stop_symbols=DurableIntentLedger._string_set_from_payload(
+                    payload,
+                    "required_stop_symbols",
+                    "LOCAL_RECONCILIATION_EVIDENCE_INVALID",
+                ),
+                unresolved_unknown_intent_ids=DurableIntentLedger._string_set_from_payload(
+                    payload,
+                    "unresolved_unknown_intent_ids",
+                    "LOCAL_RECONCILIATION_EVIDENCE_INVALID",
+                ),
+                audit_chain_valid=audit_chain_valid,
+                replay_valid=replay_valid,
+                expected_stop_contracts=contracts,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise PersistenceUnavailable("LOCAL_RECONCILIATION_EVIDENCE_INVALID") from error
+
+    @staticmethod
+    def _string_set_from_payload(
+        payload: dict[str, object],
+        key: str,
+        error_code: str,
+    ) -> frozenset[str]:
+        values = payload.get(key)
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            raise PersistenceUnavailable(error_code)
+        return frozenset(values)
+
+    @classmethod
+    def _reconciliation_fingerprint(cls, outcome: ReconciliationOutcome) -> str:
+        return cls._canonical_fingerprint(
+            {
+                "audit_chain_valid": outcome.audit_chain_valid,
+                "invalid_stop_contract_ids": list(outcome.invalid_stop_contract_ids),
+                "is_clean": outcome.is_clean,
+                "missing_algo_order_ids": list(outcome.missing_algo_order_ids),
+                "missing_expected_positions": [
+                    [item.symbol, format(item.quantity, "f")]
+                    for item in outcome.missing_expected_positions
+                ],
+                "missing_normal_order_ids": list(outcome.missing_normal_order_ids),
+                "missing_stop_symbols": list(outcome.missing_stop_symbols),
+                "position_quantity_mismatches": [
+                    [
+                        item.symbol,
+                        format(item.expected_quantity, "f"),
+                        format(item.exchange_quantity, "f"),
+                    ]
+                    for item in outcome.position_quantity_mismatches
+                ],
+                "replay_valid": outcome.replay_valid,
+                "unexpected_algo_order_ids": list(outcome.unexpected_algo_order_ids),
+                "unexpected_exchange_positions": [
+                    [item.symbol, format(item.quantity, "f")]
+                    for item in outcome.unexpected_exchange_positions
+                ],
+                "unexpected_normal_order_ids": list(outcome.unexpected_normal_order_ids),
+                "unresolved_unknown_intent_ids": list(outcome.unresolved_unknown_intent_ids),
+            }
+        )
+
+    @staticmethod
+    def _local_reconciliation_state(
+        facts: DurableReconciliationFacts,
+        *,
+        audit_chain_valid: bool,
+        replay_valid: bool,
+    ) -> LocalReconciliationState:
+        return LocalReconciliationState(
+            positions_by_symbol=facts.positions_by_symbol,
+            normal_order_client_ids=facts.normal_order_client_ids,
+            algo_order_client_ids=facts.algo_order_client_ids,
+            required_stop_symbols=facts.required_stop_symbols,
+            unresolved_unknown_intent_ids=facts.unresolved_unknown_intent_ids,
+            audit_chain_valid=audit_chain_valid,
+            replay_valid=replay_valid,
+            expected_stop_contracts=facts.expected_stop_contracts,
+        )
+
+    @staticmethod
+    def _audit_replay_state(
+        session: Session,
+    ) -> tuple[tuple[AuditEvent, ...], AuditChainHead, bool, bool]:
+        events = tuple(
+            session.scalars(select(AuditEvent).order_by(AuditEvent.chain_sequence.asc()))
+        )
+        head = session.get(AuditChainHead, 1)
+        if head is None:
+            raise PersistenceUnavailable("DURABLE_AUDIT_HEAD_MISSING")
+        chain_valid = verify_hash_chain(
+            events,
+            expected_count=head.event_count,
+            expected_last_sequence=head.last_sequence,
+            expected_last_record_hash=head.last_record_hash,
+        )
+        replay = ReplayRunner().replay(
+            events,
+            AuditChainHeadSnapshot(
+                event_count=head.event_count,
+                last_sequence=head.last_sequence,
+                last_record_hash=head.last_record_hash,
+            ),
+        )
+        projected_states = {
+            row.plan_id: row.state for row in session.scalars(select(TradePlanProjection))
+        }
+        replayed_states = {plan_id: state.value for plan_id, state in replay.plan_states.items()}
+        return (
+            events,
+            head,
+            chain_valid and replay.is_valid,
+            replay.is_valid and projected_states == replayed_states,
+        )
+
+    @classmethod
+    def _current_envelope_fingerprints(cls, session: Session) -> tuple[str, ...]:
+        latest_by_scope: dict[str, DurableAccountPortfolioEnvelope] = {}
+        for row in session.scalars(
+            select(DurableAccountPortfolioEnvelope).order_by(
+                DurableAccountPortfolioEnvelope.account_scope.asc(),
+                DurableAccountPortfolioEnvelope.version.asc(),
+            )
+        ):
+            cls._envelope_from_row(row)
+            latest_by_scope[row.account_scope] = row
+        if len(latest_by_scope) > 1:
+            raise PersistenceUnavailable("MULTIPLE_ACCOUNT_ENVELOPE_SCOPES")
+        for row in latest_by_scope.values():
+            if row.reconciliation_required:
+                raise PersistenceUnavailable("ACCOUNT_ENVELOPE_RECONCILIATION_REQUIRED")
+        current = {
+            (row.account_scope, row.version): row.envelope_fingerprint
+            for row in latest_by_scope.values()
+        }
+        for base in session.scalars(select(DurableActualRiskPolicy)):
+            policy = cls._validated_policy_lineage(session, base)
+            key = (
+                policy.portfolio_envelope.account_scope,
+                policy.portfolio_envelope.version,
+            )
+            if current.get(key) != policy.portfolio_envelope.fingerprint:
+                raise PersistenceUnavailable("ACCOUNT_ENVELOPE_POLICY_LINK_STALE")
+        return tuple(sorted(current.values()))
 
     def register_actual_risk_policy(self, policy: ActualRiskPolicy) -> ActualRiskPolicy:
         """Persist an immutable entry policy before it can authorize simulator fills."""
@@ -327,13 +978,19 @@ class DurableIntentLedger:
         fingerprint = self._policy_fingerprint(policy)
         try:
             with self._session_factory.begin() as session:
+                self._register_portfolio_envelope(session, policy.portfolio_envelope)
+                self._assert_account_envelope_consistency(
+                    session,
+                    policy.portfolio_envelope,
+                    excluding_plan_id=policy.plan_id,
+                )
                 existing = session.get(DurableActualRiskPolicy, policy.plan_id)
                 if existing is not None:
                     if existing.policy_fingerprint != fingerprint:
                         raise DurableRiskPolicyError(
                             "plan ID already has a different durable actual-risk policy"
                         )
-                    return self._policy_from_row(existing)
+                    return self._policy_from_row(session, existing)
                 session.add(
                     DurableActualRiskPolicy(
                         plan_id=policy.plan_id,
@@ -357,6 +1014,9 @@ class DurableIntentLedger:
                         effective_equity_usdt=format(policy.effective_equity_usdt, "f"),
                         protective_stop_reference=policy.protective_stop_reference,
                         reduce_only_exit_reference=policy.reduce_only_exit_reference,
+                        account_envelope_scope=policy.portfolio_envelope.account_scope,
+                        account_envelope_version=policy.portfolio_envelope.version,
+                        account_envelope_fingerprint=policy.portfolio_envelope.fingerprint,
                         policy_fingerprint=fingerprint,
                     )
                 )
@@ -407,13 +1067,15 @@ class DurableIntentLedger:
                 base = session.get(DurableActualRiskPolicy, policy.plan_id)
                 if base is None:
                     raise DurableRiskPolicyError("base actual-risk policy must exist first")
-                base_policy = self._policy_from_row(base)
+                base_policy = self._policy_from_row(session, base)
                 self._validated_policy_lineage(session, base)
                 if (
                     policy.symbol != base_policy.symbol
                     or policy.direction is not base_policy.direction
                     or policy.protective_stop_reference != base_policy.protective_stop_reference
                     or policy.reduce_only_exit_reference != base_policy.reduce_only_exit_reference
+                    or policy.portfolio_envelope.fingerprint
+                    != base_policy.portfolio_envelope.fingerprint
                 ):
                     raise DurableRiskPolicyError(
                         "policy revisions must preserve plan identity and protection references"
@@ -543,8 +1205,6 @@ class DurableIntentLedger:
             return self._projected_portfolio_risk(session, policy, proposed_intent=intent)
 
     def prepare(self, intent: SimulatedOrderIntent) -> DurableIntentRecord:
-        if intent.role is OrderRole.ENTRY:
-            self._entry_gate.authorize_new_entry_intent()
         try:
             with self._session_factory.begin() as session:
                 latest = self._latest_for_economic_key(session, intent.economic_key)
@@ -563,6 +1223,8 @@ class DurableIntentLedger:
                 )
                 if duplicate_client is not None:
                     raise UnresolvedEconomicAction("client order ID already has a durable intent")
+                if intent.role is OrderRole.ENTRY:
+                    self._entry_gate.authorize_new_entry_intent()
                 record = DurableOrderIntent(
                     economic_key=intent.economic_key,
                     attempt_number=attempt_number,
@@ -581,6 +1243,8 @@ class DurableIntentLedger:
                 session.flush()
                 return self._to_record(record)
         except UnresolvedEconomicAction:
+            raise
+        except PersistenceUnavailable:
             raise
         except IntegrityError as error:
             raise UnresolvedEconomicAction(
@@ -618,8 +1282,13 @@ class DurableIntentLedger:
             timestamp_value=unknown_at_ms,
         )
 
-    def record_fill(self, event: FillEvent) -> FillLedgerReceipt:
-        """Persist one immutable trade fact before it can influence an outcome or risk gate."""
+    def record_fill(
+        self,
+        event: FillEvent,
+        *,
+        materialize_simulated_protection: bool = False,
+    ) -> FillLedgerReceipt:
+        """Atomically persist a fill and every resulting rehearsal safety decision."""
         try:
             with self._session_factory.begin() as session:
                 intent = self._record_for_update(session, event.client_order_id)
@@ -652,8 +1321,6 @@ class DurableIntentLedger:
                         average_fill_price=fill_ledger.average_fill_price,
                         total_fee=fill_ledger.total_fee,
                     )
-                if status is DurableIntentStatus.FILLED:
-                    raise IntentLifecycleError("terminal durable intent cannot receive a new fill")
                 receipt = fill_ledger.record(event)
                 planned_quantity = Decimal(intent.quantity)
                 if receipt.filled_quantity > planned_quantity:
@@ -671,7 +1338,10 @@ class DurableIntentLedger:
                         occurred_at=event.occurred_at.astimezone(UTC),
                     )
                 )
-                if status is not DurableIntentStatus.CANCELLED:
+                if status not in {
+                    DurableIntentStatus.CANCELLED,
+                    DurableIntentStatus.CANCEL_REQUIRED,
+                }:
                     target_status = (
                         DurableIntentStatus.FILLED
                         if receipt.filled_quantity == planned_quantity
@@ -688,22 +1358,37 @@ class DurableIntentLedger:
                             filled_quantity=receipt.filled_quantity,
                         )
                     intent.status = target_status.value
+                elif (
+                    status is DurableIntentStatus.CANCEL_REQUIRED
+                    and receipt.filled_quantity == planned_quantity
+                ):
+                    intent.status = DurableIntentStatus.FILLED.value
                 intent.filled_quantity = format(receipt.filled_quantity, "f")
                 intent.updated_at = datetime.now(UTC)
                 session.flush()
+                self._fill_uow_checkpoint("after_fill_persisted")
                 if intent.role == OrderRole.ENTRY.value:
                     self._cancel_unfilled_superseding_attempts(session, intent)
                     policy = session.get(DurableActualRiskPolicy, intent.plan_id)
-                    if policy is not None:
-                        result = self._recalculate_actual_risk(session, policy)
-                        if (
-                            result.pending_entries_blocked
-                            and result.reason != "SIMULATED_PROTECTION_MISSING"
-                        ):
-                            self._cancel_known_active_entry_intents(session)
+                    if policy is None:
                         session.flush()
+                        return receipt
+                    self._fill_uow_checkpoint("before_protection_evaluation")
+                    if materialize_simulated_protection:
+                        self._materialize_simulated_protection_in_session(
+                            session,
+                            policy,
+                        )
+                    self._fill_uow_checkpoint("after_protection_evaluation")
+                    result = self._recalculate_actual_risk(session, policy)
+                    self._fill_uow_checkpoint("after_actual_risk")
+                    if result.pending_entries_blocked:
+                        self._fill_uow_checkpoint("before_pending_cancel")
+                        self._cancel_known_active_entry_intents(session)
+                        self._fill_uow_checkpoint("after_pending_cancel")
+                    session.flush()
                 return receipt
-        except (FillLedgerError, IntentLifecycleError):
+        except (DurableRiskPolicyError, FillLedgerError, IntentLifecycleError):
             raise
         except Exception as error:
             self._persistence_breaker.record_write_failure(error)
@@ -964,6 +1649,7 @@ class DurableIntentLedger:
                 DurableIntentStatus.PREPARED,
                 DurableIntentStatus.SUBMITTING,
                 DurableIntentStatus.UNKNOWN,
+                DurableIntentStatus.CANCEL_REQUIRED,
             )
             if any(record.status is status for record in records)
         }
@@ -971,55 +1657,88 @@ class DurableIntentLedger:
     def reconciliation_facts(self) -> DurableReconciliationFacts:
         """Derive local position and protection expectations from durable records only."""
         with self._session_factory() as session:
-            positions_by_symbol: dict[str, Decimal] = {}
-            required_stop_symbols: set[str] = set()
-            algo_order_client_ids: set[str] = set()
-            for state in session.scalars(select(DurableActualRiskState)):
-                policy = session.get(DurableActualRiskPolicy, state.plan_id)
-                protection = session.get(DurableSimulatedProtection, state.plan_id)
-                if policy is None or protection is None:
-                    raise DurableRiskPolicyError(
-                        "durable reconciliation facts require complete risk and protection records"
-                    )
-                quantity = Decimal(state.position_quantity)
-                if quantity <= ZERO:
-                    continue
-                signed_quantity = (
-                    quantity if Direction(policy.direction) is Direction.LONG else -quantity
-                )
-                positions_by_symbol[policy.symbol] = (
-                    positions_by_symbol.get(policy.symbol, ZERO) + signed_quantity
-                )
-                required_stop_symbols.add(policy.symbol)
-                if protection.stop_intent_reference != policy.protective_stop_reference:
-                    raise DurableRiskPolicyError(
-                        "durable expected Algo stop does not match its policy"
-                    )
-                # This is a local expected ID only. The snapshot still has to supply
-                # typed exchange-observed Algo evidence before reconciliation is clean.
-                algo_order_client_ids.add(policy.protective_stop_reference)
+            return self._reconciliation_facts_from_session(session)
 
-            active_normal_statuses = {
-                DurableIntentStatus.NEW.value,
-                DurableIntentStatus.PARTIALLY_FILLED.value,
-            }
-            normal_order_client_ids = frozenset(
-                row.client_order_id
-                for row in session.scalars(select(DurableOrderIntent))
-                if row.status in active_normal_statuses and row.role != OrderRole.STOP.value
+    @classmethod
+    def _reconciliation_facts_from_session(
+        cls,
+        session: Session,
+    ) -> DurableReconciliationFacts:
+        positions_by_symbol: dict[str, Decimal] = {}
+        required_stop_symbols: set[str] = set()
+        algo_order_client_ids: set[str] = set()
+        expected_stop_contracts: list[ExpectedStopContract] = []
+        for state in session.scalars(select(DurableActualRiskState)):
+            policy_row = session.get(DurableActualRiskPolicy, state.plan_id)
+            protection = session.get(DurableSimulatedProtection, state.plan_id)
+            if policy_row is None or protection is None:
+                raise DurableRiskPolicyError(
+                    "durable reconciliation facts require complete risk and protection records"
+                )
+            version_row = session.scalar(
+                select(DurableActualRiskPolicyVersion)
+                .where(DurableActualRiskPolicyVersion.plan_id == state.plan_id)
+                .order_by(DurableActualRiskPolicyVersion.version.desc())
+                .limit(1)
             )
-            unresolved_unknown_intent_ids = frozenset(
-                row.client_order_id
-                for row in session.scalars(select(DurableOrderIntent))
-                if row.status in {status.value for status in _UNRESOLVED_STATUSES}
+            active_row = policy_row if version_row is None else version_row
+            policy_version = 1 if version_row is None else version_row.version
+            policy = cls._policy_from_row(session, active_row)
+            quantity = Decimal(state.position_quantity)
+            if quantity <= ZERO:
+                continue
+            signed_quantity = quantity if policy.direction is Direction.LONG else -quantity
+            positions_by_symbol[policy.symbol] = (
+                positions_by_symbol.get(policy.symbol, ZERO) + signed_quantity
             )
-            return DurableReconciliationFacts(
-                positions_by_symbol=positions_by_symbol,
-                normal_order_client_ids=normal_order_client_ids,
-                algo_order_client_ids=frozenset(algo_order_client_ids),
-                required_stop_symbols=frozenset(required_stop_symbols),
-                unresolved_unknown_intent_ids=unresolved_unknown_intent_ids,
+            required_stop_symbols.add(policy.symbol)
+            if protection.stop_intent_reference != policy.protective_stop_reference:
+                raise DurableRiskPolicyError("durable expected Algo stop does not match its policy")
+            algo_order_client_ids.add(policy.protective_stop_reference)
+            expected_stop_contracts.append(
+                ExpectedStopContract(
+                    plan_id=policy.plan_id,
+                    symbol=policy.symbol,
+                    position_side=policy.direction,
+                    expected_order_side=(
+                        OrderSide.SELL if policy.direction is Direction.LONG else OrderSide.BUY
+                    ),
+                    client_algo_id=policy.protective_stop_reference,
+                    algo_type=AlgoOrderType.STOP_MARKET,
+                    trigger_price=policy.worst_stop_exit_price,
+                    working_type=StopWorkingType.MARK_PRICE,
+                    close_position=True,
+                    quantity_semantics=StopQuantitySemantics.CLOSE_POSITION_FULL,
+                    active_status=AlgoOrderStatus.NEW,
+                    policy_version=policy_version,
+                    account_envelope_version=policy.portfolio_envelope.version,
+                    policy_fingerprint=active_row.policy_fingerprint,
+                    account_envelope_fingerprint=(policy.portfolio_envelope.fingerprint),
+                )
             )
+
+        active_normal_statuses = {
+            DurableIntentStatus.NEW.value,
+            DurableIntentStatus.PARTIALLY_FILLED.value,
+        }
+        normal_order_client_ids = frozenset(
+            row.client_order_id
+            for row in session.scalars(select(DurableOrderIntent))
+            if row.status in active_normal_statuses and row.role != OrderRole.STOP.value
+        )
+        unresolved_unknown_intent_ids = frozenset(
+            row.client_order_id
+            for row in session.scalars(select(DurableOrderIntent))
+            if row.status in {status.value for status in _UNRESOLVED_STATUSES}
+        )
+        return DurableReconciliationFacts(
+            positions_by_symbol=positions_by_symbol,
+            normal_order_client_ids=normal_order_client_ids,
+            algo_order_client_ids=frozenset(algo_order_client_ids),
+            required_stop_symbols=frozenset(required_stop_symbols),
+            unresolved_unknown_intent_ids=unresolved_unknown_intent_ids,
+            expected_stop_contracts=tuple(expected_stop_contracts),
+        )
 
     def _transition_status(
         self,
@@ -1115,7 +1834,18 @@ class DurableIntentLedger:
                 DurableIntentStatus.CANCELLED,
             }:
                 return
+        if current is DurableIntentStatus.CANCEL_REQUIRED:
+            if target in {
+                DurableIntentStatus.CANCELLED,
+                DurableIntentStatus.PARTIALLY_FILLED,
+                DurableIntentStatus.FILLED,
+            }:
+                return
         raise IntentLifecycleError("known outcome violates the durable intent lifecycle")
+
+    @staticmethod
+    def _fill_uow_checkpoint(_phase: str) -> None:
+        """Crash-injection seam used to prove transaction boundaries in tests."""
 
     @classmethod
     def _to_record(cls, record: DurableOrderIntent) -> DurableIntentRecord:
@@ -1263,19 +1993,16 @@ class DurableIntentLedger:
         canonical = json.dumps(
             {
                 "direction": policy.direction.value,
-                "effective_equity_usdt": format(policy.effective_equity_usdt, "f"),
                 "effective_leverage": policy.effective_leverage,
-                "existing_symbol_exposure_usdt": format(policy.existing_symbol_exposure_usdt, "f"),
-                "existing_total_exposure_usdt": format(policy.existing_total_exposure_usdt, "f"),
                 "exit_fee_rate": format(policy.exit_fee_rate, "f"),
                 "funding_buffer_rate": format(policy.funding_buffer_rate, "f"),
                 "funding_interval_count": policy.funding_interval_count,
-                "max_symbol_exposure_usdt": format(policy.max_symbol_exposure_usdt, "f"),
-                "max_total_exposure_usdt": format(policy.max_total_exposure_usdt, "f"),
+                "account_envelope_fingerprint": policy.portfolio_envelope.fingerprint,
+                "account_envelope_scope": policy.portfolio_envelope.account_scope,
+                "account_envelope_version": policy.portfolio_envelope.version,
                 "plan_id": policy.plan_id,
                 "protective_stop_reference": policy.protective_stop_reference,
                 "reduce_only_exit_reference": policy.reduce_only_exit_reference,
-                "required_reserve_usdt": format(policy.required_reserve_usdt, "f"),
                 "risk_budget": format(policy.risk_budget, "f"),
                 "symbol": policy.symbol,
                 "worst_stop_exit_price": format(policy.worst_stop_exit_price, "f"),
@@ -1289,8 +2016,20 @@ class DurableIntentLedger:
     @classmethod
     def _policy_from_row(
         cls,
+        session: Session,
         row: DurableActualRiskPolicy | DurableActualRiskPolicyVersion,
     ) -> ActualRiskPolicy:
+        envelope_row = session.scalar(
+            select(DurableAccountPortfolioEnvelope).where(
+                DurableAccountPortfolioEnvelope.account_scope == row.account_envelope_scope,
+                DurableAccountPortfolioEnvelope.version == row.account_envelope_version,
+            )
+        )
+        if envelope_row is None:
+            raise DurableRiskPolicyError("durable account portfolio envelope is missing")
+        envelope = cls._envelope_from_row(envelope_row)
+        if envelope.fingerprint != row.account_envelope_fingerprint:
+            raise DurableRiskPolicyError("durable policy envelope fingerprint is invalid")
         policy = ActualRiskPolicy(
             plan_id=row.plan_id,
             symbol=row.symbol,
@@ -1300,15 +2039,10 @@ class DurableIntentLedger:
             funding_buffer_rate=Decimal(row.funding_buffer_rate),
             funding_interval_count=row.funding_interval_count,
             risk_budget=Decimal(row.risk_budget),
-            max_symbol_exposure_usdt=Decimal(row.max_symbol_exposure_usdt),
-            max_total_exposure_usdt=Decimal(row.max_total_exposure_usdt),
-            existing_symbol_exposure_usdt=Decimal(row.existing_symbol_exposure_usdt),
-            existing_total_exposure_usdt=Decimal(row.existing_total_exposure_usdt),
             effective_leverage=row.effective_leverage,
-            required_reserve_usdt=Decimal(row.required_reserve_usdt),
-            effective_equity_usdt=Decimal(row.effective_equity_usdt),
             protective_stop_reference=row.protective_stop_reference,
             reduce_only_exit_reference=row.reduce_only_exit_reference,
+            portfolio_envelope=envelope,
         )
         if row.policy_fingerprint != cls._policy_fingerprint(policy):
             raise DurableRiskPolicyError("durable actual-risk policy fingerprint is invalid")
@@ -1357,7 +2091,7 @@ class DurableIntentLedger:
         session: Session,
         base: DurableActualRiskPolicy,
     ) -> ActualRiskPolicy:
-        base_policy = cls._policy_from_row(base)
+        base_policy = cls._policy_from_row(session, base)
         latest = base_policy
         expected_version = 2
         versions = session.scalars(
@@ -1370,13 +2104,15 @@ class DurableIntentLedger:
                 raise DurableRiskPolicyError(
                     "durable actual-risk policy version lineage is not contiguous"
                 )
-            policy = cls._policy_from_row(row)
+            policy = cls._policy_from_row(session, row)
             if (
                 policy.plan_id != base_policy.plan_id
                 or policy.symbol != base_policy.symbol
                 or policy.direction is not base_policy.direction
                 or policy.protective_stop_reference != base_policy.protective_stop_reference
                 or policy.reduce_only_exit_reference != base_policy.reduce_only_exit_reference
+                or policy.portfolio_envelope.fingerprint
+                != base_policy.portfolio_envelope.fingerprint
             ):
                 raise DurableRiskPolicyError(
                     "durable policy lineage changed plan, side, symbol, or protection identity"
@@ -1408,8 +2144,124 @@ class DurableIntentLedger:
             "effective_equity_usdt": format(policy.effective_equity_usdt, "f"),
             "protective_stop_reference": policy.protective_stop_reference,
             "reduce_only_exit_reference": policy.reduce_only_exit_reference,
+            "account_envelope_scope": policy.portfolio_envelope.account_scope,
+            "account_envelope_version": policy.portfolio_envelope.version,
+            "account_envelope_fingerprint": policy.portfolio_envelope.fingerprint,
             "policy_fingerprint": fingerprint,
         }
+
+    @staticmethod
+    def _envelope_from_row(row: DurableAccountPortfolioEnvelope) -> AccountPortfolioEnvelope:
+        try:
+            raw_slices = row.exposure_slices
+            if not isinstance(raw_slices, list):
+                raise TypeError("durable exposure slices must be a list")
+            slices = tuple(
+                PortfolioExposureSlice(
+                    slice_id=str(item["slice_id"]),
+                    plan_id=str(item["plan_id"]),
+                    symbol=str(item["symbol"]),
+                    direction=Direction(str(item["direction"])),
+                    notional_usdt=Decimal(str(item["notional_usdt"])),
+                    leverage=int(str(item["leverage"])),
+                    required_margin_usdt=Decimal(str(item["required_margin_usdt"])),
+                    source_state=ExposureSourceState(str(item["source_state"])),
+                )
+                for raw_item in raw_slices
+                if isinstance(raw_item, dict)
+                for item in (raw_item,)
+            )
+            if len(slices) != len(raw_slices):
+                raise TypeError("durable exposure slices must be structured")
+            envelope = AccountPortfolioEnvelope(
+                account_scope=row.account_scope,
+                version=row.version,
+                verified_account_equity_usdt=Decimal(row.verified_account_equity_usdt),
+                bot_equity_cap_usdt=Decimal(row.bot_equity_cap_usdt),
+                required_reserve_usdt=Decimal(row.required_reserve_usdt),
+                max_total_exposure_usdt=Decimal(row.max_total_exposure_usdt),
+                max_symbol_exposure_usdt=Decimal(row.max_symbol_exposure_usdt),
+                max_required_margin_usdt=Decimal(row.max_required_margin_usdt),
+                daily_remaining_risk_usdt=Decimal(row.daily_remaining_risk_usdt),
+                weekly_remaining_risk_usdt=Decimal(row.weekly_remaining_risk_usdt),
+                open_position_count=row.open_position_count,
+                pending_order_count=row.pending_order_count,
+                exposure_slices=slices,
+                reconciliation_required=row.reconciliation_required,
+                fingerprint=row.envelope_fingerprint,
+            )
+        except (KeyError, TypeError, ValueError, FillLedgerError) as error:
+            raise DurableRiskPolicyError("durable account envelope is invalid") from error
+        return envelope
+
+    @classmethod
+    def _register_portfolio_envelope(
+        cls,
+        session: Session,
+        envelope: AccountPortfolioEnvelope,
+    ) -> None:
+        existing = session.scalar(
+            select(DurableAccountPortfolioEnvelope).where(
+                DurableAccountPortfolioEnvelope.account_scope == envelope.account_scope,
+                DurableAccountPortfolioEnvelope.version == envelope.version,
+            )
+        )
+        if existing is not None:
+            if existing.envelope_fingerprint != envelope.fingerprint:
+                raise DurableRiskPolicyError(
+                    "account envelope version already has conflicting durable facts"
+                )
+            cls._envelope_from_row(existing)
+            return
+        session.add(
+            DurableAccountPortfolioEnvelope(
+                account_scope=envelope.account_scope,
+                version=envelope.version,
+                verified_account_equity_usdt=format(envelope.verified_account_equity_usdt, "f"),
+                bot_equity_cap_usdt=format(envelope.bot_equity_cap_usdt, "f"),
+                required_reserve_usdt=format(envelope.required_reserve_usdt, "f"),
+                max_total_exposure_usdt=format(envelope.max_total_exposure_usdt, "f"),
+                max_symbol_exposure_usdt=format(envelope.max_symbol_exposure_usdt, "f"),
+                max_required_margin_usdt=format(envelope.max_required_margin_usdt, "f"),
+                daily_remaining_risk_usdt=format(envelope.daily_remaining_risk_usdt, "f"),
+                weekly_remaining_risk_usdt=format(envelope.weekly_remaining_risk_usdt, "f"),
+                open_position_count=envelope.open_position_count,
+                pending_order_count=envelope.pending_order_count,
+                exposure_slices=[item.canonical_record() for item in envelope.exposure_slices],
+                reconciliation_required=envelope.reconciliation_required,
+                envelope_fingerprint=envelope.fingerprint,
+            )
+        )
+
+    @classmethod
+    def _assert_account_envelope_consistency(
+        cls,
+        session: Session,
+        envelope: AccountPortfolioEnvelope,
+        *,
+        excluding_plan_id: str | None = None,
+    ) -> None:
+        if envelope.reconciliation_required:
+            raise DurableRiskPolicyError("account portfolio envelope requires reconciliation")
+        latest_version = session.scalar(
+            select(DurableAccountPortfolioEnvelope.version)
+            .where(DurableAccountPortfolioEnvelope.account_scope == envelope.account_scope)
+            .order_by(DurableAccountPortfolioEnvelope.version.desc())
+            .limit(1)
+        )
+        if latest_version is not None and latest_version != envelope.version:
+            raise DurableRiskPolicyError("account portfolio envelope version is stale")
+        scoped_policies = select(DurableActualRiskPolicy).where(
+            DurableActualRiskPolicy.account_envelope_scope == envelope.account_scope
+        )
+        for row in session.scalars(scoped_policies):
+            if excluding_plan_id is not None and row.plan_id == excluding_plan_id:
+                continue
+            active_policy = cls._validated_policy_lineage(session, row)
+            if active_policy.portfolio_envelope.fingerprint != envelope.fingerprint:
+                raise DurableRiskPolicyError(
+                    "active plans reference conflicting account portfolio envelopes"
+                )
 
     @classmethod
     def _projected_portfolio_risk(
@@ -1420,23 +2272,45 @@ class DurableIntentLedger:
         proposed_intent: SimulatedOrderIntent | None,
         current_plan_result: PositionRiskAssessment | None = None,
     ) -> PortfolioRiskAssessment:
+        envelope = policy.portfolio_envelope
+        cls._assert_account_envelope_consistency(session, envelope)
+        slices_by_id = {item.slice_id: item for item in envelope.exposure_slices}
+
+        def add_slice(item: PortfolioExposureSlice) -> None:
+            existing = slices_by_id.get(item.slice_id)
+            if existing is not None and existing != item:
+                raise DurableRiskPolicyError("portfolio exposure slice identity is conflicting")
+            slices_by_id[item.slice_id] = item
+
         position_exposure = ZERO
-        symbol_position_exposure = ZERO
         projected_plan_stop_risk = ZERO
-        plan_notionals: defaultdict[str, Decimal] = defaultdict(lambda: ZERO)
-        plan_policies: dict[str, ActualRiskPolicy] = {}
+        aggregate_stop_risk = ZERO
         for state in session.scalars(select(DurableActualRiskState)):
             state_policy = cls._latest_policy_from_session(session, state.plan_id)
-            plan_policies[state.plan_id] = state_policy
+            if state_policy.portfolio_envelope.fingerprint != envelope.fingerprint:
+                raise DurableRiskPolicyError(
+                    "active risk state references a conflicting account envelope"
+                )
             notional = Decimal(state.actual_notional_usdt)
             stop_risk = Decimal(state.actual_stop_risk)
             if current_plan_result is not None and state.plan_id == policy.plan_id:
                 notional = current_plan_result.actual_notional_usdt
                 stop_risk = current_plan_result.actual_stop_risk
             position_exposure += notional
-            plan_notionals[state.plan_id] += notional
-            if state_policy.symbol == policy.symbol:
-                symbol_position_exposure += notional
+            aggregate_stop_risk += stop_risk
+            if notional > ZERO:
+                add_slice(
+                    PortfolioExposureSlice(
+                        slice_id=f"position:{state.plan_id}",
+                        plan_id=state.plan_id,
+                        symbol=state_policy.symbol,
+                        direction=state_policy.direction,
+                        notional_usdt=notional,
+                        leverage=state_policy.effective_leverage,
+                        required_margin_usdt=(notional / Decimal(state_policy.effective_leverage)),
+                        source_state=ExposureSourceState.CONFIRMED,
+                    )
+                )
             if state.plan_id == policy.plan_id:
                 projected_plan_stop_risk += stop_risk
 
@@ -1448,63 +2322,94 @@ class DurableIntentLedger:
             DurableIntentStatus.PARTIALLY_FILLED.value,
         }
         pending_exposure = ZERO
-        symbol_pending_exposure = ZERO
         for row in session.scalars(select(DurableOrderIntent)):
             if row.role != OrderRole.ENTRY.value or row.status not in active_statuses:
                 continue
             remaining_quantity = max(Decimal(row.quantity) - Decimal(row.filled_quantity), ZERO)
             pending_notional = remaining_quantity * Decimal(row.price)
             row_policy = cls._latest_policy_from_session(session, row.plan_id)
-            plan_policies[row.plan_id] = row_policy
-            plan_notionals[row.plan_id] += pending_notional
-            pending_exposure += pending_notional
-            if row.symbol == policy.symbol:
-                symbol_pending_exposure += pending_notional
-            if row.plan_id == policy.plan_id:
-                projected_plan_stop_risk += cls._projected_pending_stop_risk(
-                    policy,
-                    quantity=remaining_quantity,
-                    entry_price=Decimal(row.price),
+            if row_policy.portfolio_envelope.fingerprint != envelope.fingerprint:
+                raise DurableRiskPolicyError(
+                    "pending intent references a conflicting account envelope"
                 )
+            pending_exposure += pending_notional
+            if pending_notional > ZERO:
+                add_slice(
+                    PortfolioExposureSlice(
+                        slice_id=f"pending:{row.client_order_id}",
+                        plan_id=row.plan_id,
+                        symbol=row.symbol,
+                        direction=Direction(row.direction),
+                        notional_usdt=pending_notional,
+                        leverage=row_policy.effective_leverage,
+                        required_margin_usdt=(
+                            pending_notional / Decimal(row_policy.effective_leverage)
+                        ),
+                        source_state=(
+                            ExposureSourceState.PARTIALLY_FILLED
+                            if row.status == DurableIntentStatus.PARTIALLY_FILLED.value
+                            else ExposureSourceState.PENDING
+                        ),
+                    )
+                )
+            pending_stop_risk = cls._projected_pending_stop_risk(
+                row_policy,
+                quantity=remaining_quantity,
+                entry_price=Decimal(row.price),
+            )
+            aggregate_stop_risk += pending_stop_risk
+            if row.plan_id == policy.plan_id:
+                projected_plan_stop_risk += pending_stop_risk
 
         if proposed_intent is not None:
             proposed_notional = proposed_intent.quantity * proposed_intent.price
-            plan_policies[policy.plan_id] = policy
-            plan_notionals[policy.plan_id] += proposed_notional
             pending_exposure += proposed_notional
-            symbol_pending_exposure += proposed_notional
-            projected_plan_stop_risk += cls._projected_pending_stop_risk(
+            add_slice(
+                PortfolioExposureSlice(
+                    slice_id=f"proposed:{proposed_intent.client_order_id}",
+                    plan_id=policy.plan_id,
+                    symbol=proposed_intent.symbol,
+                    direction=proposed_intent.direction,
+                    notional_usdt=proposed_notional,
+                    leverage=policy.effective_leverage,
+                    required_margin_usdt=(proposed_notional / Decimal(policy.effective_leverage)),
+                    source_state=ExposureSourceState.PENDING,
+                )
+            )
+            proposed_stop_risk = cls._projected_pending_stop_risk(
                 policy,
                 quantity=proposed_intent.quantity,
                 entry_price=proposed_intent.price,
             )
+            projected_plan_stop_risk += proposed_stop_risk
+            aggregate_stop_risk += proposed_stop_risk
 
-        aggregate_symbol = (
-            policy.existing_symbol_exposure_usdt
-            + symbol_position_exposure
-            + symbol_pending_exposure
+        exposure_slices = tuple(sorted(slices_by_id.values(), key=lambda item: item.slice_id))
+        aggregate_symbol = sum(
+            (item.notional_usdt for item in exposure_slices if item.symbol == policy.symbol),
+            ZERO,
         )
-        aggregate_total = policy.existing_total_exposure_usdt + position_exposure + pending_exposure
-        required_margin = policy.existing_total_exposure_usdt / Decimal(policy.effective_leverage)
-        aggregate_reserve = ZERO
-        for plan_id, notional in plan_notionals.items():
-            if notional <= ZERO:
-                continue
-            plan_policy = plan_policies[plan_id]
-            required_margin += notional / Decimal(plan_policy.effective_leverage)
-            aggregate_reserve += plan_policy.required_reserve_usdt
-        if policy.existing_total_exposure_usdt > ZERO and plan_notionals[policy.plan_id] <= ZERO:
-            aggregate_reserve += policy.required_reserve_usdt
-        required_margin += aggregate_reserve
+        aggregate_total = sum((item.notional_usdt for item in exposure_slices), ZERO)
+        aggregate_reserve = envelope.required_reserve_usdt
+        required_margin = (
+            sum((item.required_margin_usdt for item in exposure_slices), ZERO) + aggregate_reserve
+        )
         reason: str | None = None
-        if aggregate_symbol > policy.max_symbol_exposure_usdt:
+        if aggregate_symbol > envelope.max_symbol_exposure_usdt:
             reason = "PROJECTED_SYMBOL_EXPOSURE_LIMIT_BREACH"
-        elif aggregate_total > policy.max_total_exposure_usdt:
+        elif aggregate_total > envelope.max_total_exposure_usdt:
             reason = "PROJECTED_TOTAL_EXPOSURE_LIMIT_BREACH"
-        elif required_margin > policy.effective_equity_usdt:
+        elif required_margin > min(
+            envelope.max_required_margin_usdt,
+            envelope.effective_equity_usdt,
+        ):
             reason = "PROJECTED_MARGIN_REQUIREMENT_BREACH"
         elif projected_plan_stop_risk > policy.risk_budget:
             reason = "PROJECTED_STOP_RISK_BREACH"
+        elif aggregate_stop_risk > envelope.daily_remaining_risk_usdt:
+            reason = "PROJECTED_DAILY_RISK_LIMIT_BREACH"
+        elif aggregate_stop_risk > envelope.weekly_remaining_risk_usdt:
+            reason = "PROJECTED_WEEKLY_RISK_LIMIT_BREACH"
         return PortfolioRiskAssessment(
             pending_order_exposure_usdt=pending_exposure,
             position_exposure_usdt=position_exposure,
@@ -1515,6 +2420,7 @@ class DurableIntentLedger:
             projected_plan_stop_risk=projected_plan_stop_risk,
             blocked=reason is not None,
             reason=reason,
+            exposure_slices=exposure_slices,
         )
 
     @staticmethod
@@ -1587,6 +2493,9 @@ class DurableIntentLedger:
             "PROJECTED_TOTAL_EXPOSURE_LIMIT_BREACH",
             "PROJECTED_MARGIN_REQUIREMENT_BREACH",
             "PROJECTED_STOP_RISK_BREACH",
+            "PROJECTED_DAILY_RISK_LIMIT_BREACH",
+            "PROJECTED_WEEKLY_RISK_LIMIT_BREACH",
+            "SIMULATED_PROTECTION_MISSING",
             "SIMULATED_PROTECTION_QUANTITY_MISMATCH",
         }
         if result.reason not in reduction_reasons:
@@ -1625,12 +2534,15 @@ class DurableIntentLedger:
                 continue
             if DurableIntentStatus(later.status) is DurableIntentStatus.FILLED:
                 continue
-            later.status = DurableIntentStatus.CANCELLED.value
+            later.status = DurableIntentStatus.CANCEL_REQUIRED.value
             later.updated_at = datetime.now(UTC)
 
     @staticmethod
     def _cancel_known_active_entry_intents(session: Session) -> None:
         active_statuses = {
+            DurableIntentStatus.PREPARED.value,
+            DurableIntentStatus.SUBMITTING.value,
+            DurableIntentStatus.UNKNOWN.value,
             DurableIntentStatus.NEW.value,
             DurableIntentStatus.PARTIALLY_FILLED.value,
         }
@@ -1640,8 +2552,29 @@ class DurableIntentLedger:
                 DurableOrderIntent.status.in_(active_statuses),
             )
         ):
-            row.status = DurableIntentStatus.CANCELLED.value
+            row.status = DurableIntentStatus.CANCEL_REQUIRED.value
             row.updated_at = datetime.now(UTC)
+
+    @classmethod
+    def _materialize_simulated_protection_in_session(
+        cls,
+        session: Session,
+        policy_row: DurableActualRiskPolicy,
+    ) -> None:
+        protection = session.get(DurableSimulatedProtection, policy_row.plan_id)
+        if protection is None:
+            raise DurableRiskPolicyError("durable simulated protection evidence is missing")
+        policy = cls._latest_policy_from_session(session, policy_row.plan_id)
+        if (
+            protection.stop_intent_reference != policy.protective_stop_reference
+            or protection.reduce_only_exit_intent_reference != policy.reduce_only_exit_reference
+        ):
+            raise DurableRiskPolicyError("durable protection references do not match the policy")
+        fills = cls._fill_ledger_for_plan(session, policy.plan_id)
+        protection.protected_position_quantity = format(fills.filled_quantity, "f")
+        protection.stop_intent_ready = fills.filled_quantity > ZERO
+        protection.reduce_only_exit_intent_ready = fills.filled_quantity > ZERO
+        protection.updated_at = datetime.now(UTC)
 
     @classmethod
     def _recalculate_actual_risk(
@@ -1684,10 +2617,10 @@ class DurableIntentLedger:
             ),
             max_symbol_exposure_usdt=policy.max_symbol_exposure_usdt,
             max_total_exposure_usdt=policy.max_total_exposure_usdt,
-            existing_symbol_exposure_usdt=policy.existing_symbol_exposure_usdt,
-            existing_total_exposure_usdt=policy.existing_total_exposure_usdt,
+            existing_symbol_exposure_usdt=ZERO,
+            existing_total_exposure_usdt=ZERO,
             effective_leverage=policy.effective_leverage,
-            required_reserve_usdt=policy.required_reserve_usdt,
+            required_reserve_usdt=ZERO,
             effective_equity_usdt=policy.effective_equity_usdt,
         )
         result = cls._apply_aggregate_risk(session, policy, result)

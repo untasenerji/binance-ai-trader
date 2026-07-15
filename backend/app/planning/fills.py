@@ -1,5 +1,7 @@
 """Exact fill accounting and confirmed-position stop-risk evaluation."""
 
+import hashlib
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -83,6 +85,7 @@ class PortfolioRiskAssessment:
     projected_plan_stop_risk: Decimal
     blocked: bool
     reason: str | None
+    exposure_slices: tuple["PortfolioExposureSlice", ...] = ()
 
 
 class RiskReductionStatus(StrEnum):
@@ -104,6 +107,174 @@ class RiskReductionRequirement:
         return self.status is RiskReductionStatus.OPEN
 
 
+class ExposureSourceState(StrEnum):
+    EXTERNAL_CONFIRMED = "EXTERNAL_CONFIRMED"
+    EXTERNAL_PENDING = "EXTERNAL_PENDING"
+    CONFIRMED = "CONFIRMED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    PENDING = "PENDING"
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioExposureSlice:
+    """One independently margined account exposure fact."""
+
+    slice_id: str
+    plan_id: str
+    symbol: str
+    direction: Direction
+    notional_usdt: Decimal
+    leverage: int
+    required_margin_usdt: Decimal
+    source_state: ExposureSourceState
+
+    def __post_init__(self) -> None:
+        if not self.slice_id or not self.plan_id or not self.symbol:
+            raise FillLedgerError("portfolio exposure slices need durable identity")
+        if not isinstance(self.direction, Direction):
+            raise TypeError("portfolio exposure direction must be typed")
+        if not isinstance(self.source_state, ExposureSourceState):
+            raise TypeError("portfolio exposure source state must be typed")
+        if (
+            not isinstance(self.leverage, int)
+            or isinstance(self.leverage, bool)
+            or self.leverage < 1
+        ):
+            raise FillLedgerError("portfolio exposure leverage must be a positive integer")
+        for value in (self.notional_usdt, self.required_margin_usdt):
+            if not isinstance(value, Decimal) or not value.is_finite() or value < ZERO:
+                raise FillLedgerError("portfolio exposure values must be non-negative Decimals")
+        if self.required_margin_usdt != self.notional_usdt / Decimal(self.leverage):
+            raise FillLedgerError(
+                "portfolio exposure margin must equal notional divided by leverage"
+            )
+
+    def canonical_record(self) -> dict[str, object]:
+        return {
+            "direction": self.direction.value,
+            "leverage": self.leverage,
+            "notional_usdt": format(self.notional_usdt, "f"),
+            "plan_id": self.plan_id,
+            "required_margin_usdt": format(self.required_margin_usdt, "f"),
+            "slice_id": self.slice_id,
+            "source_state": self.source_state.value,
+            "symbol": self.symbol,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AccountPortfolioEnvelope:
+    """Immutable account-level risk authority shared by every plan."""
+
+    account_scope: str
+    version: int
+    verified_account_equity_usdt: Decimal
+    bot_equity_cap_usdt: Decimal
+    required_reserve_usdt: Decimal
+    max_total_exposure_usdt: Decimal
+    max_symbol_exposure_usdt: Decimal
+    max_required_margin_usdt: Decimal
+    daily_remaining_risk_usdt: Decimal
+    weekly_remaining_risk_usdt: Decimal
+    open_position_count: int
+    pending_order_count: int
+    exposure_slices: tuple[PortfolioExposureSlice, ...] = ()
+    reconciliation_required: bool = False
+    fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.account_scope:
+            raise FillLedgerError("portfolio envelope needs an account scope")
+        if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 1:
+            raise FillLedgerError("portfolio envelope version must be positive")
+        decimal_values = (
+            self.verified_account_equity_usdt,
+            self.bot_equity_cap_usdt,
+            self.required_reserve_usdt,
+            self.max_total_exposure_usdt,
+            self.max_symbol_exposure_usdt,
+            self.max_required_margin_usdt,
+            self.daily_remaining_risk_usdt,
+            self.weekly_remaining_risk_usdt,
+        )
+        if any(
+            not isinstance(value, Decimal) or not value.is_finite() or value < ZERO
+            for value in decimal_values
+        ):
+            raise FillLedgerError("portfolio envelope values must be non-negative Decimals")
+        if (
+            min(
+                self.verified_account_equity_usdt,
+                self.bot_equity_cap_usdt,
+                self.max_total_exposure_usdt,
+                self.max_symbol_exposure_usdt,
+                self.max_required_margin_usdt,
+            )
+            <= ZERO
+        ):
+            raise FillLedgerError("portfolio envelope financial caps must be positive")
+        if self.required_reserve_usdt > self.max_required_margin_usdt:
+            raise FillLedgerError("portfolio reserve cannot exceed maximum required margin")
+        for count in (self.open_position_count, self.pending_order_count):
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise FillLedgerError("portfolio envelope counts must be non-negative integers")
+        if not isinstance(self.reconciliation_required, bool):
+            raise TypeError("portfolio envelope reconciliation flag must be boolean")
+        if any(type(item) is not PortfolioExposureSlice for item in self.exposure_slices):
+            raise TypeError("portfolio envelope exposure slices must be exact typed values")
+        slice_ids = [item.slice_id for item in self.exposure_slices]
+        if len(slice_ids) != len(set(slice_ids)):
+            raise FillLedgerError("portfolio envelope exposure slice IDs must be unique")
+        ordered_slices = tuple(sorted(self.exposure_slices, key=lambda item: item.slice_id))
+        object.__setattr__(self, "exposure_slices", ordered_slices)
+        expected = self.expected_fingerprint()
+        if self.fingerprint and self.fingerprint != expected:
+            raise FillLedgerError("portfolio envelope fingerprint is invalid")
+        object.__setattr__(self, "fingerprint", expected)
+
+    @property
+    def effective_equity_usdt(self) -> Decimal:
+        return min(self.verified_account_equity_usdt, self.bot_equity_cap_usdt)
+
+    @property
+    def existing_total_exposure_usdt(self) -> Decimal:
+        return sum((item.notional_usdt for item in self.exposure_slices), ZERO)
+
+    def existing_symbol_exposure_usdt(self, symbol: str) -> Decimal:
+        return sum(
+            (item.notional_usdt for item in self.exposure_slices if item.symbol == symbol),
+            ZERO,
+        )
+
+    @property
+    def existing_required_margin_usdt(self) -> Decimal:
+        return sum((item.required_margin_usdt for item in self.exposure_slices), ZERO)
+
+    def expected_fingerprint(self) -> str:
+        canonical = json.dumps(
+            {
+                "account_scope": self.account_scope,
+                "bot_equity_cap_usdt": format(self.bot_equity_cap_usdt, "f"),
+                "daily_remaining_risk_usdt": format(self.daily_remaining_risk_usdt, "f"),
+                "exposure_slices": [item.canonical_record() for item in self.exposure_slices],
+                "max_required_margin_usdt": format(self.max_required_margin_usdt, "f"),
+                "max_symbol_exposure_usdt": format(self.max_symbol_exposure_usdt, "f"),
+                "max_total_exposure_usdt": format(self.max_total_exposure_usdt, "f"),
+                "open_position_count": self.open_position_count,
+                "pending_order_count": self.pending_order_count,
+                "reconciliation_required": self.reconciliation_required,
+                "required_reserve_usdt": format(self.required_reserve_usdt, "f"),
+                "verified_account_equity_usdt": format(self.verified_account_equity_usdt, "f"),
+                "version": self.version,
+                "weekly_remaining_risk_usdt": format(self.weekly_remaining_risk_usdt, "f"),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class ActualRiskPolicy:
     """Immutable local policy used to gate entry stages after durable simulated fills."""
@@ -116,15 +287,10 @@ class ActualRiskPolicy:
     funding_buffer_rate: Decimal
     funding_interval_count: int
     risk_budget: Decimal
-    max_symbol_exposure_usdt: Decimal
-    max_total_exposure_usdt: Decimal
-    existing_symbol_exposure_usdt: Decimal
-    existing_total_exposure_usdt: Decimal
     effective_leverage: int
-    required_reserve_usdt: Decimal
-    effective_equity_usdt: Decimal
     protective_stop_reference: str
     reduce_only_exit_reference: str
+    portfolio_envelope: AccountPortfolioEnvelope
 
     def __post_init__(self) -> None:
         if not self.plan_id or not self.symbol:
@@ -133,6 +299,8 @@ class ActualRiskPolicy:
             raise FillLedgerError("actual-risk policy needs durable protection references")
         if not isinstance(self.direction, Direction):
             raise TypeError("actual-risk policy direction must be typed")
+        if type(self.portfolio_envelope) is not AccountPortfolioEnvelope:
+            raise TypeError("actual-risk policy requires an exact account portfolio envelope")
         # Keep policy validation aligned with the financial evaluator so a malformed
         # policy cannot silently skip the post-fill entry gate.
         evaluate_simulated_position_risk(
@@ -153,6 +321,30 @@ class ActualRiskPolicy:
             required_reserve_usdt=self.required_reserve_usdt,
             effective_equity_usdt=self.effective_equity_usdt,
         )
+
+    @property
+    def max_symbol_exposure_usdt(self) -> Decimal:
+        return self.portfolio_envelope.max_symbol_exposure_usdt
+
+    @property
+    def max_total_exposure_usdt(self) -> Decimal:
+        return self.portfolio_envelope.max_total_exposure_usdt
+
+    @property
+    def existing_symbol_exposure_usdt(self) -> Decimal:
+        return self.portfolio_envelope.existing_symbol_exposure_usdt(self.symbol)
+
+    @property
+    def existing_total_exposure_usdt(self) -> Decimal:
+        return self.portfolio_envelope.existing_total_exposure_usdt
+
+    @property
+    def required_reserve_usdt(self) -> Decimal:
+        return self.portfolio_envelope.required_reserve_usdt
+
+    @property
+    def effective_equity_usdt(self) -> Decimal:
+        return self.portfolio_envelope.effective_equity_usdt
 
 
 @dataclass(slots=True)

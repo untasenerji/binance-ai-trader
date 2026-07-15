@@ -26,7 +26,14 @@ from app.persistence.circuit_breaker import (
 )
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.replay import ReplayRunner
-from app.planning.fills import ActualRiskPolicy, FillEvent, FillLedgerError
+from app.planning.fills import (
+    AccountPortfolioEnvelope,
+    ActualRiskPolicy,
+    ExposureSourceState,
+    FillEvent,
+    FillLedgerError,
+    PortfolioExposureSlice,
+)
 from app.simulation.intent_ledger import (
     AbsenceEvidenceSource,
     BoundedAbsenceEvidence,
@@ -94,6 +101,20 @@ def _policy(
     existing_total_exposure_usdt: Decimal = Decimal("0"),
     effective_equity_usdt: Decimal = Decimal("50"),
 ) -> ActualRiskPolicy:
+    exposure_slices: tuple[PortfolioExposureSlice, ...] = ()
+    if existing_total_exposure_usdt > 0:
+        exposure_slices = (
+            PortfolioExposureSlice(
+                slice_id="external-confirmed",
+                plan_id="external-plan",
+                symbol="BTCUSDT",
+                direction=direction,
+                notional_usdt=existing_total_exposure_usdt,
+                leverage=2,
+                required_margin_usdt=existing_total_exposure_usdt / Decimal(2),
+                source_state=ExposureSourceState.EXTERNAL_CONFIRMED,
+            ),
+        )
     return ActualRiskPolicy(
         plan_id=plan_id,
         symbol="BTCUSDT",
@@ -103,15 +124,24 @@ def _policy(
         funding_buffer_rate=Decimal("0"),
         funding_interval_count=0,
         risk_budget=risk_budget,
-        max_symbol_exposure_usdt=max_symbol_exposure_usdt,
-        max_total_exposure_usdt=max_total_exposure_usdt,
-        existing_symbol_exposure_usdt=existing_symbol_exposure_usdt,
-        existing_total_exposure_usdt=existing_total_exposure_usdt,
         effective_leverage=2,
-        required_reserve_usdt=Decimal("0"),
-        effective_equity_usdt=effective_equity_usdt,
         protective_stop_reference=f"{plan_id}-stop",
         reduce_only_exit_reference=f"{plan_id}-reduce-only-exit",
+        portfolio_envelope=AccountPortfolioEnvelope(
+            account_scope="third-audit-account",
+            version=1,
+            verified_account_equity_usdt=effective_equity_usdt,
+            bot_equity_cap_usdt=effective_equity_usdt,
+            required_reserve_usdt=Decimal("0"),
+            max_total_exposure_usdt=max_total_exposure_usdt,
+            max_symbol_exposure_usdt=max_symbol_exposure_usdt,
+            max_required_margin_usdt=effective_equity_usdt,
+            daily_remaining_risk_usdt=Decimal("1000000"),
+            weekly_remaining_risk_usdt=Decimal("1000000"),
+            open_position_count=0,
+            pending_order_count=0,
+            exposure_slices=exposure_slices,
+        ),
     )
 
 

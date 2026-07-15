@@ -16,7 +16,6 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.persistence.circuit_breaker import (
-    EntryIntentAuthorizationGate,
     PersistenceCircuitBreaker,
     PersistenceRecoveryEvidence,
 )
@@ -192,11 +191,6 @@ class AuditRepository:
         self._persistence_breaker = (
             persistence_breaker if persistence_breaker is not None else PersistenceCircuitBreaker()
         )
-        self._entry_authorization_gate = EntryIntentAuthorizationGate(self._persistence_breaker)
-
-    @property
-    def entry_authorization_gate(self) -> EntryIntentAuthorizationGate:
-        return self._entry_authorization_gate
 
     def record_delivery(
         self,
@@ -371,6 +365,7 @@ class AuditRepository:
                 unresolved_unknown_intent_ids=(reconciliation_facts.unresolved_unknown_intent_ids),
                 audit_chain_valid=audit_chain_valid,
                 replay_valid=replay.is_valid,
+                expected_stop_contracts=reconciliation_facts.expected_stop_contracts,
             ),
             snapshot=reconciliation_snapshot,
         )
@@ -426,6 +421,7 @@ class AuditRepository:
                 unresolved_unknown_intent_ids=(reconciliation_facts.unresolved_unknown_intent_ids),
                 audit_chain_valid=audit_chain_valid,
                 replay_valid=replay.is_valid,
+                expected_stop_contracts=reconciliation_facts.expected_stop_contracts,
             ),
             snapshot=reconciliation_snapshot,
         )

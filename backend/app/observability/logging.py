@@ -19,10 +19,9 @@ class LogLevel(StrEnum):
     CRITICAL = "CRITICAL"
 
 
-_SENSITIVE_FIELD_PARTS = frozenset(
+_SENSITIVE_SINGLE_ALIASES = frozenset(
     {
         "api",
-        "apikey",
         "authorization",
         "cookie",
         "credential",
@@ -34,10 +33,27 @@ _SENSITIVE_FIELD_PARTS = frozenset(
         "token",
     }
 )
-_SENSITIVE_ASSIGNMENT_NAME = (
-    r"api[_-]?key|api[_-]?secret|client[_-]?secret|access[_-]?token|"
-    r"refresh[_-]?token|secret[_-]?key|authorization|cookie|password|passphrase|"
-    r"secret|signature|token"
+_SENSITIVE_COMPOUND_ALIAS_PARTS = (
+    ("api", "key"),
+    ("api", "secret"),
+    ("api", "token"),
+    ("client", "secret"),
+    ("access", "token"),
+    ("refresh", "token"),
+    ("secret", "key"),
+)
+_SENSITIVE_CANONICAL_ALIASES = _SENSITIVE_SINGLE_ALIASES | frozenset(
+    "".join(parts) for parts in _SENSITIVE_COMPOUND_ALIAS_PARTS
+)
+_ALIAS_SEPARATOR_PATTERN = r"[\s_-]*"
+_SENSITIVE_ASSIGNMENT_NAME = "|".join(
+    (
+        *(
+            _ALIAS_SEPARATOR_PATTERN.join(re.escape(part) for part in parts)
+            for parts in _SENSITIVE_COMPOUND_ALIAS_PARTS
+        ),
+        *(re.escape(alias) for alias in sorted(_SENSITIVE_SINGLE_ALIASES)),
+    )
 )
 _ASSIGNMENT_PATTERN = re.compile(rf"(?i)\b({_SENSITIVE_ASSIGNMENT_NAME})\s*[:=]\s*([^\s,;;&]+)")
 _JSON_QUOTED_ASSIGNMENT_PATTERN = re.compile(
@@ -54,22 +70,14 @@ _QUOTED_ASSIGNMENT_PATTERN = re.compile(
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _BASIC_PATTERN = re.compile(r"(?i)\bbasic\s+[^\s,;]+")
-_URL_ENCODED_SEPARATOR = r"(?:[_-]|%5[fF]|%2[dD])"
-_URL_ENCODED_SENSITIVE_ASSIGNMENT_NAME = (
-    rf"api{_URL_ENCODED_SEPARATOR}?(?:key|secret)|"
-    rf"client{_URL_ENCODED_SEPARATOR}?secret|"
-    rf"access{_URL_ENCODED_SEPARATOR}?token|"
-    rf"refresh{_URL_ENCODED_SEPARATOR}?token|"
-    rf"secret{_URL_ENCODED_SEPARATOR}?key|"
-    r"authorization|cookie|password|passphrase|secret|signature|token"
-)
-_URL_ENCODED_ASSIGNMENT_PATTERN = re.compile(
-    rf"(?i)\b({_URL_ENCODED_SENSITIVE_ASSIGNMENT_NAME})(?:%3[aA]|%3[dD])([^\s,;;&]+)"
-)
 _OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 _CAMEL_CASE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _UNICODE_ESCAPE_PATTERN = re.compile(r"\\u([0-9a-fA-F]{4})")
 _MAX_DECODE_LAYERS = 8
+_MAX_TEXT_LENGTH = 65_536
+_MAX_STRUCTURE_DEPTH = 24
+_MAX_COLLECTION_ITEMS = 4_096
+_MAX_STRUCTURE_NODES = 16_384
 
 
 def _decode_one_layer(value: str) -> str:
@@ -83,9 +91,13 @@ def _decode_one_layer(value: str) -> str:
 
 
 def _bounded_decode(value: str) -> tuple[str, bool]:
+    if len(value) > _MAX_TEXT_LENGTH:
+        return "[REDACTED]", True
     decoded = value
     for _ in range(_MAX_DECODE_LAYERS):
         next_value = _decode_one_layer(decoded)
+        if len(next_value) > _MAX_TEXT_LENGTH:
+            return "[REDACTED]", True
         if next_value == decoded:
             return decoded, False
         decoded = next_value
@@ -114,26 +126,50 @@ def redact_text(value: str) -> str:
     redacted = _BASIC_PATTERN.sub("Basic [REDACTED]", redacted)
     redacted = _BEARER_PATTERN.sub("Bearer [REDACTED]", redacted)
     redacted = _ASSIGNMENT_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", redacted)
-    redacted = _URL_ENCODED_ASSIGNMENT_PATTERN.sub(
-        lambda match: f"{match.group(1)}=[REDACTED]", redacted
-    )
     return _OPENAI_KEY_PATTERN.sub("[REDACTED]", redacted)
 
 
 def redact_for_log(value: object) -> object:
     """Return JSON-safe observability data that cannot expose sensitive field values."""
+    return _redact_for_log(value, depth=0, remaining_nodes=[_MAX_STRUCTURE_NODES])
+
+
+def _redact_for_log(
+    value: object,
+    *,
+    depth: int,
+    remaining_nodes: list[int],
+) -> object:
+    if depth > _MAX_STRUCTURE_DEPTH or remaining_nodes[0] <= 0:
+        return "[REDACTED]"
+    remaining_nodes[0] -= 1
     if isinstance(value, Mapping):
+        if len(value) > _MAX_COLLECTION_ITEMS:
+            return "[REDACTED]"
         redacted: dict[str, object] = {}
         for key, nested_value in value.items():
             normalized_key = str(key)
             redacted[normalized_key] = (
                 "[REDACTED]"
                 if _is_sensitive_field(normalized_key)
-                else redact_for_log(nested_value)
+                else _redact_for_log(
+                    nested_value,
+                    depth=depth + 1,
+                    remaining_nodes=remaining_nodes,
+                )
             )
         return redacted
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [redact_for_log(item) for item in value]
+        if len(value) > _MAX_COLLECTION_ITEMS:
+            return "[REDACTED]"
+        return [
+            _redact_for_log(
+                item,
+                depth=depth + 1,
+                remaining_nodes=remaining_nodes,
+            )
+            for item in value
+        ]
     if isinstance(value, str):
         return redact_text(value)
     if isinstance(value, Decimal):
@@ -155,9 +191,8 @@ def _is_sensitive_field(key: str) -> bool:
     key_parts = re.split(r"[^a-z0-9]+", separated_key.casefold())
     compact_key = "".join(key_parts)
     return (
-        any(part in _SENSITIVE_FIELD_PARTS for part in key_parts)
-        or compact_key in _SENSITIVE_FIELD_PARTS
-        or "apikey" in compact_key
+        any(part in _SENSITIVE_SINGLE_ALIASES for part in key_parts)
+        or compact_key in _SENSITIVE_CANONICAL_ALIASES
     )
 
 

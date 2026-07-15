@@ -7,7 +7,14 @@ from hashlib import sha256
 from typing import ClassVar
 
 from app.domain.types import Direction
-from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, Strategy
+from app.strategy.models import (
+    Candle,
+    FrozenStrategy,
+    SignalCandidate,
+    Strategy,
+    StrategyFitResult,
+    StrategyKind,
+)
 
 _ONE_HUNDRED = Decimal("100")
 
@@ -173,3 +180,43 @@ class MeanReversionStrategy:
 
     def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
         return _freeze(self, candles, timeframe=timeframe)
+
+
+def frozen_strategy_from_fit(result: StrategyFitResult) -> FrozenStrategy:
+    """Build one reviewed evaluator solely from immutable fit provenance."""
+    if type(result) is not StrategyFitResult:
+        raise TypeError("walk-forward execution requires an exact fit result")
+    specification = result.specification
+    if specification.kind is StrategyKind.NO_TRADE_BASELINE:
+        trainer: Strategy = NoTradeBaseline()
+    elif specification.kind is StrategyKind.TREND_PULLBACK:
+        assert specification.lookback is not None
+        assert specification.validity_ms is not None
+        trainer = TrendPullbackStrategy(
+            lookback=specification.lookback,
+            validity_ms=specification.validity_ms,
+        )
+    elif specification.kind is StrategyKind.VOLATILITY_BREAKOUT:
+        assert specification.lookback is not None
+        assert specification.validity_ms is not None
+        trainer = VolatilityBreakoutStrategy(
+            lookback=specification.lookback,
+            validity_ms=specification.validity_ms,
+        )
+    else:
+        assert specification.kind is StrategyKind.MEAN_REVERSION
+        assert specification.lookback is not None
+        assert specification.validity_ms is not None
+        assert specification.deviation_percent is not None
+        trainer = MeanReversionStrategy(
+            lookback=specification.lookback,
+            validity_ms=specification.validity_ms,
+            deviation_percent=specification.deviation_percent,
+        )
+    return FrozenStrategy(
+        strategy_id=trainer.strategy_id,
+        training_candle_count=result.training_candle_count,
+        training_end_ms=result.training_end_ms,
+        configuration_fingerprint=specification.fingerprint,
+        evaluator=trainer.evaluate,
+    )

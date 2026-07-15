@@ -2,14 +2,21 @@
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 from types import FunctionType, MethodType, ModuleType
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
-from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, Strategy, TrainableStrategy
+from app.strategy.models import (
+    Candle,
+    FrozenStrategy,
+    SignalCandidate,
+    Strategy,
+    StrategyFitResult,
+    StrategySpecification,
+)
 
 _BPS_DENOMINATOR = Decimal("10000")
 
@@ -503,13 +510,18 @@ class WalkForwardRunner:
 
     def run(
         self,
-        strategy_factory: Callable[[], TrainableStrategy],
+        strategy_specification: StrategySpecification,
         candles: Sequence[Candle],
         *,
         timeframe: str,
         costs: BacktestCosts,
         funding_settlements: Sequence[FundingSettlement] = (),
     ) -> tuple[WalkForwardWindow, ...]:
+        if type(strategy_specification) is not StrategySpecification:
+            raise WalkForwardTrainingError(
+                "custom walk-forward factories cannot isolate held-out state; "
+                "an exact frozen StrategySpecification is required"
+            )
         series = tuple(candles)
         settlements = tuple(funding_settlements)
         windows: list[WalkForwardWindow] = []
@@ -520,11 +532,9 @@ class WalkForwardRunner:
             test_end = train_end + self.test_size
             segment = series[start:test_end]
             training_candles = tuple(series[start:train_end])
-            trainer = strategy_factory()
             frozen_strategy, training_data_fingerprint = self._fit_train_only(
-                trainer,
+                strategy_specification,
                 training_candles=training_candles,
-                held_out_candles=tuple(series[train_end:]),
                 timeframe=timeframe,
             )
             raw_result = engine.run(
@@ -558,41 +568,32 @@ class WalkForwardRunner:
     @classmethod
     def _fit_train_only(
         cls,
-        trainer: TrainableStrategy,
+        strategy_specification: StrategySpecification,
         *,
         training_candles: tuple[Candle, ...],
-        held_out_candles: tuple[Candle, ...],
         timeframe: str,
     ) -> tuple[FrozenStrategy, str]:
-        from app.strategy.strategies import (
-            MeanReversionStrategy,
-            NoTradeBaseline,
-            TrendPullbackStrategy,
-            VolatilityBreakoutStrategy,
-        )
+        from app.strategy.strategies import frozen_strategy_from_fit
 
-        training_data_fingerprint = cls._training_data_fingerprint(training_candles)
-        trusted_trainer_types = (
-            MeanReversionStrategy,
-            NoTradeBaseline,
-            TrendPullbackStrategy,
-            VolatilityBreakoutStrategy,
-        )
-        if type(trainer) not in trusted_trainer_types:
+        if type(strategy_specification) is not StrategySpecification:
             raise WalkForwardTrainingError(
-                "custom walk-forward trainers cannot isolate held-out data with trusted "
-                "train-only proof"
+                "walk-forward fit requires an exact frozen StrategySpecification"
             )
-        _TrainingIsolationGuard.for_window(
-            training_candles,
-            held_out_candles,
-        ).inspect(trainer, path="trainer")
-        fit = getattr(trainer, "fit", None)
-        if not callable(fit):
-            raise WalkForwardTrainingError("walk-forward trainer must implement fit")
-        frozen_strategy = fit(training_candles, timeframe=timeframe)
-        if not isinstance(frozen_strategy, FrozenStrategy):
-            raise WalkForwardTrainingError("walk-forward fit must return FrozenStrategy")
+        if not training_candles:
+            raise WalkForwardTrainingError("walk-forward training slice cannot be empty")
+        if any(candle.timeframe != timeframe for candle in training_candles):
+            raise WalkForwardTrainingError(
+                "walk-forward training timeframe does not match its immutable slice"
+            )
+        training_data_fingerprint = cls._training_data_fingerprint(training_candles)
+        fit_result = StrategyFitResult(
+            specification=strategy_specification,
+            training_data_fingerprint=training_data_fingerprint,
+            training_candle_count=len(training_candles),
+            training_end_ms=training_candles[-1].close_time_ms,
+            timeframe=timeframe,
+        )
+        frozen_strategy = frozen_strategy_from_fit(fit_result)
         if (
             frozen_strategy.training_candle_count != len(training_candles)
             or frozen_strategy.training_end_ms != training_candles[-1].close_time_ms
@@ -600,10 +601,8 @@ class WalkForwardRunner:
             raise WalkForwardTrainingError(
                 "frozen strategy training provenance does not match the train slice"
             )
-        _TrainingIsolationGuard.for_window(training_candles, held_out_candles).inspect(
-            frozen_strategy.evaluator,
-            path="frozen evaluator",
-        )
+        if frozen_strategy.configuration_fingerprint != strategy_specification.fingerprint:
+            raise WalkForwardTrainingError("frozen strategy changed its specification")
         return frozen_strategy, training_data_fingerprint
 
     @staticmethod

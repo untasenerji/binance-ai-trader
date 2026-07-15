@@ -5,8 +5,13 @@ import pytest
 
 from app.domain.types import Direction
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner, WalkForwardTrainingError
-from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, TrainableStrategy
-from app.strategy.strategies import VolatilityBreakoutStrategy
+from app.strategy.models import (
+    Candle,
+    FrozenStrategy,
+    SignalCandidate,
+    StrategySpecification,
+    TrainableStrategy,
+)
 
 
 def _candle(index: int, close_price: Decimal | None = None) -> Candle:
@@ -92,24 +97,17 @@ class ExternalMutationStrategy:
         )
 
 
-def test_walk_forward_uses_a_fresh_factory_instance_per_window_and_global_entry_indexes() -> None:
+def test_walk_forward_uses_one_frozen_specification_and_global_entry_indexes() -> None:
     candles = tuple(_candle(index, Decimal("100") + Decimal(index * 2)) for index in range(10))
-    created: list[VolatilityBreakoutStrategy] = []
-
-    def factory() -> TrainableStrategy:
-        strategy = VolatilityBreakoutStrategy(lookback=2)
-        created.append(strategy)
-        return strategy
 
     windows = WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-        factory,
+        StrategySpecification.volatility_breakout(lookback=2),
         candles,
         timeframe="1m",
         costs=_costs(),
     )
 
     assert len(windows) == 2
-    assert len(created) == 2
     assert all(window.result.trades for window in windows)
     assert all(
         window.test_start <= trade.entry_bar_index < window.test_end
@@ -127,7 +125,7 @@ def test_walk_forward_rejects_a_strategy_that_retains_future_candle_data() -> No
 
     with pytest.raises(WalkForwardTrainingError, match="held-out"):
         WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-            factory,
+            factory,  # type: ignore[arg-type]
             source,
             timeframe="1m",
             costs=_costs(),

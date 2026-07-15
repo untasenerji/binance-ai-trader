@@ -240,8 +240,6 @@ class ExchangeSimulator:
                     ),
                 ),
             )
-        if intent.role is OrderRole.ENTRY and order.filled_quantity > ZERO:
-            self._materialize_protection(intent.plan_id)
         cancelled_order_ids = (
             self._enforce_actual_entry_risk(
                 intent.plan_id,
@@ -370,7 +368,6 @@ class ExchangeSimulator:
         order.status = status
         order.filled_quantity = filled_quantity
         if order.intent.role is OrderRole.ENTRY and order.filled_quantity > ZERO:
-            self._materialize_protection(order.intent.plan_id)
             cancelled_order_ids = self._enforce_actual_entry_risk(
                 order.intent.plan_id,
                 current_client_order_id=order.intent.client_order_id,
@@ -510,7 +507,8 @@ class ExchangeSimulator:
                     (self.now_ms + fill.occurred_at_offset_ms) / 1_000,
                     tz=UTC,
                 ),
-            )
+            ),
+            materialize_simulated_protection=order.intent.role is OrderRole.ENTRY,
         )
 
     def _authorize_entry_risk(self, intent: SimulatedOrderIntent) -> None:
@@ -603,6 +601,7 @@ class ExchangeSimulator:
             DurableIntentStatus.UNKNOWN: SimulatedOrderStatus.UNKNOWN,
             DurableIntentStatus.NEW: SimulatedOrderStatus.NEW,
             DurableIntentStatus.PARTIALLY_FILLED: SimulatedOrderStatus.PARTIALLY_FILLED,
+            DurableIntentStatus.CANCEL_REQUIRED: SimulatedOrderStatus.CANCELLED,
             DurableIntentStatus.FILLED: SimulatedOrderStatus.FILLED,
             DurableIntentStatus.CANCELLED: SimulatedOrderStatus.CANCELLED,
             DurableIntentStatus.REJECTED: SimulatedOrderStatus.REJECTED,

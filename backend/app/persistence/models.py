@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -190,6 +191,9 @@ class DurableActualRiskPolicy(Base):
     effective_equity_usdt: Mapped[str] = mapped_column(String(64))
     protective_stop_reference: Mapped[str] = mapped_column(String(128))
     reduce_only_exit_reference: Mapped[str] = mapped_column(String(128))
+    account_envelope_scope: Mapped[str] = mapped_column(String(128))
+    account_envelope_version: Mapped[int] = mapped_column(Integer)
+    account_envelope_fingerprint: Mapped[str] = mapped_column(String(64))
     policy_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -219,7 +223,106 @@ class DurableActualRiskPolicyVersion(Base):
     effective_equity_usdt: Mapped[str] = mapped_column(String(64))
     protective_stop_reference: Mapped[str] = mapped_column(String(128))
     reduce_only_exit_reference: Mapped[str] = mapped_column(String(128))
+    account_envelope_scope: Mapped[str] = mapped_column(String(128))
+    account_envelope_version: Mapped[int] = mapped_column(Integer)
+    account_envelope_fingerprint: Mapped[str] = mapped_column(String(64))
     policy_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableAccountPortfolioEnvelope(Base):
+    """Append-only account-level cap, equity, and exposure authority."""
+
+    __tablename__ = "durable_account_portfolio_envelopes"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_scope",
+            "version",
+            name="uq_account_portfolio_envelope_version",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_scope: Mapped[str] = mapped_column(String(128), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    verified_account_equity_usdt: Mapped[str] = mapped_column(String(64))
+    bot_equity_cap_usdt: Mapped[str] = mapped_column(String(64))
+    required_reserve_usdt: Mapped[str] = mapped_column(String(64))
+    max_total_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    max_symbol_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    max_required_margin_usdt: Mapped[str] = mapped_column(String(64))
+    daily_remaining_risk_usdt: Mapped[str] = mapped_column(String(64))
+    weekly_remaining_risk_usdt: Mapped[str] = mapped_column(String(64))
+    open_position_count: Mapped[int] = mapped_column(Integer)
+    pending_order_count: Mapped[int] = mapped_column(Integer)
+    exposure_slices: Mapped[list[dict[str, object]]] = mapped_column(JSON)
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    envelope_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class MigrationQuarantineRecord(Base):
+    """Fail-closed evidence retained when a forward migration cannot infer facts."""
+
+    __tablename__ = "migration_quarantine_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "migration_revision",
+            "source_table",
+            "source_identity",
+            "reason",
+            name="uq_migration_quarantine_record",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    migration_revision: Mapped[str] = mapped_column(String(64))
+    source_table: Mapped[str] = mapped_column(String(128))
+    source_identity: Mapped[str] = mapped_column(String(256))
+    reason: Mapped[str] = mapped_column(String(128))
+    evidence: Mapped[dict[str, object]] = mapped_column(JSON)
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableEntryAuthorizationGrant(Base):
+    """Append-only, short-lived recovery authorization evidence."""
+
+    __tablename__ = "durable_entry_authorization_grants"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    grant_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    recovery_probe_event_id: Mapped[str] = mapped_column(String(128))
+    recovery_status: Mapped[str] = mapped_column(String(32))
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    audit_event_count: Mapped[int] = mapped_column(Integer)
+    audit_last_sequence: Mapped[int] = mapped_column(Integer)
+    audit_last_record_hash: Mapped[str] = mapped_column(String(64))
+    replay_valid: Mapped[bool] = mapped_column(Boolean)
+    projection_matches_replay: Mapped[bool] = mapped_column(Boolean)
+    unresolved_intent_count: Mapped[int] = mapped_column(Integer)
+    reconciliation_clean: Mapped[bool] = mapped_column(Boolean)
+    reconciliation_fingerprint: Mapped[str] = mapped_column(String(64))
+    exchange_snapshot: Mapped[dict[str, object]] = mapped_column(JSON)
+    exchange_snapshot_fingerprint: Mapped[str] = mapped_column(String(64))
+    local_state_snapshot: Mapped[dict[str, object]] = mapped_column(JSON)
+    local_state_fingerprint: Mapped[str] = mapped_column(String(64))
+    capability_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableEntryAuthorizationRevocation(Base):
+    """Append-only invalidation of a previously issued entry capability."""
+
+    __tablename__ = "durable_entry_authorization_revocations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    revocation_id: Mapped[str] = mapped_column(String(128), unique=True)
+    grant_id: Mapped[str] = mapped_column(
+        ForeignKey("durable_entry_authorization_grants.grant_id"), unique=True, index=True
+    )
+    reason: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -309,5 +412,13 @@ def _reject_durable_evidence_mutation(*_: object) -> None:
 @event.listens_for(DurableActualRiskPolicy, "before_delete")
 @event.listens_for(DurableActualRiskPolicyVersion, "before_update")
 @event.listens_for(DurableActualRiskPolicyVersion, "before_delete")
+@event.listens_for(DurableAccountPortfolioEnvelope, "before_update")
+@event.listens_for(DurableAccountPortfolioEnvelope, "before_delete")
+@event.listens_for(MigrationQuarantineRecord, "before_update")
+@event.listens_for(MigrationQuarantineRecord, "before_delete")
+@event.listens_for(DurableEntryAuthorizationGrant, "before_update")
+@event.listens_for(DurableEntryAuthorizationGrant, "before_delete")
+@event.listens_for(DurableEntryAuthorizationRevocation, "before_update")
+@event.listens_for(DurableEntryAuthorizationRevocation, "before_delete")
 def _reject_durable_policy_mutation(*_: object) -> None:
-    raise AppendOnlyViolation("durable actual-risk policies are append-only")
+    raise AppendOnlyViolation("durable policy and authorization evidence is append-only")

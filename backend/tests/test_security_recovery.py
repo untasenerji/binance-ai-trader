@@ -7,7 +7,6 @@ from conftest import actual_risk_policy_for
 from app.domain.types import Direction
 from app.exchange.contracts import (
     AlgoOrderIntent,
-    AlgoOrderType,
     ReconciliationSnapshot,
 )
 from app.observability.recovery import RecoveryAction
@@ -48,19 +47,28 @@ def audit_repository(tmp_path: Path) -> AuditRepository:
     return AuditRepository(create_session_factory(engine))
 
 
-def _reconciliation_snapshot() -> ReconciliationSnapshot:
+def _reconciliation_snapshot(ledger: DurableIntentLedger) -> ReconciliationSnapshot:
+    contract = ledger.reconciliation_facts().expected_stop_contracts[0]
     return ReconciliationSnapshot(
         positions_by_symbol={"BTCUSDT": Decimal("0.005")},
         normal_order_client_ids=frozenset({"UTA1-recovery-EN-1"}),
         algo_order_client_ids=frozenset({"recovery-simulated-stop"}),
         algo_orders=(
             AlgoOrderIntent(
-                client_algo_id="recovery-simulated-stop",
-                symbol="BTCUSDT",
-                direction=Direction.LONG,
-                algo_type=AlgoOrderType.STOP_MARKET,
-                trigger_price=Decimal("900"),
-                close_position=True,
+                client_algo_id=contract.client_algo_id,
+                symbol=contract.symbol,
+                direction=contract.position_side,
+                algo_type=contract.algo_type,
+                trigger_price=contract.trigger_price,
+                close_position=contract.close_position,
+                working_type=contract.working_type,
+                status=contract.active_status,
+                plan_id=contract.plan_id,
+                policy_version=contract.policy_version,
+                account_envelope_version=contract.account_envelope_version,
+                policy_fingerprint=contract.policy_fingerprint,
+                account_envelope_fingerprint=contract.account_envelope_fingerprint,
+                stop_contract_fingerprint=contract.fingerprint,
             ),
         ),
     )
@@ -97,7 +105,7 @@ def test_restart_matches_typed_snapshot_but_cannot_enable_live_authority(
     result = LocalRecoveryCoordinator().recover_after_restart(
         restored_checkpoint,
         audit_repository=audit_repository,
-        reconciliation_snapshot=_reconciliation_snapshot(),
+        reconciliation_snapshot=_reconciliation_snapshot(durable_intent_ledger),
         intent_ledger=durable_intent_ledger,
     )
 

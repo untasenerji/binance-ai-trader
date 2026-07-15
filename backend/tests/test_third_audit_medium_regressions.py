@@ -95,7 +95,7 @@ def test_walk_forward_rejects_a_trainer_that_retains_held_out_market_data() -> N
 
     with pytest.raises(WalkForwardTrainingError, match="held-out"):
         WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-            factory,
+            factory,  # type: ignore[arg-type]
             candles,
             timeframe="1m",
             costs=_costs(),

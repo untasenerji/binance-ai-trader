@@ -30,9 +30,14 @@ from app.persistence.circuit_breaker import (
     PersistenceRecoveryEvidence,
 )
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
-from app.persistence.models import DurableActualRiskPolicy
+from app.persistence.models import DurableAccountPortfolioEnvelope, DurableActualRiskPolicy
 from app.persistence.replay import ReplayRunner
-from app.planning.fills import ActualRiskPolicy, FillEvent, FillLedgerError
+from app.planning.fills import (
+    AccountPortfolioEnvelope,
+    ActualRiskPolicy,
+    FillEvent,
+    FillLedgerError,
+)
 from app.simulation.intent_ledger import (
     AbsenceEvidenceSource,
     DurableIntentLedger,
@@ -63,7 +68,7 @@ from app.strategy.backtest import (
     FundingSettlement,
     WalkForwardRunner,
 )
-from app.strategy.models import Candle
+from app.strategy.models import Candle, StrategySpecification
 from app.strategy.strategies import VolatilityBreakoutStrategy
 
 
@@ -86,15 +91,23 @@ def _policy(
         funding_buffer_rate=Decimal("0"),
         funding_interval_count=0,
         risk_budget=risk_budget,
-        max_symbol_exposure_usdt=max_symbol_exposure,
-        max_total_exposure_usdt=max_total_exposure,
-        existing_symbol_exposure_usdt=Decimal("0"),
-        existing_total_exposure_usdt=Decimal("0"),
         effective_leverage=2,
-        required_reserve_usdt=Decimal("0"),
-        effective_equity_usdt=equity,
         protective_stop_reference=f"{plan_id}-sim-stop",
         reduce_only_exit_reference=f"{plan_id}-sim-reduce",
+        portfolio_envelope=AccountPortfolioEnvelope(
+            account_scope="fourth-audit-account",
+            version=1,
+            verified_account_equity_usdt=equity,
+            bot_equity_cap_usdt=equity,
+            required_reserve_usdt=Decimal("0"),
+            max_total_exposure_usdt=max_total_exposure,
+            max_symbol_exposure_usdt=max_symbol_exposure,
+            max_required_margin_usdt=equity,
+            daily_remaining_risk_usdt=Decimal("1000000"),
+            weekly_remaining_risk_usdt=Decimal("1000000"),
+            open_position_count=0,
+            pending_order_count=0,
+        ),
     )
 
 
@@ -675,6 +688,26 @@ def test_policy_fingerprint_is_revalidated_when_loaded(
     policy = _policy("fingerprint-reload")
     ledger = DurableIntentLedger(fourth_session_factory)
     with fourth_session_factory.begin() as session:
+        envelope = policy.portfolio_envelope
+        session.add(
+            DurableAccountPortfolioEnvelope(
+                account_scope=envelope.account_scope,
+                version=envelope.version,
+                verified_account_equity_usdt=format(envelope.verified_account_equity_usdt, "f"),
+                bot_equity_cap_usdt=format(envelope.bot_equity_cap_usdt, "f"),
+                required_reserve_usdt=format(envelope.required_reserve_usdt, "f"),
+                max_total_exposure_usdt=format(envelope.max_total_exposure_usdt, "f"),
+                max_symbol_exposure_usdt=format(envelope.max_symbol_exposure_usdt, "f"),
+                max_required_margin_usdt=format(envelope.max_required_margin_usdt, "f"),
+                daily_remaining_risk_usdt=format(envelope.daily_remaining_risk_usdt, "f"),
+                weekly_remaining_risk_usdt=format(envelope.weekly_remaining_risk_usdt, "f"),
+                open_position_count=envelope.open_position_count,
+                pending_order_count=envelope.pending_order_count,
+                exposure_slices=[],
+                reconciliation_required=False,
+                envelope_fingerprint=envelope.fingerprint,
+            )
+        )
         session.add(
             DurableActualRiskPolicy(
                 plan_id=policy.plan_id,
@@ -694,6 +727,9 @@ def test_policy_fingerprint_is_revalidated_when_loaded(
                 effective_equity_usdt=format(policy.effective_equity_usdt, "f"),
                 protective_stop_reference=policy.protective_stop_reference,
                 reduce_only_exit_reference=policy.reduce_only_exit_reference,
+                account_envelope_scope=envelope.account_scope,
+                account_envelope_version=envelope.version,
+                account_envelope_fingerprint=envelope.fingerprint,
                 policy_fingerprint="0" * 64,
             )
         )
@@ -763,7 +799,7 @@ def test_walk_forward_passes_funding_settlements_exactly_like_direct_backtest() 
     direct_test_trades = tuple(trade for trade in direct.trades if 2 <= trade.entry_bar_index < 5)
 
     windows = WalkForwardRunner(train_size=2, test_size=3, step_size=3).run(
-        lambda: VolatilityBreakoutStrategy(lookback=2),
+        StrategySpecification.volatility_breakout(lookback=2),
         candles,
         timeframe="1m",
         costs=costs,

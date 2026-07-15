@@ -14,7 +14,7 @@ from sqlalchemy.orm.unitofwork import UOWTransaction
 from app.domain.types import Direction
 from app.exchange.contracts import ReconciliationSnapshot
 from app.persistence.audit import AuditRepository
-from app.persistence.circuit_breaker import PersistenceCircuitBreaker
+from app.persistence.circuit_breaker import PersistenceCircuitBreaker, PersistenceUnavailable
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import DurableOrderIntent
 from app.simulation.intent_ledger import (
@@ -206,16 +206,35 @@ def test_restart_keeps_prepared_submitting_and_unknown_intents_unresolved(
     prepared = _intent(client_order_id="prepared", stage_index=1)
     submitting = _intent(client_order_id="submitting", stage_index=2)
     unknown = _intent(client_order_id="unknown", stage_index=3)
-    ledger.prepare(prepared)
-    ledger.prepare(submitting)
-    ledger.mark_submitting(submitting.client_order_id, submitted_at_ms=500)
-    ledger.prepare(unknown)
-    ledger.mark_submitting(unknown.client_order_id, submitted_at_ms=1_000)
-    ledger.mark_unknown(unknown.client_order_id, unknown_at_ms=1_000)
+    crash_states = (
+        (prepared, DurableIntentStatus.PREPARED, None, None),
+        (submitting, DurableIntentStatus.SUBMITTING, 500, None),
+        (unknown, DurableIntentStatus.UNKNOWN, 1_000, 1_000),
+    )
+    with session_factory.begin() as session:
+        for intent, status, submitted_at_ms, unknown_at_ms in crash_states:
+            session.add(
+                DurableOrderIntent(
+                    economic_key=intent.economic_key,
+                    attempt_number=1,
+                    client_order_id=intent.client_order_id,
+                    plan_id=intent.plan_id,
+                    symbol=intent.symbol,
+                    direction=intent.direction.value,
+                    role=intent.role.value,
+                    stage_index=intent.stage_index,
+                    quantity=format(intent.quantity, "f"),
+                    price=format(intent.price, "f"),
+                    filled_quantity="0",
+                    status=status.value,
+                    submitted_at_ms=submitted_at_ms,
+                    unknown_at_ms=unknown_at_ms,
+                )
+            )
 
     restarted = DurableIntentLedger(
         session_factory,
-        persistence_breaker=ledger.persistence_breaker,
+        persistence_breaker=PersistenceCircuitBreaker(),
     )
 
     assert restarted.unresolved_client_order_ids() == ("prepared", "submitting", "unknown")
@@ -259,7 +278,7 @@ def test_concurrent_same_economic_retry_creates_only_one_prepared_intent(
         barrier.wait()
         try:
             ledger.prepare(_intent(client_order_id=f"concurrent-{client_index}"))
-        except UnresolvedEconomicAction:
+        except (PersistenceUnavailable, UnresolvedEconomicAction):
             return False
         return True
 
@@ -301,4 +320,4 @@ def test_database_failure_after_simulated_submit_leaves_a_durable_unresolved_att
 
     assert simulator.order(intent.client_order_id).status is SimulatedOrderStatus.NEW
     assert ledger.intent(intent.client_order_id).status is DurableIntentStatus.SUBMITTING
-    assert not ledger.persistence_breaker.new_entries_allowed
+    assert not ledger._persistence_breaker.new_entries_allowed  # noqa: SLF001

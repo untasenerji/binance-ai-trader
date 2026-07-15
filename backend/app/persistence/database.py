@@ -36,6 +36,10 @@ def _install_audit_append_only_guards(engine: Engine) -> None:
                 "durable_intent_absence_observations",
                 "durable_actual_risk_policies",
                 "durable_actual_risk_policy_versions",
+                "durable_account_portfolio_envelopes",
+                "migration_quarantine_records",
+                "durable_entry_authorization_grants",
+                "durable_entry_authorization_revocations",
             ):
                 for operation in ("update", "delete"):
                     connection.execute(
@@ -69,6 +73,22 @@ def _install_audit_append_only_guards(engine: Engine) -> None:
                 (
                     "durable_actual_risk_policy_versions",
                     "prevent_durable_actual_risk_policy_versions_mutation",
+                ),
+                (
+                    "durable_account_portfolio_envelopes",
+                    "prevent_durable_account_portfolio_envelopes_mutation",
+                ),
+                (
+                    "migration_quarantine_records",
+                    "prevent_migration_quarantine_records_mutation",
+                ),
+                (
+                    "durable_entry_authorization_grants",
+                    "prevent_durable_entry_authorization_grants_mutation",
+                ),
+                (
+                    "durable_entry_authorization_revocations",
+                    "prevent_durable_entry_authorization_revocations_mutation",
                 ),
             ):
                 connection.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name} ON {table_name}"))

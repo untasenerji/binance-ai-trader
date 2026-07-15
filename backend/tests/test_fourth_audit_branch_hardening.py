@@ -365,7 +365,7 @@ def test_recovery_service_rejects_substituted_inputs_and_output(
 ) -> None:
     repository = AuditRepository(
         durable_intent_ledger._session_factory,  # noqa: SLF001 - exact-type boundary test
-        persistence_breaker=durable_intent_ledger.persistence_breaker,
+        persistence_breaker=durable_intent_ledger._persistence_breaker,  # noqa: SLF001
     )
     with pytest.raises(TypeError, match="concrete production audit"):
         PersistenceRecoveryService(

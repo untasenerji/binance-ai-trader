@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.domain.types import Direction
 from app.strategy.backtest import BacktestCosts, BacktestEngine, WalkForwardRunner
-from app.strategy.models import Candle, FrozenStrategy, SignalCandidate
+from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, StrategySpecification
 from app.strategy.strategies import (
     MeanReversionStrategy,
     NoTradeBaseline,
@@ -149,7 +149,7 @@ def test_walk_forward_returns_only_out_of_sample_trades_deterministically() -> N
         slippage_bps=Decimal("0"),
     )
     windows = WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-        lambda: VolatilityBreakoutStrategy(lookback=2),
+        StrategySpecification.volatility_breakout(lookback=2),
         candles,
         timeframe="1m",
         costs=costs,

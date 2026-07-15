@@ -5,12 +5,17 @@ import pytest
 from app.domain.types import Direction
 from app.exchange.contracts import (
     AlgoOrderIntent,
+    AlgoOrderStatus,
     AlgoOrderType,
+    ExpectedStopContract,
     LocalReconciliationState,
+    OrderSide,
     PositionAmount,
     PositionQuantityMismatch,
     ReconciliationReasonCode,
     ReconciliationSnapshot,
+    StopQuantitySemantics,
+    StopWorkingType,
     reconcile_local_state,
 )
 from app.simulation.failure import FailureCoordinator
@@ -26,6 +31,7 @@ def _local_state(
     unresolved_unknown_intent_ids: frozenset[str] = frozenset(),
     audit_chain_valid: bool = True,
     replay_valid: bool = True,
+    expected_stop_contracts: tuple[ExpectedStopContract, ...] = (),
 ) -> LocalReconciliationState:
     return LocalReconciliationState(
         positions_by_symbol=positions_by_symbol or {},
@@ -35,6 +41,7 @@ def _local_state(
         unresolved_unknown_intent_ids=unresolved_unknown_intent_ids,
         audit_chain_valid=audit_chain_valid,
         replay_valid=replay_valid,
+        expected_stop_contracts=expected_stop_contracts,
     )
 
 
@@ -54,7 +61,37 @@ def _snapshot(
     )
 
 
-def _algo_order(client_algo_id: str, *, symbol: str = "BTCUSDT") -> AlgoOrderIntent:
+def _stop_contract(
+    client_algo_id: str,
+    *,
+    symbol: str = "BTCUSDT",
+) -> ExpectedStopContract:
+    return ExpectedStopContract(
+        plan_id="reconciliation-plan",
+        symbol=symbol,
+        position_side=Direction.LONG,
+        expected_order_side=OrderSide.SELL,
+        client_algo_id=client_algo_id,
+        algo_type=AlgoOrderType.STOP_MARKET,
+        trigger_price=Decimal("90"),
+        working_type=StopWorkingType.MARK_PRICE,
+        close_position=True,
+        quantity_semantics=StopQuantitySemantics.CLOSE_POSITION_FULL,
+        active_status=AlgoOrderStatus.NEW,
+        policy_version=1,
+        account_envelope_version=1,
+        policy_fingerprint="a" * 64,
+        account_envelope_fingerprint="b" * 64,
+    )
+
+
+def _algo_order(
+    client_algo_id: str,
+    *,
+    symbol: str = "BTCUSDT",
+    contract: ExpectedStopContract | None = None,
+) -> AlgoOrderIntent:
+    contract = contract or _stop_contract(client_algo_id, symbol=symbol)
     return AlgoOrderIntent(
         client_algo_id=client_algo_id,
         symbol=symbol,
@@ -62,6 +99,14 @@ def _algo_order(client_algo_id: str, *, symbol: str = "BTCUSDT") -> AlgoOrderInt
         algo_type=AlgoOrderType.STOP_MARKET,
         trigger_price=Decimal("90"),
         close_position=True,
+        working_type=contract.working_type,
+        status=contract.active_status,
+        plan_id=contract.plan_id,
+        policy_version=contract.policy_version,
+        account_envelope_version=contract.account_envelope_version,
+        policy_fingerprint=contract.policy_fingerprint,
+        account_envelope_fingerprint=contract.account_envelope_fingerprint,
+        stop_contract_fingerprint=contract.fingerprint,
     )
 
 
@@ -139,17 +184,19 @@ def test_only_a_fully_clean_snapshot_can_release_failure_coordinator_pause() -> 
     assert coordinator.new_entries_paused
     assert coordinator.reconciliation_required
 
+    contract = _stop_contract("algo-1")
     clean = reconcile_local_state(
         local=_local_state(
             positions_by_symbol={"BTCUSDT": Decimal("1")},
             normal_order_client_ids=frozenset({"normal-1"}),
             algo_order_client_ids=frozenset({"algo-1"}),
             required_stop_symbols=frozenset({"BTCUSDT"}),
+            expected_stop_contracts=(contract,),
         ),
         snapshot=_snapshot(
             positions_by_symbol={"BTCUSDT": Decimal("1")},
             normal_order_client_ids=frozenset({"normal-1"}),
-            algo_orders=(_algo_order("algo-1"),),
+            algo_orders=(_algo_order("algo-1", contract=contract),),
         ),
     )
 

@@ -7,8 +7,12 @@ import pytest
 
 from app.observability.logging import redact_for_log, redact_text
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner, WalkForwardTrainingError
-from app.strategy.models import Candle, FrozenStrategy, TrainableStrategy
-from app.strategy.strategies import NoTradeBaseline
+from app.strategy.models import (
+    Candle,
+    FrozenStrategy,
+    StrategySpecification,
+    TrainableStrategy,
+)
 
 
 def _candle(index: int) -> Candle:
@@ -202,7 +206,7 @@ def _assert_training_rejected(
 ) -> None:
     with pytest.raises(WalkForwardTrainingError, match="held-out|isolate"):
         WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-            factory,
+            factory,  # type: ignore[arg-type]
             candles,
             timeframe="1m",
             costs=_costs(),
@@ -285,7 +289,7 @@ def test_walk_forward_accepts_reviewed_builtin_trainer_without_custom_state() ->
     candles = tuple(_candle(index) for index in range(7))
 
     windows = WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-        NoTradeBaseline,
+        StrategySpecification.no_trade(),
         candles,
         timeframe="1m",
         costs=_costs(),

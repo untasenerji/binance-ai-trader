@@ -1,5 +1,7 @@
 """Typed normal/algo order and fail-closed reconciliation contracts."""
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -30,6 +32,24 @@ class NormalOrderRole(StrEnum):
 class OrderSide(StrEnum):
     BUY = "BUY"
     SELL = "SELL"
+
+
+class StopWorkingType(StrEnum):
+    MARK_PRICE = "MARK_PRICE"
+    CONTRACT_PRICE = "CONTRACT_PRICE"
+
+
+class AlgoOrderStatus(StrEnum):
+    NEW = "NEW"
+    TRIGGERED = "TRIGGERED"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+
+
+class StopQuantitySemantics(StrEnum):
+    CLOSE_POSITION_FULL = "CLOSE_POSITION_FULL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +95,14 @@ class AlgoOrderIntent:
     trigger_price: Decimal
     close_position: bool
     quantity: Decimal | None = None
+    working_type: StopWorkingType = StopWorkingType.MARK_PRICE
+    status: AlgoOrderStatus = AlgoOrderStatus.NEW
+    plan_id: str | None = None
+    policy_version: int | None = None
+    account_envelope_version: int | None = None
+    policy_fingerprint: str | None = None
+    account_envelope_fingerprint: str | None = None
+    stop_contract_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not self.client_algo_id or not self.symbol or self.trigger_price <= ZERO:
@@ -85,6 +113,24 @@ class AlgoOrderIntent:
             or self.quantity <= ZERO
         ):
             raise ValueError("algo order quantity must be a positive finite Decimal")
+        if not isinstance(self.working_type, StopWorkingType):
+            raise TypeError("algo order working type must be typed")
+        if not isinstance(self.status, AlgoOrderStatus):
+            raise TypeError("algo order status must be typed")
+        for version in (self.policy_version, self.account_envelope_version):
+            if version is not None and (
+                not isinstance(version, int) or isinstance(version, bool) or version < 1
+            ):
+                raise ValueError("algo order policy versions must be positive integers")
+        for fingerprint in (
+            self.policy_fingerprint,
+            self.account_envelope_fingerprint,
+            self.stop_contract_fingerprint,
+        ):
+            if fingerprint is not None and (
+                not isinstance(fingerprint, str) or len(fingerprint) != 64
+            ):
+                raise ValueError("algo order fingerprints must be 64-character strings")
         if self.algo_type is AlgoOrderType.STOP_MARKET:
             if not self.close_position:
                 raise ValueError("protective STOP_MARKET must use closePosition")
@@ -94,6 +140,172 @@ class AlgoOrderIntent:
     @property
     def side(self) -> OrderSide:
         return OrderSide.SELL if self.direction is Direction.LONG else OrderSide.BUY
+
+
+@dataclass(frozen=True, slots=True)
+class AlgoOrderObservation:
+    """Exchange-observed Algo fields, including values invalid for a local intent."""
+
+    client_algo_id: str
+    symbol: str
+    direction: Direction
+    algo_type: AlgoOrderType
+    trigger_price: Decimal
+    close_position: bool
+    quantity: Decimal | None = None
+    working_type: StopWorkingType = StopWorkingType.MARK_PRICE
+    status: AlgoOrderStatus = AlgoOrderStatus.NEW
+    plan_id: str | None = None
+    policy_version: int | None = None
+    account_envelope_version: int | None = None
+    policy_fingerprint: str | None = None
+    account_envelope_fingerprint: str | None = None
+    stop_contract_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not self.client_algo_id
+            or not self.symbol
+            or not isinstance(self.direction, Direction)
+            or not isinstance(self.algo_type, AlgoOrderType)
+            or not isinstance(self.trigger_price, Decimal)
+            or not self.trigger_price.is_finite()
+            or self.trigger_price <= ZERO
+            or not isinstance(self.close_position, bool)
+            or not isinstance(self.working_type, StopWorkingType)
+            or not isinstance(self.status, AlgoOrderStatus)
+        ):
+            raise ValueError("observed Algo order fields are invalid")
+        if self.quantity is not None and (
+            not isinstance(self.quantity, Decimal)
+            or not self.quantity.is_finite()
+            or self.quantity <= ZERO
+        ):
+            raise ValueError("observed Algo quantity must be a positive Decimal")
+        for version in (self.policy_version, self.account_envelope_version):
+            if version is not None and (
+                not isinstance(version, int) or isinstance(version, bool) or version < 1
+            ):
+                raise ValueError("observed Algo policy versions are invalid")
+        for fingerprint in (
+            self.policy_fingerprint,
+            self.account_envelope_fingerprint,
+            self.stop_contract_fingerprint,
+        ):
+            if fingerprint is not None and (
+                not isinstance(fingerprint, str) or len(fingerprint) != 64
+            ):
+                raise ValueError("observed Algo fingerprints are invalid")
+
+    @property
+    def side(self) -> OrderSide:
+        return OrderSide.SELL if self.direction is Direction.LONG else OrderSide.BUY
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedStopContract:
+    """Complete local expectation that an exchange-observed stop must match."""
+
+    plan_id: str
+    symbol: str
+    position_side: Direction
+    expected_order_side: OrderSide
+    client_algo_id: str
+    algo_type: AlgoOrderType
+    trigger_price: Decimal
+    working_type: StopWorkingType
+    close_position: bool
+    quantity_semantics: StopQuantitySemantics
+    active_status: AlgoOrderStatus
+    policy_version: int
+    account_envelope_version: int
+    policy_fingerprint: str
+    account_envelope_fingerprint: str
+    fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.plan_id or not self.symbol or not self.client_algo_id:
+            raise ValueError("expected stop contract needs durable identity")
+        if not isinstance(self.position_side, Direction):
+            raise TypeError("expected stop position side must be typed")
+        inverse = OrderSide.SELL if self.position_side is Direction.LONG else OrderSide.BUY
+        if self.expected_order_side is not inverse:
+            raise ValueError("expected stop side must be inverse to the position")
+        if self.algo_type is not AlgoOrderType.STOP_MARKET:
+            raise ValueError("expected protection must be STOP_MARKET")
+        if (
+            not isinstance(self.trigger_price, Decimal)
+            or not self.trigger_price.is_finite()
+            or self.trigger_price <= ZERO
+        ):
+            raise ValueError("expected stop trigger must be a positive Decimal")
+        if self.working_type not in {StopWorkingType.MARK_PRICE, StopWorkingType.CONTRACT_PRICE}:
+            raise TypeError("expected stop working type must be typed")
+        if not self.close_position:
+            raise ValueError("expected stop must close the full position")
+        if self.quantity_semantics is not StopQuantitySemantics.CLOSE_POSITION_FULL:
+            raise ValueError("expected stop must omit quantity under closePosition")
+        if self.active_status is not AlgoOrderStatus.NEW:
+            raise ValueError("expected stop must be exchange-active")
+        for version in (self.policy_version, self.account_envelope_version):
+            if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+                raise ValueError("expected stop versions must be positive integers")
+        for fingerprint in (
+            self.policy_fingerprint,
+            self.account_envelope_fingerprint,
+        ):
+            if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+                raise ValueError("expected stop policy fingerprints are invalid")
+        expected = self.expected_fingerprint()
+        if self.fingerprint and self.fingerprint != expected:
+            raise ValueError("expected stop contract fingerprint is invalid")
+        object.__setattr__(self, "fingerprint", expected)
+
+    def expected_fingerprint(self) -> str:
+        canonical = json.dumps(
+            {
+                "account_envelope_fingerprint": self.account_envelope_fingerprint,
+                "account_envelope_version": self.account_envelope_version,
+                "active_status": self.active_status.value,
+                "algo_type": self.algo_type.value,
+                "client_algo_id": self.client_algo_id,
+                "close_position": self.close_position,
+                "expected_order_side": self.expected_order_side.value,
+                "plan_id": self.plan_id,
+                "policy_fingerprint": self.policy_fingerprint,
+                "policy_version": self.policy_version,
+                "position_side": self.position_side.value,
+                "quantity_semantics": self.quantity_semantics.value,
+                "symbol": self.symbol,
+                "trigger_price": format(self.trigger_price, "f"),
+                "working_type": self.working_type.value,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def matches(self, observed: object) -> bool:
+        return (
+            isinstance(observed, (AlgoOrderIntent, AlgoOrderObservation))
+            and observed.client_algo_id == self.client_algo_id
+            and observed.plan_id == self.plan_id
+            and observed.symbol == self.symbol
+            and observed.direction is self.position_side
+            and observed.side is self.expected_order_side
+            and observed.algo_type is self.algo_type
+            and observed.trigger_price == self.trigger_price
+            and observed.working_type is self.working_type
+            and observed.close_position is self.close_position
+            and observed.quantity is None
+            and observed.status is self.active_status
+            and observed.policy_version == self.policy_version
+            and observed.account_envelope_version == self.account_envelope_version
+            and observed.policy_fingerprint == self.policy_fingerprint
+            and observed.account_envelope_fingerprint == self.account_envelope_fingerprint
+            and observed.stop_contract_fingerprint == self.fingerprint
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +443,7 @@ class ReconciliationSnapshot:
     positions_by_symbol: Mapping[str, Decimal]
     normal_order_client_ids: frozenset[str]
     algo_order_client_ids: frozenset[str]
-    algo_orders: tuple[AlgoOrderIntent, ...] = ()
+    algo_orders: tuple[AlgoOrderIntent | AlgoOrderObservation, ...] = ()
     stop_protected_symbols: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
@@ -248,8 +460,10 @@ class ReconciliationSnapshot:
         supplied_algo_ids = _normalize_identifiers(
             self.algo_order_client_ids, field_name="algo order IDs"
         )
-        if any(not isinstance(order, AlgoOrderIntent) for order in self.algo_orders):
-            raise TypeError("algo snapshot records must be typed AlgoOrderIntent values")
+        if any(
+            type(order) not in {AlgoOrderIntent, AlgoOrderObservation} for order in self.algo_orders
+        ):
+            raise TypeError("algo snapshot records must be typed Algo observations")
         observed_algo_ids = frozenset(order.client_algo_id for order in self.algo_orders)
         if len(observed_algo_ids) != len(self.algo_orders):
             raise ValueError("algo snapshot records must not duplicate client IDs")
@@ -266,25 +480,6 @@ class ReconciliationSnapshot:
             ),
         )
 
-    @property
-    def verified_stop_protected_symbols(self) -> frozenset[str]:
-        """Require side-correct full-position stops for each observed nonzero position."""
-        verified: set[str] = set()
-        for symbol, position_quantity in self.positions_by_symbol.items():
-            if position_quantity == ZERO:
-                continue
-            expected_direction = Direction.LONG if position_quantity > ZERO else Direction.SHORT
-            if any(
-                order.symbol == symbol
-                and order.direction is expected_direction
-                and order.algo_type is AlgoOrderType.STOP_MARKET
-                and order.close_position
-                and order.quantity is None
-                for order in self.algo_orders
-            ):
-                verified.add(symbol)
-        return frozenset(verified)
-
 
 @dataclass(frozen=True, slots=True)
 class LocalReconciliationState:
@@ -297,6 +492,7 @@ class LocalReconciliationState:
     unresolved_unknown_intent_ids: frozenset[str]
     audit_chain_valid: bool
     replay_valid: bool
+    expected_stop_contracts: tuple[ExpectedStopContract, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.audit_chain_valid, bool) or not isinstance(self.replay_valid, bool):
@@ -310,6 +506,18 @@ class LocalReconciliationState:
         }
         if not required_stops.issubset(nonzero_position_symbols):
             raise ValueError("required stops must correspond to nonzero expected positions")
+        if any(
+            type(contract) is not ExpectedStopContract for contract in self.expected_stop_contracts
+        ):
+            raise TypeError("expected stops must use complete typed contracts")
+        contract_ids = [contract.client_algo_id for contract in self.expected_stop_contracts]
+        if len(contract_ids) != len(set(contract_ids)):
+            raise ValueError("expected stop contract IDs must be unique")
+        contract_symbols = {contract.symbol for contract in self.expected_stop_contracts}
+        if not contract_symbols.issubset(required_stops):
+            raise ValueError("expected stop contracts must correspond to required symbols")
+        if not set(contract_ids).issubset(self.algo_order_client_ids):
+            raise ValueError("expected stop contract IDs must be durable expected algo IDs")
         object.__setattr__(self, "positions_by_symbol", normalized_positions)
         object.__setattr__(
             self,
@@ -322,6 +530,11 @@ class LocalReconciliationState:
             _normalize_identifiers(self.algo_order_client_ids, field_name="algo order IDs"),
         )
         object.__setattr__(self, "required_stop_symbols", required_stops)
+        object.__setattr__(
+            self,
+            "expected_stop_contracts",
+            tuple(sorted(self.expected_stop_contracts, key=lambda item: item.client_algo_id)),
+        )
         object.__setattr__(
             self,
             "unresolved_unknown_intent_ids",
@@ -344,6 +557,7 @@ class ReconciliationOutcome:
     unresolved_unknown_intent_ids: tuple[str, ...]
     audit_chain_valid: bool
     replay_valid: bool
+    invalid_stop_contract_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.audit_chain_valid, bool) or not isinstance(self.replay_valid, bool):
@@ -374,6 +588,10 @@ class ReconciliationOutcome:
             ),
             (self.missing_stop_symbols, ReconciliationReasonCode.MISSING_STOP_PROTECTION),
             (
+                self.invalid_stop_contract_ids,
+                ReconciliationReasonCode.MISSING_STOP_PROTECTION,
+            ),
+            (
                 self.unresolved_unknown_intent_ids,
                 ReconciliationReasonCode.UNRESOLVED_UNKNOWN_INTENT,
             ),
@@ -397,6 +615,7 @@ class ReconciliationOutcome:
                 self.missing_expected_positions,
                 self.unexpected_exchange_positions,
                 self.missing_stop_symbols,
+                self.invalid_stop_contract_ids,
                 self.unresolved_unknown_intent_ids,
                 not self.audit_chain_valid,
                 not self.replay_valid,
@@ -450,8 +669,25 @@ def reconcile_local_state(
                 )
             )
 
+    observed_by_id = {order.client_algo_id: order for order in snapshot.algo_orders}
+    invalid_stop_contract_ids = tuple(
+        sorted(
+            contract.client_algo_id
+            for contract in local.expected_stop_contracts
+            if not contract.matches(observed_by_id.get(contract.client_algo_id))
+        )
+    )
+    invalid_stop_ids = set(invalid_stop_contract_ids)
+    contracted_symbols = {contract.symbol for contract in local.expected_stop_contracts}
     missing_stops = tuple(
-        sorted(local.required_stop_symbols - snapshot.verified_stop_protected_symbols)
+        sorted(
+            (local.required_stop_symbols - contracted_symbols)
+            | {
+                contract.symbol
+                for contract in local.expected_stop_contracts
+                if contract.client_algo_id in invalid_stop_ids
+            }
+        )
     )
     unresolved_unknowns = tuple(sorted(local.unresolved_unknown_intent_ids))
     return ReconciliationOutcome(
@@ -466,6 +702,7 @@ def reconcile_local_state(
         unresolved_unknown_intent_ids=unresolved_unknowns,
         audit_chain_valid=local.audit_chain_valid,
         replay_valid=local.replay_valid,
+        invalid_stop_contract_ids=invalid_stop_contract_ids,
     )
 
 

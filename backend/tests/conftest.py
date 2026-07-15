@@ -13,7 +13,7 @@ from app.persistence.audit import AuditRepository
 from app.persistence.circuit_breaker import PersistenceCircuitBreaker
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import Base
-from app.planning.fills import ActualRiskPolicy
+from app.planning.fills import AccountPortfolioEnvelope, ActualRiskPolicy
 from app.simulation.intent_ledger import DurableIntentLedger
 
 LOCAL_POSTGRES_TEST_URL = "postgresql+psycopg://postgres@127.0.0.1:5432/uta"
@@ -37,15 +37,23 @@ def actual_risk_policy_for(
         funding_buffer_rate=Decimal("0"),
         funding_interval_count=0,
         risk_budget=risk_budget,
-        max_symbol_exposure_usdt=Decimal("100000"),
-        max_total_exposure_usdt=Decimal("100000"),
-        existing_symbol_exposure_usdt=Decimal("0"),
-        existing_total_exposure_usdt=Decimal("0"),
         effective_leverage=2,
-        required_reserve_usdt=Decimal("0"),
-        effective_equity_usdt=Decimal("100000"),
         protective_stop_reference=f"{plan_id}-simulated-stop",
         reduce_only_exit_reference=f"{plan_id}-simulated-reduce-only-exit",
+        portfolio_envelope=AccountPortfolioEnvelope(
+            account_scope="test-account",
+            version=1,
+            verified_account_equity_usdt=Decimal("100000"),
+            bot_equity_cap_usdt=Decimal("100000"),
+            required_reserve_usdt=Decimal("0"),
+            max_total_exposure_usdt=Decimal("100000"),
+            max_symbol_exposure_usdt=Decimal("100000"),
+            max_required_margin_usdt=Decimal("100000"),
+            daily_remaining_risk_usdt=Decimal("100000"),
+            weekly_remaining_risk_usdt=Decimal("100000"),
+            open_position_count=0,
+            pending_order_count=0,
+        ),
     )
 
 

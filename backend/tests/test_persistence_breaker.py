@@ -15,7 +15,6 @@ from app.exchange.contracts import (
 )
 from app.persistence.audit import AuditRepository
 from app.persistence.circuit_breaker import (
-    EntryIntentAuthorizationGate,
     PersistenceCircuitBreaker,
     PersistenceRecoveryEvidence,
     PersistenceUnavailable,
@@ -105,10 +104,9 @@ def test_breaker_starts_fail_closed_and_only_repository_derived_evidence_opens_i
     session_factory: sessionmaker[Session],
 ) -> None:
     breaker, ledger, repository = _recovery_components(session_factory)
-    gate = EntryIntentAuthorizationGate(breaker)
 
     with pytest.raises(PersistenceUnavailable, match="STARTUP_RECONCILIATION_REQUIRED"):
-        gate.authorize_new_entry_intent()
+        breaker.require_new_entries_allowed()
 
     with pytest.raises(PersistenceUnavailable, match="RECOVERY_EVIDENCE_INCOMPLETE"):
         breaker.reset_after_verified_reconciliation(
@@ -134,7 +132,7 @@ def test_breaker_starts_fail_closed_and_only_repository_derived_evidence_opens_i
     assert evidence.write_probe_event_id.startswith("persistence-recovery-probe-")
     assert evidence.replay_valid
     assert evidence.projection_matches_replay
-    gate.authorize_new_entry_intent()
+    ledger._entry_gate.authorize_new_entry_intent()  # noqa: SLF001
 
 
 def test_recovery_evidence_rejects_missing_or_noncontiguous_audit_witnesses() -> None:
@@ -239,7 +237,7 @@ def test_failure_before_insert_rolls_back_and_trips_shared_breaker(
 
     assert len(repository.list_audit_events()) == 1
     with pytest.raises(PersistenceUnavailable, match="DATABASE_AUDIT_FAILURE"):
-        repository.entry_authorization_gate.authorize_new_entry_intent()
+        breaker.require_new_entries_allowed()
 
 
 def test_flush_failure_rolls_back_and_trips_shared_breaker(
