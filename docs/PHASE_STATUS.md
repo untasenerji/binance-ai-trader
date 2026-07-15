@@ -50,7 +50,7 @@
 
 ## Fifth Independent Audit Remediation
 
-- Base revision: `b4a3dc86b350e3a997b8d0470a70f62057ae9021`; no remediation commit was created, as requested.
+- Base revision: `b4a3dc86b350e3a997b8d0470a70f62057ae9021`; implementation checkpoint: `8902240524d0dea3bbea77e52ffd65a1b6868404` (`fix: remediate fifth independent audit findings`).
 - `docs/FIFTH_AUDIT_REMEDIATION_REPORT.md` records red-first regressions and local closure evidence for all fifth-audit findings.
 - PostgreSQL-inclusive validation: 313 passed, 1 deliberate `live_public` deselection, 85.43% combined coverage, and 71.56% true branch coverage (`1039/1452`).
 - PostgreSQL-only validation: 18 passed; populated-0008 upgrade, replay/recovery, role normalization, config ownership, runtime denials, and migration roundtrips passed on a real PostgreSQL service.

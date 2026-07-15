@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-15
 **Base revision:** `b4a3dc86b350e3a997b8d0470a70f62057ae9021`
-**Commit:** Not created, as requested.
+**Implementation checkpoint:** `8902240524d0dea3bbea77e52ffd65a1b6868404` (`fix: remediate fifth independent audit findings`).
 
 ## Safety Boundary
 
@@ -89,9 +89,9 @@ Migration coverage was measured separately because the production app coverage s
 | `docker compose config --quiet` | PASS |
 | `git diff --check` | PASS |
 
-## Git Status
+## Git Checkpoint
 
-No commit was created. The final `git status --short` is intentionally dirty with the requested remediation:
+The implementation checkpoint is `8902240524d0dea3bbea77e52ffd65a1b6868404`. The verified pre-checkpoint `git status --short` was:
 
 ```text
  M backend/alembic/versions/0009_evidence_risk_hardening.py
