@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-15
 **Base revision:** `e19628eb75fe4b74d43286656d25865a359a9875`
-**Commit state:** Uncommitted by explicit instruction.
+**Implementation checkpoint:** `971aa6f830763c05837468d22d9cce6c58f6c66f` (`fix: remediate fourth independent audit findings`).
 
 ## Safety Boundary
 
@@ -79,7 +79,7 @@ The PostgreSQL-inclusive suite passed 286 tests with one deliberate credential-f
 
 ## Git Evidence
 
-`git diff --check` completed with exit code 0. The final uncommitted worktree required by the audit is:
+`git diff --check` completed with exit code 0. The verified pre-checkpoint worktree was:
 
 ```text
  M .github/workflows/ci.yml

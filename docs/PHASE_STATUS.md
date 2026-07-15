@@ -42,7 +42,7 @@
 
 ## Fourth Independent Audit Remediation
 
-- Base revision: `e19628e`; remediation remains uncommitted by explicit instruction.
+- Base revision: `e19628e`; implementation checkpoint: `971aa6f830763c05837468d22d9cce6c58f6c66f` (`fix: remediate fourth independent audit findings`).
 - `docs/FOURTH_AUDIT_REMEDIATION_REPORT.md` records red-first regressions, local SQLite/PostgreSQL evidence, exact test commands, and true branch-only module coverage.
 - Simulation protection and future exchange evidence are non-substitutable; no credential, signer, authenticated transport, test-order path, or real-order path was added.
 - Hosted GitHub Actions remains **NOT VERIFIED**.
