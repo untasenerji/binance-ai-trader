@@ -12,11 +12,11 @@ from app.planning.fills import (
     ActualRiskPolicy,
     ConfirmedPositionRisk,
     FillEvent,
-    evaluate_confirmed_position_risk,
 )
 from app.simulation.intent_ledger import (
     BoundedAbsenceEvidence,
     DurableIntentLedger,
+    DurableIntentRecord,
     DurableIntentStatus,
     UnknownIntentObservation,
 )
@@ -127,15 +127,38 @@ class ExchangeSimulator:
     _event_counter: int = 0
     _actual_risk_by_plan: dict[str, ConfirmedPositionRisk] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.actual_risk_policy is None:
+            return
+        if self.intent_ledger is None:
+            raise DurableIntentLedgerRequired("actual-risk policy requires a durable intent ledger")
+        self.intent_ledger.register_actual_risk_policy(self.actual_risk_policy)
+
+    @classmethod
+    def reopen_after_restart(
+        cls,
+        *,
+        intent_ledger: DurableIntentLedger,
+        now_ms: int = 0,
+    ) -> "ExchangeSimulator":
+        """Rebuild local simulator state solely from durable intent and risk evidence."""
+        simulator = cls(intent_ledger=intent_ledger, now_ms=now_ms)
+        for record in intent_ledger.list_intents():
+            simulator._rehydrate_order(record)
+        return simulator
+
     def submit(self, intent: SimulatedOrderIntent) -> SimulatedOrder:
         if self.intent_ledger is None:
             raise DurableIntentLedgerRequired(
                 "simulated submission requires a durable intent ledger"
             )
         if intent.role is OrderRole.ENTRY:
-            self._authorize_entry_risk(intent.plan_id)
+            self._authorize_entry_risk(intent)
         self.intent_ledger.prepare(intent)
-        self.intent_ledger.mark_submitting(intent.client_order_id)
+        self.intent_ledger.mark_submitting(
+            intent.client_order_id,
+            submitted_at_ms=self.now_ms,
+        )
 
         fault = self.fault_plan.consume()
         if fault in {
@@ -161,7 +184,7 @@ class ExchangeSimulator:
         self._economic_keys[intent.economic_key] = intent.client_order_id
         if fault is SimulatedFault.UNKNOWN_503:
             order.status = SimulatedOrderStatus.UNKNOWN
-            self.intent_ledger.mark_unknown(intent.client_order_id)
+            self.intent_ledger.mark_unknown(intent.client_order_id, unknown_at_ms=self.now_ms)
             raise UnknownOrderOutcome("unknown exchange outcome must be reconciled before retry")
 
         fill_sequence = self.fill_plan.consume()
@@ -183,9 +206,15 @@ class ExchangeSimulator:
                     ),
                 ),
             )
-        cancelled_order_ids = self._enforce_actual_entry_risk(
-            intent.plan_id,
-            current_client_order_id=intent.client_order_id,
+        if intent.role is OrderRole.ENTRY and order.filled_quantity > ZERO:
+            self._materialize_protection(intent.plan_id)
+        cancelled_order_ids = (
+            self._enforce_actual_entry_risk(
+                intent.plan_id,
+                current_client_order_id=intent.client_order_id,
+            )
+            if intent.role is OrderRole.ENTRY
+            else frozenset()
         )
         self.intent_ledger.record_exchange_outcome(
             intent.client_order_id,
@@ -284,6 +313,18 @@ class ExchangeSimulator:
         )
         order.status = status
         order.filled_quantity = filled_quantity
+        if order.intent.role is OrderRole.ENTRY and order.filled_quantity > ZERO:
+            self._materialize_protection(order.intent.plan_id)
+            cancelled_order_ids = self._enforce_actual_entry_risk(
+                order.intent.plan_id,
+                current_client_order_id=order.intent.client_order_id,
+            )
+            if order.intent.client_order_id in cancelled_order_ids:
+                self.intent_ledger.record_exchange_outcome(
+                    client_order_id,
+                    status=DurableIntentStatus.CANCELLED,
+                    filled_quantity=filled_quantity,
+                )
         self._schedule_event(order)
 
     def advance_to(self, now_ms: int) -> tuple[SimulatorEvent, ...]:
@@ -369,8 +410,14 @@ class ExchangeSimulator:
     ) -> None:
         if not fill_sequence:
             return
-        cumulative_quantity = ZERO
+        cumulative_quantity = order.filled_quantity
         for fill in fill_sequence:
+            if fill.cumulative_quantity < cumulative_quantity:
+                raise SimulatorError("simulated fill sequence cannot reduce cumulative quantity")
+            if fill.cumulative_quantity == cumulative_quantity:
+                self._persist_fill(order, fill)
+                self._schedule_event(order, fill=fill, status=order.status)
+                continue
             if fill.cumulative_quantity != cumulative_quantity + fill.last_quantity:
                 raise SimulatorError("simulated fill sequence cumulative quantity is inconsistent")
             if fill.cumulative_quantity > order.intent.quantity:
@@ -384,11 +431,12 @@ class ExchangeSimulator:
             )
             self._schedule_event(order, fill=fill, status=event_status)
         order.filled_quantity = cumulative_quantity
-        order.status = (
-            SimulatedOrderStatus.FILLED
-            if cumulative_quantity == order.intent.quantity
-            else SimulatedOrderStatus.PARTIALLY_FILLED
-        )
+        if order.status is not SimulatedOrderStatus.CANCELLED:
+            order.status = (
+                SimulatedOrderStatus.FILLED
+                if cumulative_quantity == order.intent.quantity
+                else SimulatedOrderStatus.PARTIALLY_FILLED
+            )
 
     def _persist_fill(self, order: SimulatedOrder, fill: SimulatedFill) -> None:
         if self.intent_ledger is None:
@@ -409,12 +457,14 @@ class ExchangeSimulator:
             )
         )
 
-    def _authorize_entry_risk(self, plan_id: str) -> None:
-        policy = self._risk_policy_for(plan_id)
+    def _authorize_entry_risk(self, intent: SimulatedOrderIntent) -> None:
+        policy = self._risk_policy_for(intent.plan_id)
         if policy is None:
-            return
+            raise EntryRiskBlocked("RISK_POLICY_MISSING")
+        if policy.symbol != intent.symbol or policy.direction is not intent.direction:
+            raise EntryRiskBlocked("RISK_POLICY_PLAN_MISMATCH")
         result = self._evaluate_actual_risk(policy)
-        self._actual_risk_by_plan[plan_id] = result
+        self._actual_risk_by_plan[intent.plan_id] = result
         if result.pending_entries_blocked:
             raise EntryRiskBlocked(result.reason or "ACTUAL_ENTRY_RISK_BLOCKED")
 
@@ -426,7 +476,7 @@ class ExchangeSimulator:
     ) -> frozenset[str]:
         policy = self._risk_policy_for(plan_id)
         if policy is None:
-            return frozenset()
+            raise EntryRiskBlocked("RISK_POLICY_MISSING")
         result = self._evaluate_actual_risk(policy)
         self._actual_risk_by_plan[plan_id] = result
         if not result.pending_entries_blocked:
@@ -460,26 +510,59 @@ class ExchangeSimulator:
             raise DurableIntentLedgerRequired(
                 "actual-risk evaluation requires a durable intent ledger"
             )
-        fills = self.intent_ledger.fill_ledger_for_plan(policy.plan_id)
-        signed_quantity = (
-            fills.filled_quantity if policy.direction is Direction.LONG else -fills.filled_quantity
-        )
-        return evaluate_confirmed_position_risk(
-            direction=policy.direction,
-            signed_confirmed_position_quantity=signed_quantity,
-            fills=fills,
-            worst_stop_exit_price=policy.worst_stop_exit_price,
-            exit_fee_rate=policy.exit_fee_rate,
-            funding_buffer_rate=policy.funding_buffer_rate,
-            funding_interval_count=policy.funding_interval_count,
-            risk_budget=policy.risk_budget,
-            stop_confirmed=policy.stop_confirmed,
-        )
+        return self.intent_ledger.actual_risk_state(policy.plan_id)
 
     def _risk_policy_for(self, plan_id: str) -> ActualRiskPolicy | None:
-        if self.actual_risk_policy is None or self.actual_risk_policy.plan_id != plan_id:
+        if self.actual_risk_policy is not None and self.actual_risk_policy.plan_id != plan_id:
             return None
-        return self.actual_risk_policy
+        if self.intent_ledger is None:
+            return None
+        return self.intent_ledger.actual_risk_policy(plan_id)
+
+    def _materialize_protection(self, plan_id: str) -> None:
+        if self.intent_ledger is None:
+            raise DurableIntentLedgerRequired(
+                "simulated protection requires a durable intent ledger"
+            )
+        policy = self._risk_policy_for(plan_id)
+        if policy is None:
+            raise EntryRiskBlocked("RISK_POLICY_MISSING")
+        fills = self.intent_ledger.fill_ledger_for_plan(plan_id)
+        if fills.filled_quantity <= ZERO:
+            return
+        self.intent_ledger.record_simulated_protection(
+            plan_id,
+            confirmed_position_quantity=fills.filled_quantity,
+        )
+
+    def _rehydrate_order(self, record: DurableIntentRecord) -> None:
+        status_by_durable = {
+            DurableIntentStatus.PREPARED: SimulatedOrderStatus.UNKNOWN,
+            DurableIntentStatus.SUBMITTING: SimulatedOrderStatus.UNKNOWN,
+            DurableIntentStatus.UNKNOWN: SimulatedOrderStatus.UNKNOWN,
+            DurableIntentStatus.NEW: SimulatedOrderStatus.NEW,
+            DurableIntentStatus.PARTIALLY_FILLED: SimulatedOrderStatus.PARTIALLY_FILLED,
+            DurableIntentStatus.FILLED: SimulatedOrderStatus.FILLED,
+            DurableIntentStatus.CANCELLED: SimulatedOrderStatus.CANCELLED,
+            DurableIntentStatus.REJECTED: SimulatedOrderStatus.REJECTED,
+            DurableIntentStatus.ABSENT: SimulatedOrderStatus.CANCELLED,
+        }
+        intent = SimulatedOrderIntent(
+            client_order_id=record.client_order_id,
+            plan_id=record.plan_id,
+            symbol=record.symbol,
+            direction=record.direction,
+            role=record.role,
+            stage_index=record.stage_index,
+            quantity=record.quantity,
+            price=record.price,
+        )
+        self._orders[record.client_order_id] = SimulatedOrder(
+            intent=intent,
+            status=status_by_durable[record.status],
+            filled_quantity=record.filled_quantity,
+        )
+        self._economic_keys[record.economic_key] = record.client_order_id
 
     def _require_order(self, client_order_id: str) -> SimulatedOrder:
         order = self._orders.get(client_order_id)

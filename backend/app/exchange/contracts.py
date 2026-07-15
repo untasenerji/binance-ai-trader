@@ -169,6 +169,7 @@ class ReconciliationSnapshot:
     positions_by_symbol: Mapping[str, Decimal]
     normal_order_client_ids: frozenset[str]
     algo_order_client_ids: frozenset[str]
+    algo_orders: tuple[AlgoOrderIntent, ...] = ()
     stop_protected_symbols: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
@@ -182,11 +183,18 @@ class ReconciliationSnapshot:
             "normal_order_client_ids",
             _normalize_identifiers(self.normal_order_client_ids, field_name="normal order IDs"),
         )
-        object.__setattr__(
-            self,
-            "algo_order_client_ids",
-            _normalize_identifiers(self.algo_order_client_ids, field_name="algo order IDs"),
+        supplied_algo_ids = _normalize_identifiers(
+            self.algo_order_client_ids, field_name="algo order IDs"
         )
+        if any(not isinstance(order, AlgoOrderIntent) for order in self.algo_orders):
+            raise TypeError("algo snapshot records must be typed AlgoOrderIntent values")
+        observed_algo_ids = frozenset(order.client_algo_id for order in self.algo_orders)
+        if len(observed_algo_ids) != len(self.algo_orders):
+            raise ValueError("algo snapshot records must not duplicate client IDs")
+        if supplied_algo_ids and supplied_algo_ids != observed_algo_ids:
+            raise ValueError("algo order IDs must match concrete algo snapshot records")
+        object.__setattr__(self, "algo_order_client_ids", observed_algo_ids)
+        object.__setattr__(self, "algo_orders", tuple(self.algo_orders))
         object.__setattr__(
             self,
             "stop_protected_symbols",
@@ -194,6 +202,15 @@ class ReconciliationSnapshot:
                 self.stop_protected_symbols,
                 field_name="stop-protected symbols",
             ),
+        )
+
+    @property
+    def verified_stop_protected_symbols(self) -> frozenset[str]:
+        """Only close-position STOP_MARKET records can prove a protected position."""
+        return frozenset(
+            order.symbol
+            for order in self.algo_orders
+            if order.algo_type is AlgoOrderType.STOP_MARKET and order.close_position
         )
 
 
@@ -319,7 +336,9 @@ def reconcile_local_state(
                 )
             )
 
-    missing_stops = tuple(sorted(local.required_stop_symbols - snapshot.stop_protected_symbols))
+    missing_stops = tuple(
+        sorted(local.required_stop_symbols - snapshot.verified_stop_protected_symbols)
+    )
     unresolved_unknowns = tuple(sorted(local.unresolved_unknown_intent_ids))
     reason_codes: list[ReconciliationReasonCode] = []
     if missing_normal:

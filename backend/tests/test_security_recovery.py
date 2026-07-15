@@ -2,13 +2,13 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from conftest import actual_risk_policy_for
 
 from app.domain.types import Direction
 from app.exchange.contracts import (
-    LocalReconciliationState,
-    ReconciliationOutcome,
+    AlgoOrderIntent,
+    AlgoOrderType,
     ReconciliationSnapshot,
-    reconcile_local_state,
 )
 from app.observability.recovery import RecoveryAction
 from app.persistence.audit import AuditRepository
@@ -48,22 +48,20 @@ def audit_repository(tmp_path: Path) -> AuditRepository:
     return AuditRepository(create_session_factory(engine))
 
 
-def _clean_reconciliation() -> ReconciliationOutcome:
-    return reconcile_local_state(
-        local=LocalReconciliationState(
-            positions_by_symbol={"BTCUSDT": Decimal("0.005")},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-            required_stop_symbols=frozenset({"BTCUSDT"}),
-            unresolved_unknown_intent_ids=frozenset(),
-            audit_chain_valid=True,
-            replay_valid=True,
-        ),
-        snapshot=ReconciliationSnapshot(
-            positions_by_symbol={"BTCUSDT": Decimal("0.005")},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-            stop_protected_symbols=frozenset({"BTCUSDT"}),
+def _reconciliation_snapshot() -> ReconciliationSnapshot:
+    return ReconciliationSnapshot(
+        positions_by_symbol={"BTCUSDT": Decimal("0.005")},
+        normal_order_client_ids=frozenset({"UTA1-recovery-EN-1"}),
+        algo_order_client_ids=frozenset({"recovery-simulated-stop"}),
+        algo_orders=(
+            AlgoOrderIntent(
+                client_algo_id="recovery-simulated-stop",
+                symbol="BTCUSDT",
+                direction=Direction.LONG,
+                algo_type=AlgoOrderType.STOP_MARKET,
+                trigger_price=Decimal("900"),
+                close_position=True,
+            ),
         ),
     )
 
@@ -75,6 +73,7 @@ def test_restart_recovers_a_partial_simulated_position_from_durable_checkpoint(
 ) -> None:
     simulator = ExchangeSimulator(
         intent_ledger=durable_intent_ledger,
+        actual_risk_policy=actual_risk_policy_for("recovery"),
         fault_plan=FaultPlan.from_faults((SimulatedFault.PARTIAL_FILL,)),
     )
     partial = simulator.submit(
@@ -98,7 +97,7 @@ def test_restart_recovers_a_partial_simulated_position_from_durable_checkpoint(
     result = LocalRecoveryCoordinator().recover_after_restart(
         restored_checkpoint,
         audit_repository=audit_repository,
-        reconciliation_outcome=_clean_reconciliation(),
+        reconciliation_snapshot=_reconciliation_snapshot(),
         intent_ledger=durable_intent_ledger,
     )
 
@@ -138,7 +137,11 @@ def test_missing_stop_hard_halts_recovery() -> None:
     result = LocalRecoveryCoordinator().recover_after_restart(
         missing_stop,
         audit_repository=AuditRepository(create_session_factory(engine)),
-        reconciliation_outcome=_clean_reconciliation(),
+        reconciliation_snapshot=ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        ),
         intent_ledger=intent_ledger,
     )
 

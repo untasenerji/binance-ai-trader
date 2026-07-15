@@ -171,7 +171,7 @@ def test_breaker_rejects_caller_forged_booleans_and_counts() -> None:
         )
     with pytest.raises(TypeError):
         breaker.reset_after_verified_reconciliation(  # type: ignore[misc, call-arg]
-            "caller-supplied evidence"  # type: ignore[arg-type]
+            "caller-supplied evidence"
         )
 
     assert not breaker.new_entries_allowed
@@ -214,6 +214,8 @@ def test_unknown_intent_cannot_resolve_from_caller_supplied_timestamps_and_count
                 price="100",
                 filled_quantity="0",
                 status=DurableIntentStatus.UNKNOWN.value,
+                submitted_at_ms=0,
+                unknown_at_ms=0,
             )
         )
     supplied = BoundedAbsenceEvidence(
@@ -458,6 +460,8 @@ def test_unknown_absence_needs_durable_repeated_observations_from_every_source(
                 price="100",
                 filled_quantity="0",
                 status=DurableIntentStatus.UNKNOWN.value,
+                submitted_at_ms=0,
+                unknown_at_ms=0,
             )
         )
     for observed_at_ms in (0, 1_000):
@@ -469,6 +473,10 @@ def test_unknown_absence_needs_durable_repeated_observations_from_every_source(
                     observed_at_ms=observed_at_ms,
                     stream_watermark_ms=observed_at_ms,
                     found=False,
+                    query_reference=f"{source.value}-{observed_at_ms}",
+                    query_client_order_id=intent.client_order_id,
+                    query_economic_key=intent.economic_key,
+                    query_started_at_ms=observed_at_ms,
                 ),
             )
 

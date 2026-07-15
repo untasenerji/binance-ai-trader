@@ -14,13 +14,25 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.domain.decimal_math import ZERO
+from app.domain.types import Direction
 from app.persistence.circuit_breaker import EntryIntentAuthorizationGate, PersistenceCircuitBreaker
 from app.persistence.models import (
+    DurableActualRiskPolicy,
+    DurableActualRiskState,
     DurableIntentAbsenceObservation,
     DurableIntentFill,
     DurableOrderIntent,
+    DurablePlanProtection,
 )
-from app.planning.fills import FillEvent, FillLedger, FillLedgerError, FillLedgerReceipt
+from app.planning.fills import (
+    ActualRiskPolicy,
+    ConfirmedPositionRisk,
+    FillEvent,
+    FillLedger,
+    FillLedgerError,
+    FillLedgerReceipt,
+    evaluate_confirmed_position_risk,
+)
 from app.simulation.models import OrderRole, SimulatedOrderIntent
 
 
@@ -87,6 +99,10 @@ class BoundedAbsenceEvidenceError(IntentLedgerError):
     pass
 
 
+class DurableRiskPolicyError(IntentLedgerError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class BoundedAbsenceEvidence:
     """A summary derived from durable observations, never an authorization input."""
@@ -133,11 +149,19 @@ class UnknownIntentObservation:
     observed_at_ms: int
     stream_watermark_ms: int
     found: bool
+    query_reference: str
+    query_client_order_id: str
+    query_economic_key: str
+    query_started_at_ms: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, AbsenceEvidenceSource):
             raise TypeError("absence observation source must be typed")
-        integer_values = (self.observed_at_ms, self.stream_watermark_ms)
+        integer_values = (
+            self.observed_at_ms,
+            self.stream_watermark_ms,
+            self.query_started_at_ms,
+        )
         if any(
             not isinstance(value, int) or isinstance(value, bool) or value < 0
             for value in integer_values
@@ -145,8 +169,16 @@ class UnknownIntentObservation:
             raise ValueError("absence observation timestamps must be non-negative integers")
         if self.stream_watermark_ms < self.observed_at_ms:
             raise ValueError("stream watermark cannot precede the observed snapshot")
+        if self.query_started_at_ms > self.observed_at_ms:
+            raise ValueError("query start cannot follow its observation")
         if not isinstance(self.found, bool):
             raise TypeError("absence observation found flag must be boolean")
+        if (
+            not self.query_reference
+            or not self.query_client_order_id
+            or not self.query_economic_key
+        ):
+            raise ValueError("absence observations need durable query identity")
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,12 +188,15 @@ class DurableIntentRecord:
     attempt_number: int
     plan_id: str
     symbol: str
+    direction: Direction
     role: OrderRole
     stage_index: int
     quantity: Decimal
     price: Decimal
     filled_quantity: Decimal
     status: DurableIntentStatus
+    submitted_at_ms: int | None
+    unknown_at_ms: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,9 +204,32 @@ class DurableAbsenceObservation:
     client_order_id: str
     economic_key: str
     source: AbsenceEvidenceSource
+    query_reference: str
+    query_client_order_id: str
+    query_economic_key: str
+    query_started_at_ms: int
     observed_at_ms: int
     stream_watermark_ms: int
     found: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DurableProtectionEvidence:
+    plan_id: str
+    protective_stop_reference: str
+    reduce_only_exit_reference: str
+    confirmed_position_quantity: Decimal
+    stop_confirmed: bool
+    reduce_only_exit_confirmed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DurableReconciliationFacts:
+    positions_by_symbol: dict[str, Decimal]
+    normal_order_client_ids: frozenset[str]
+    algo_order_client_ids: frozenset[str]
+    required_stop_symbols: frozenset[str]
+    unresolved_unknown_intent_ids: frozenset[str]
 
 
 class DurableIntentLedger:
@@ -198,6 +256,142 @@ class DurableIntentLedger:
         return DurableIntentLedger(
             self._session_factory, persistence_breaker=self._persistence_breaker
         )
+
+    def register_actual_risk_policy(self, policy: ActualRiskPolicy) -> ActualRiskPolicy:
+        """Persist an immutable entry policy before it can authorize simulator fills."""
+        if not isinstance(policy, ActualRiskPolicy):
+            raise TypeError("actual-risk policy must be typed")
+        fingerprint = self._policy_fingerprint(policy)
+        try:
+            with self._session_factory.begin() as session:
+                existing = session.get(DurableActualRiskPolicy, policy.plan_id)
+                if existing is not None:
+                    if existing.policy_fingerprint != fingerprint:
+                        raise DurableRiskPolicyError(
+                            "plan ID already has a different durable actual-risk policy"
+                        )
+                    return self._policy_from_row(existing)
+                session.add(
+                    DurableActualRiskPolicy(
+                        plan_id=policy.plan_id,
+                        symbol=policy.symbol,
+                        direction=policy.direction.value,
+                        worst_stop_exit_price=format(policy.worst_stop_exit_price, "f"),
+                        exit_fee_rate=format(policy.exit_fee_rate, "f"),
+                        funding_buffer_rate=format(policy.funding_buffer_rate, "f"),
+                        funding_interval_count=policy.funding_interval_count,
+                        risk_budget=format(policy.risk_budget, "f"),
+                        max_symbol_exposure_usdt=format(policy.max_symbol_exposure_usdt, "f"),
+                        max_total_exposure_usdt=format(policy.max_total_exposure_usdt, "f"),
+                        existing_symbol_exposure_usdt=format(
+                            policy.existing_symbol_exposure_usdt, "f"
+                        ),
+                        existing_total_exposure_usdt=format(
+                            policy.existing_total_exposure_usdt, "f"
+                        ),
+                        effective_leverage=policy.effective_leverage,
+                        required_reserve_usdt=format(policy.required_reserve_usdt, "f"),
+                        effective_equity_usdt=format(policy.effective_equity_usdt, "f"),
+                        protective_stop_reference=policy.protective_stop_reference,
+                        reduce_only_exit_reference=policy.reduce_only_exit_reference,
+                        policy_fingerprint=fingerprint,
+                    )
+                )
+                session.add(
+                    DurablePlanProtection(
+                        plan_id=policy.plan_id,
+                        protective_stop_reference=policy.protective_stop_reference,
+                        reduce_only_exit_reference=policy.reduce_only_exit_reference,
+                        confirmed_position_quantity=format(ZERO, "f"),
+                        stop_confirmed=False,
+                        reduce_only_exit_confirmed=False,
+                    )
+                )
+                session.add(
+                    DurableActualRiskState(
+                        plan_id=policy.plan_id,
+                        confirmed_position_quantity=format(ZERO, "f"),
+                        average_entry_price=None,
+                        actual_notional_usdt=format(ZERO, "f"),
+                        actual_required_margin_usdt=format(ZERO, "f"),
+                        actual_stop_risk=format(ZERO, "f"),
+                        pending_entries_blocked=False,
+                        hard_halted=False,
+                        reason=None,
+                    )
+                )
+                return policy
+        except DurableRiskPolicyError:
+            raise
+        except Exception as error:
+            self._persistence_breaker.record_write_failure(error)
+            raise
+
+    def actual_risk_policy(self, plan_id: str) -> ActualRiskPolicy | None:
+        with self._session_factory() as session:
+            row = session.get(DurableActualRiskPolicy, plan_id)
+            return None if row is None else self._policy_from_row(row)
+
+    def protection_evidence(self, plan_id: str) -> DurableProtectionEvidence:
+        with self._session_factory() as session:
+            row = session.get(DurablePlanProtection, plan_id)
+            if row is None:
+                raise KeyError(f"no durable protection evidence for {plan_id}")
+            return self._to_protection_evidence(row)
+
+    def record_simulated_protection(
+        self,
+        plan_id: str,
+        *,
+        confirmed_position_quantity: Decimal,
+    ) -> DurableProtectionEvidence:
+        """Record local-only simulated stop/reduce-only protection after a confirmed fill."""
+        if (
+            not isinstance(confirmed_position_quantity, Decimal)
+            or not confirmed_position_quantity.is_finite()
+            or confirmed_position_quantity < ZERO
+        ):
+            raise DurableRiskPolicyError("confirmed position quantity must be non-negative Decimal")
+        try:
+            with self._session_factory.begin() as session:
+                policy = session.get(DurableActualRiskPolicy, plan_id)
+                protection = session.get(DurablePlanProtection, plan_id)
+                if policy is None or protection is None:
+                    raise DurableRiskPolicyError(
+                        "durable policy and protection evidence are required"
+                    )
+                fills = self._fill_ledger_for_plan(session, plan_id)
+                if fills.filled_quantity != confirmed_position_quantity:
+                    raise DurableRiskPolicyError(
+                        "simulated protection quantity must match durable confirmed entry fills"
+                    )
+                protection.confirmed_position_quantity = format(confirmed_position_quantity, "f")
+                protection.stop_confirmed = True
+                protection.reduce_only_exit_confirmed = True
+                protection.updated_at = datetime.now(UTC)
+                self._recalculate_actual_risk(session, policy)
+                session.flush()
+                return self._to_protection_evidence(protection)
+        except DurableRiskPolicyError:
+            raise
+        except Exception as error:
+            self._persistence_breaker.record_write_failure(error)
+            raise
+
+    def actual_risk_state(self, plan_id: str) -> ConfirmedPositionRisk:
+        try:
+            with self._session_factory.begin() as session:
+                policy = session.get(DurableActualRiskPolicy, plan_id)
+                if policy is None:
+                    raise DurableRiskPolicyError("no durable actual-risk policy for this plan")
+                result = self._recalculate_actual_risk(session, policy)
+                session.flush()
+                return result
+        except DurableRiskPolicyError:
+            raise
+        except Exception as error:
+            self._persistence_breaker.record_write_failure(error)
+            raise
 
     def prepare(self, intent: SimulatedOrderIntent) -> DurableIntentRecord:
         if intent.role is OrderRole.ENTRY:
@@ -247,18 +441,32 @@ class DurableIntentLedger:
             self._persistence_breaker.record_write_failure(error)
             raise
 
-    def mark_submitting(self, client_order_id: str) -> DurableIntentRecord:
+    def mark_submitting(
+        self,
+        client_order_id: str,
+        *,
+        submitted_at_ms: int | None = None,
+    ) -> DurableIntentRecord:
         return self._transition_status(
             client_order_id,
             expected_statuses=frozenset({DurableIntentStatus.PREPARED}),
             target_status=DurableIntentStatus.SUBMITTING,
+            timestamp_field="submitted_at_ms",
+            timestamp_value=submitted_at_ms,
         )
 
-    def mark_unknown(self, client_order_id: str) -> DurableIntentRecord:
+    def mark_unknown(
+        self,
+        client_order_id: str,
+        *,
+        unknown_at_ms: int | None = None,
+    ) -> DurableIntentRecord:
         return self._transition_status(
             client_order_id,
             expected_statuses=frozenset({DurableIntentStatus.SUBMITTING}),
             target_status=DurableIntentStatus.UNKNOWN,
+            timestamp_field="unknown_at_ms",
+            timestamp_value=unknown_at_ms,
         )
 
     def record_fill(self, event: FillEvent) -> FillLedgerReceipt:
@@ -267,8 +475,6 @@ class DurableIntentLedger:
             with self._session_factory.begin() as session:
                 intent = self._record_for_update(session, event.client_order_id)
                 status = DurableIntentStatus(intent.status)
-                if status in _TERMINAL_STATUSES:
-                    raise IntentLifecycleError("terminal durable intents cannot receive new fills")
                 existing_rows = tuple(
                     session.scalars(
                         select(DurableIntentFill).where(
@@ -297,6 +503,12 @@ class DurableIntentLedger:
                         average_fill_price=fill_ledger.average_fill_price,
                         total_fee=fill_ledger.total_fee,
                     )
+                if status in {
+                    DurableIntentStatus.FILLED,
+                    DurableIntentStatus.ABSENT,
+                    DurableIntentStatus.REJECTED,
+                }:
+                    raise IntentLifecycleError("terminal durable intent cannot receive a new fill")
                 receipt = fill_ledger.record(event)
                 planned_quantity = Decimal(intent.quantity)
                 if receipt.filled_quantity > planned_quantity:
@@ -314,21 +526,27 @@ class DurableIntentLedger:
                         occurred_at=event.occurred_at.astimezone(UTC),
                     )
                 )
-                target_status = (
-                    DurableIntentStatus.FILLED
-                    if receipt.filled_quantity == planned_quantity
-                    else DurableIntentStatus.PARTIALLY_FILLED
-                )
-                self._assert_known_outcome_transition(
-                    current=status,
-                    target=target_status,
-                    prior_filled_quantity=Decimal(intent.filled_quantity),
-                    filled_quantity=receipt.filled_quantity,
-                )
-                intent.status = target_status.value
+                if status is not DurableIntentStatus.CANCELLED:
+                    target_status = (
+                        DurableIntentStatus.FILLED
+                        if receipt.filled_quantity == planned_quantity
+                        else DurableIntentStatus.PARTIALLY_FILLED
+                    )
+                    self._assert_known_outcome_transition(
+                        current=status,
+                        target=target_status,
+                        prior_filled_quantity=Decimal(intent.filled_quantity),
+                        filled_quantity=receipt.filled_quantity,
+                    )
+                    intent.status = target_status.value
                 intent.filled_quantity = format(receipt.filled_quantity, "f")
                 intent.updated_at = datetime.now(UTC)
                 session.flush()
+                if intent.role == OrderRole.ENTRY.value:
+                    policy = session.get(DurableActualRiskPolicy, intent.plan_id)
+                    if policy is not None:
+                        self._recalculate_actual_risk(session, policy)
+                        session.flush()
                 return receipt
         except (FillLedgerError, IntentLifecycleError):
             raise
@@ -380,7 +598,7 @@ class DurableIntentLedger:
                 record.updated_at = datetime.now(UTC)
                 session.flush()
                 return self._to_record(record)
-        except IntentLifecycleError:
+        except (BoundedAbsenceEvidenceError, IntentLifecycleError):
             raise
         except Exception as error:
             self._persistence_breaker.record_write_failure(error)
@@ -401,10 +619,33 @@ class DurableIntentLedger:
                     raise IntentLifecycleError(
                         "absence observations require an UNKNOWN durable intent"
                     )
+                if record.submitted_at_ms is None or record.unknown_at_ms is None:
+                    raise BoundedAbsenceEvidenceError(
+                        "durable submission and UNKNOWN timestamps are required"
+                    )
+                if (
+                    observation.query_client_order_id != record.client_order_id
+                    or observation.query_economic_key != record.economic_key
+                ):
+                    raise BoundedAbsenceEvidenceError(
+                        "absence query identity does not match the durable intent"
+                    )
+                if (
+                    observation.query_started_at_ms < record.submitted_at_ms
+                    or observation.observed_at_ms < record.unknown_at_ms
+                    or observation.stream_watermark_ms < record.unknown_at_ms
+                ):
+                    raise BoundedAbsenceEvidenceError(
+                        "absence observation predates durable UNKNOWN submission evidence"
+                    )
                 row = DurableIntentAbsenceObservation(
                     client_order_id=record.client_order_id,
                     economic_key=record.economic_key,
                     source=observation.source.value,
+                    query_reference=observation.query_reference,
+                    query_client_order_id=observation.query_client_order_id,
+                    query_economic_key=observation.query_economic_key,
+                    query_started_at_ms=observation.query_started_at_ms,
                     observed_at_ms=observation.observed_at_ms,
                     stream_watermark_ms=observation.stream_watermark_ms,
                     found=observation.found,
@@ -412,7 +653,7 @@ class DurableIntentLedger:
                 session.add(row)
                 session.flush()
                 return self._to_absence_observation(row)
-        except IntentLifecycleError:
+        except (BoundedAbsenceEvidenceError, IntentLifecycleError):
             raise
         except IntegrityError as error:
             raise BoundedAbsenceEvidenceError(
@@ -494,21 +735,7 @@ class DurableIntentLedger:
 
     def fill_ledger_for_plan(self, plan_id: str) -> FillLedger:
         with self._session_factory() as session:
-            rows = tuple(
-                session.scalars(
-                    select(DurableIntentFill)
-                    .join(
-                        DurableOrderIntent,
-                        DurableOrderIntent.client_order_id == DurableIntentFill.client_order_id,
-                    )
-                    .where(
-                        DurableOrderIntent.plan_id == plan_id,
-                        DurableOrderIntent.role == OrderRole.ENTRY.value,
-                    )
-                    .order_by(DurableIntentFill.id.asc())
-                )
-            )
-            return FillLedger.from_events(self._fill_event_from_row(row) for row in rows)
+            return self._fill_ledger_for_plan(session, plan_id)
 
     def unresolved_client_order_ids(self) -> tuple[str, ...]:
         return tuple(
@@ -529,13 +756,71 @@ class DurableIntentLedger:
             if any(record.status is status for record in records)
         }
 
+    def reconciliation_facts(self) -> DurableReconciliationFacts:
+        """Derive local position and protection expectations from durable records only."""
+        with self._session_factory() as session:
+            positions_by_symbol: dict[str, Decimal] = {}
+            required_stop_symbols: set[str] = set()
+            algo_order_client_ids: set[str] = set()
+            for state in session.scalars(select(DurableActualRiskState)):
+                policy = session.get(DurableActualRiskPolicy, state.plan_id)
+                protection = session.get(DurablePlanProtection, state.plan_id)
+                if policy is None or protection is None:
+                    raise DurableRiskPolicyError(
+                        "durable reconciliation facts require complete risk and protection records"
+                    )
+                quantity = Decimal(state.confirmed_position_quantity)
+                if quantity <= ZERO:
+                    continue
+                signed_quantity = (
+                    quantity if Direction(policy.direction) is Direction.LONG else -quantity
+                )
+                positions_by_symbol[policy.symbol] = (
+                    positions_by_symbol.get(policy.symbol, ZERO) + signed_quantity
+                )
+                required_stop_symbols.add(policy.symbol)
+                if protection.stop_confirmed and protection.reduce_only_exit_confirmed:
+                    algo_order_client_ids.add(protection.protective_stop_reference)
+
+            active_normal_statuses = {
+                DurableIntentStatus.NEW.value,
+                DurableIntentStatus.PARTIALLY_FILLED.value,
+            }
+            normal_order_client_ids = frozenset(
+                row.client_order_id
+                for row in session.scalars(select(DurableOrderIntent))
+                if row.status in active_normal_statuses and row.role != OrderRole.STOP.value
+            )
+            unresolved_unknown_intent_ids = frozenset(
+                row.client_order_id
+                for row in session.scalars(select(DurableOrderIntent))
+                if row.status in {status.value for status in _UNRESOLVED_STATUSES}
+            )
+            return DurableReconciliationFacts(
+                positions_by_symbol=positions_by_symbol,
+                normal_order_client_ids=normal_order_client_ids,
+                algo_order_client_ids=frozenset(algo_order_client_ids),
+                required_stop_symbols=frozenset(required_stop_symbols),
+                unresolved_unknown_intent_ids=unresolved_unknown_intent_ids,
+            )
+
     def _transition_status(
         self,
         client_order_id: str,
         *,
         expected_statuses: frozenset[DurableIntentStatus],
         target_status: DurableIntentStatus,
+        timestamp_field: str | None = None,
+        timestamp_value: int | None = None,
     ) -> DurableIntentRecord:
+        if timestamp_value is not None and (
+            not isinstance(timestamp_value, int)
+            or isinstance(timestamp_value, bool)
+            or timestamp_value < 0
+        ):
+            raise ValueError("durable lifecycle timestamps must be non-negative integers")
+        if timestamp_field not in {None, "submitted_at_ms", "unknown_at_ms"}:
+            raise ValueError("durable lifecycle timestamp field is invalid")
         try:
             with self._session_factory.begin() as session:
                 record = self._record_for_update(session, client_order_id)
@@ -544,6 +829,8 @@ class DurableIntentLedger:
                         "durable intent is not in the required lifecycle state"
                     )
                 record.status = target_status.value
+                if timestamp_field is not None:
+                    setattr(record, timestamp_field, timestamp_value)
                 record.updated_at = datetime.now(UTC)
                 session.flush()
                 return self._to_record(record)
@@ -584,6 +871,8 @@ class DurableIntentLedger:
         if filled_quantity < prior_filled_quantity:
             raise IntentLifecycleError("known outcomes cannot reduce durable filled quantity")
         if current in _TERMINAL_STATUSES:
+            if current is DurableIntentStatus.CANCELLED and target is DurableIntentStatus.CANCELLED:
+                return
             if current is target and prior_filled_quantity == filled_quantity:
                 return
             raise IntentLifecycleError("terminal durable intent cannot change outcome")
@@ -618,12 +907,15 @@ class DurableIntentLedger:
             attempt_number=record.attempt_number,
             plan_id=record.plan_id,
             symbol=record.symbol,
+            direction=Direction(record.direction),
             role=OrderRole(record.role),
             stage_index=record.stage_index,
             quantity=Decimal(record.quantity),
             price=Decimal(record.price),
             filled_quantity=Decimal(record.filled_quantity),
             status=DurableIntentStatus(record.status),
+            submitted_at_ms=record.submitted_at_ms,
+            unknown_at_ms=record.unknown_at_ms,
         )
 
     @staticmethod
@@ -634,6 +926,10 @@ class DurableIntentLedger:
             client_order_id=row.client_order_id,
             economic_key=row.economic_key,
             source=AbsenceEvidenceSource(row.source),
+            query_reference=row.query_reference,
+            query_client_order_id=row.query_client_order_id,
+            query_economic_key=row.query_economic_key,
+            query_started_at_ms=row.query_started_at_ms,
             observed_at_ms=row.observed_at_ms,
             stream_watermark_ms=row.stream_watermark_ms,
             found=row.found,
@@ -677,6 +973,138 @@ class DurableIntentLedger:
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     @staticmethod
+    def _policy_fingerprint(policy: ActualRiskPolicy) -> str:
+        canonical = json.dumps(
+            {
+                "direction": policy.direction.value,
+                "effective_equity_usdt": format(policy.effective_equity_usdt, "f"),
+                "effective_leverage": policy.effective_leverage,
+                "existing_symbol_exposure_usdt": format(policy.existing_symbol_exposure_usdt, "f"),
+                "existing_total_exposure_usdt": format(policy.existing_total_exposure_usdt, "f"),
+                "exit_fee_rate": format(policy.exit_fee_rate, "f"),
+                "funding_buffer_rate": format(policy.funding_buffer_rate, "f"),
+                "funding_interval_count": policy.funding_interval_count,
+                "max_symbol_exposure_usdt": format(policy.max_symbol_exposure_usdt, "f"),
+                "max_total_exposure_usdt": format(policy.max_total_exposure_usdt, "f"),
+                "plan_id": policy.plan_id,
+                "protective_stop_reference": policy.protective_stop_reference,
+                "reduce_only_exit_reference": policy.reduce_only_exit_reference,
+                "required_reserve_usdt": format(policy.required_reserve_usdt, "f"),
+                "risk_budget": format(policy.risk_budget, "f"),
+                "symbol": policy.symbol,
+                "worst_stop_exit_price": format(policy.worst_stop_exit_price, "f"),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    @staticmethod
+    def _policy_from_row(row: DurableActualRiskPolicy) -> ActualRiskPolicy:
+        return ActualRiskPolicy(
+            plan_id=row.plan_id,
+            symbol=row.symbol,
+            direction=Direction(row.direction),
+            worst_stop_exit_price=Decimal(row.worst_stop_exit_price),
+            exit_fee_rate=Decimal(row.exit_fee_rate),
+            funding_buffer_rate=Decimal(row.funding_buffer_rate),
+            funding_interval_count=row.funding_interval_count,
+            risk_budget=Decimal(row.risk_budget),
+            max_symbol_exposure_usdt=Decimal(row.max_symbol_exposure_usdt),
+            max_total_exposure_usdt=Decimal(row.max_total_exposure_usdt),
+            existing_symbol_exposure_usdt=Decimal(row.existing_symbol_exposure_usdt),
+            existing_total_exposure_usdt=Decimal(row.existing_total_exposure_usdt),
+            effective_leverage=row.effective_leverage,
+            required_reserve_usdt=Decimal(row.required_reserve_usdt),
+            effective_equity_usdt=Decimal(row.effective_equity_usdt),
+            protective_stop_reference=row.protective_stop_reference,
+            reduce_only_exit_reference=row.reduce_only_exit_reference,
+            # The stored proof is evaluated separately from policy configuration.
+            stop_confirmed=True,
+        )
+
+    @staticmethod
+    def _to_protection_evidence(row: DurablePlanProtection) -> DurableProtectionEvidence:
+        return DurableProtectionEvidence(
+            plan_id=row.plan_id,
+            protective_stop_reference=row.protective_stop_reference,
+            reduce_only_exit_reference=row.reduce_only_exit_reference,
+            confirmed_position_quantity=Decimal(row.confirmed_position_quantity),
+            stop_confirmed=row.stop_confirmed,
+            reduce_only_exit_confirmed=row.reduce_only_exit_confirmed,
+        )
+
+    @classmethod
+    def _recalculate_actual_risk(
+        cls,
+        session: Session,
+        policy_row: DurableActualRiskPolicy,
+    ) -> ConfirmedPositionRisk:
+        policy = cls._policy_from_row(policy_row)
+        protection = session.get(DurablePlanProtection, policy.plan_id)
+        state = session.get(DurableActualRiskState, policy.plan_id)
+        if protection is None or state is None:
+            raise DurableRiskPolicyError("durable policy state or protection evidence is missing")
+        if (
+            protection.protective_stop_reference != policy.protective_stop_reference
+            or protection.reduce_only_exit_reference != policy.reduce_only_exit_reference
+        ):
+            raise DurableRiskPolicyError("durable protection references do not match the policy")
+        fills = cls._fill_ledger_for_plan(session, policy.plan_id)
+        signed_confirmed_position_quantity = (
+            fills.filled_quantity if policy.direction is Direction.LONG else -fills.filled_quantity
+        )
+        result = evaluate_confirmed_position_risk(
+            direction=policy.direction,
+            signed_confirmed_position_quantity=signed_confirmed_position_quantity,
+            fills=fills,
+            worst_stop_exit_price=policy.worst_stop_exit_price,
+            exit_fee_rate=policy.exit_fee_rate,
+            funding_buffer_rate=policy.funding_buffer_rate,
+            funding_interval_count=policy.funding_interval_count,
+            risk_budget=policy.risk_budget,
+            stop_confirmed=(protection.stop_confirmed and protection.reduce_only_exit_confirmed),
+            max_symbol_exposure_usdt=policy.max_symbol_exposure_usdt,
+            max_total_exposure_usdt=policy.max_total_exposure_usdt,
+            existing_symbol_exposure_usdt=policy.existing_symbol_exposure_usdt,
+            existing_total_exposure_usdt=policy.existing_total_exposure_usdt,
+            effective_leverage=policy.effective_leverage,
+            required_reserve_usdt=policy.required_reserve_usdt,
+            effective_equity_usdt=policy.effective_equity_usdt,
+        )
+        state.confirmed_position_quantity = format(result.confirmed_position_quantity, "f")
+        state.average_entry_price = (
+            None if result.average_entry_price is None else format(result.average_entry_price, "f")
+        )
+        state.actual_notional_usdt = format(result.actual_notional_usdt, "f")
+        state.actual_required_margin_usdt = format(result.actual_required_margin_usdt, "f")
+        state.actual_stop_risk = format(result.actual_stop_risk, "f")
+        state.pending_entries_blocked = result.pending_entries_blocked
+        state.hard_halted = result.hard_halted
+        state.reason = result.reason
+        state.updated_at = datetime.now(UTC)
+        return result
+
+    @staticmethod
+    def _fill_ledger_for_plan(session: Session, plan_id: str) -> FillLedger:
+        rows = tuple(
+            session.scalars(
+                select(DurableIntentFill)
+                .join(
+                    DurableOrderIntent,
+                    DurableOrderIntent.client_order_id == DurableIntentFill.client_order_id,
+                )
+                .where(
+                    DurableOrderIntent.plan_id == plan_id,
+                    DurableOrderIntent.role == OrderRole.ENTRY.value,
+                )
+                .order_by(DurableIntentFill.id.asc())
+            )
+        )
+        return FillLedger.from_events(DurableIntentLedger._fill_event_from_row(row) for row in rows)
+
+    @staticmethod
     def _record_for_update(session: Session, client_order_id: str) -> DurableOrderIntent:
         statement = select(DurableOrderIntent).where(
             DurableOrderIntent.client_order_id == client_order_id
@@ -716,6 +1144,10 @@ class DurableIntentLedger:
         session: Session,
         record: DurableOrderIntent,
     ) -> BoundedAbsenceEvidence:
+        if record.submitted_at_ms is None or record.unknown_at_ms is None:
+            raise BoundedAbsenceEvidenceError(
+                "durable submission and UNKNOWN timestamps are required"
+            )
         rows = tuple(
             session.scalars(
                 select(DurableIntentAbsenceObservation)
@@ -728,6 +1160,24 @@ class DurableIntentLedger:
         if any(row.economic_key != record.economic_key for row in rows):
             raise BoundedAbsenceEvidenceError(
                 "absence evidence does not match durable economic identity"
+            )
+        if any(
+            row.query_client_order_id != record.client_order_id
+            or row.query_economic_key != record.economic_key
+            for row in rows
+        ):
+            raise BoundedAbsenceEvidenceError(
+                "absence query identity does not match durable intent evidence"
+            )
+        if any(
+            not row.query_reference
+            or row.query_started_at_ms < record.submitted_at_ms
+            or row.observed_at_ms < record.unknown_at_ms
+            or row.stream_watermark_ms < record.unknown_at_ms
+            for row in rows
+        ):
+            raise BoundedAbsenceEvidenceError(
+                "absence evidence is not causally after durable UNKNOWN submission"
             )
         if any(row.found for row in rows):
             raise BoundedAbsenceEvidenceError("presence evidence prevents an absence resolution")

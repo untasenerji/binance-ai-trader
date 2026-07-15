@@ -5,11 +5,7 @@ import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.domain.types import TradePlanState
-from app.exchange.contracts import (
-    LocalReconciliationState,
-    ReconciliationSnapshot,
-    reconcile_local_state,
-)
+from app.exchange.contracts import ReconciliationSnapshot
 from app.persistence.audit import AuditRepository, verify_hash_chain
 from app.persistence.circuit_breaker import (
     PersistenceCircuitBreaker,
@@ -123,21 +119,10 @@ def test_database_failure_blocks_new_entries_until_reconciliation(
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_outcome=reconcile_local_state(
-            local=LocalReconciliationState(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-                required_stop_symbols=frozenset(),
-                unresolved_unknown_intent_ids=frozenset(),
-                audit_chain_valid=True,
-                replay_valid=True,
-            ),
-            snapshot=ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-            ),
+        reconciliation_snapshot=ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
         ),
     )
     breaker.require_new_entries_allowed()

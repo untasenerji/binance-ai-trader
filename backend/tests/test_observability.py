@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -14,7 +15,14 @@ from app.observability.alerts import (
     InMemoryAlertAdapter,
 )
 from app.observability.backup import BackupNotReady, create_backup_manifest, verify_restore
-from app.observability.logging import LogLevel, StructuredLogger, redact_for_log, redact_text
+from app.observability.logging import (
+    LogLevel,
+    StructuredLogEvent,
+    StructuredLogger,
+    python_structured_logger,
+    redact_for_log,
+    redact_text,
+)
 from app.observability.metrics import MetricRegistry
 from app.observability.recovery import OperationsMonitor, RecoveryAction
 from app.observability.reports import DailyOperationsReport, DailyReportInput
@@ -138,6 +146,61 @@ def test_log_redaction_covers_basic_credentials_url_encoded_secrets_and_event_te
         )
     )
     assert basic_canary not in redact_text(encoded_text)
+
+
+def test_log_boundary_handles_collection_scalar_datetime_and_validation_branches(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class UnserializableValue:
+        pass
+
+    naive_time = datetime(2026, 7, 14, 12, 0)
+    aware_time = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
+    redacted = redact_for_log(
+        [
+            "token=collection-canary",
+            Decimal("1.25"),
+            naive_time,
+            aware_time,
+            None,
+            True,
+            3,
+            0.5,
+            UnserializableValue(),
+        ]
+    )
+
+    assert redacted == [
+        "token=[REDACTED]",
+        "1.25",
+        "2026-07-14T12:00:00+00:00",
+        "2026-07-14T12:00:00+00:00",
+        None,
+        True,
+        3,
+        0.5,
+        "<UnserializableValue>",
+    ]
+    with pytest.raises(ValueError, match="event is required"):
+        StructuredLogEvent(
+            event="  ",
+            level=LogLevel.INFO,
+            occurred_at_utc=aware_time,
+            fields={},
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        StructuredLogEvent(
+            event="naive-event",
+            level=LogLevel.INFO,
+            occurred_at_utc=naive_time,
+            fields={},
+        )
+
+    logger = python_structured_logger("third-audit-logging-branches")
+    with caplog.at_level(logging.INFO, logger="third-audit-logging-branches"):
+        serialized = logger.emit(event="branch-coverage", fields={})
+
+    assert serialized in caplog.messages
 
 
 def test_metrics_are_label_free_decimal_safe_and_renderable() -> None:

@@ -2,7 +2,10 @@ from decimal import Decimal
 
 import pytest
 
+from app.domain.types import Direction
 from app.exchange.contracts import (
+    AlgoOrderIntent,
+    AlgoOrderType,
     LocalReconciliationState,
     PositionAmount,
     PositionQuantityMismatch,
@@ -39,14 +42,26 @@ def _snapshot(
     *,
     positions_by_symbol: dict[str, Decimal] | None = None,
     normal_order_client_ids: frozenset[str] = frozenset(),
-    algo_order_client_ids: frozenset[str] = frozenset(),
+    algo_orders: tuple[AlgoOrderIntent, ...] = (),
     stop_protected_symbols: frozenset[str] = frozenset(),
 ) -> ReconciliationSnapshot:
     return ReconciliationSnapshot(
         positions_by_symbol=positions_by_symbol or {},
         normal_order_client_ids=normal_order_client_ids,
-        algo_order_client_ids=algo_order_client_ids,
+        algo_order_client_ids=frozenset(order.client_algo_id for order in algo_orders),
+        algo_orders=algo_orders,
         stop_protected_symbols=stop_protected_symbols,
+    )
+
+
+def _algo_order(client_algo_id: str, *, symbol: str = "BTCUSDT") -> AlgoOrderIntent:
+    return AlgoOrderIntent(
+        client_algo_id=client_algo_id,
+        symbol=symbol,
+        direction=Direction.LONG,
+        algo_type=AlgoOrderType.STOP_MARKET,
+        trigger_price=Decimal("90"),
+        close_position=True,
     )
 
 
@@ -58,7 +73,7 @@ def test_normal_and_algo_namespaces_are_compared_independently() -> None:
         ),
         snapshot=_snapshot(
             normal_order_client_ids=frozenset({"algo-1"}),
-            algo_order_client_ids=frozenset({"normal-1"}),
+            algo_orders=(_algo_order("normal-1"),),
         ),
     )
 
@@ -134,8 +149,7 @@ def test_only_a_fully_clean_snapshot_can_release_failure_coordinator_pause() -> 
         snapshot=_snapshot(
             positions_by_symbol={"BTCUSDT": Decimal("1")},
             normal_order_client_ids=frozenset({"normal-1"}),
-            algo_order_client_ids=frozenset({"algo-1"}),
-            stop_protected_symbols=frozenset({"BTCUSDT"}),
+            algo_orders=(_algo_order("algo-1"),),
         ),
     )
 

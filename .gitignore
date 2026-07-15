@@ -13,6 +13,10 @@ backend/.venv/
 .coverage
 coverage.xml
 coverage.json
+backend/coverage*.xml
+backend/coverage*.json
+backend/*-coverage.xml
+backend/*-coverage.json
 backend/test-results/
 *.db
 *.sqlite3

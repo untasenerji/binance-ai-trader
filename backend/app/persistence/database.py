@@ -31,6 +31,7 @@ def _install_audit_append_only_guards(engine: Engine) -> None:
         if engine.dialect.name == "sqlite":
             for table_name in (
                 "audit_events",
+                "processed_events",
                 "durable_intent_fills",
                 "durable_intent_absence_observations",
             ):
@@ -53,6 +54,7 @@ def _install_audit_append_only_guards(engine: Engine) -> None:
             )
             for table_name, trigger_name in (
                 ("audit_events", "prevent_audit_events_mutation"),
+                ("processed_events", "prevent_processed_events_mutation"),
                 ("durable_intent_fills", "prevent_durable_intent_fills_mutation"),
                 (
                     "durable_intent_absence_observations",

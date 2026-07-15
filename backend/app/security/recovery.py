@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from app.domain.decimal_math import ZERO
-from app.exchange.contracts import ReconciliationOutcome
+from app.exchange.contracts import ReconciliationSnapshot
 from app.observability.recovery import RecoveryAction
 from app.persistence.audit import AuditRepository
 from app.persistence.replay import ReplayRunner
@@ -182,11 +182,11 @@ class LocalRecoveryCoordinator:
         checkpoint: RecoveryCheckpoint,
         *,
         audit_repository: AuditRepository,
-        reconciliation_outcome: ReconciliationOutcome,
+        reconciliation_snapshot: ReconciliationSnapshot,
         intent_ledger: DurableIntentLedger,
     ) -> RecoveryResult:
-        if not isinstance(reconciliation_outcome, ReconciliationOutcome):
-            raise TypeError("reconciliation_outcome must be ReconciliationOutcome")
+        if not isinstance(reconciliation_snapshot, ReconciliationSnapshot):
+            raise TypeError("reconciliation_snapshot must be ReconciliationSnapshot")
         if not isinstance(intent_ledger, DurableIntentLedger):
             raise TypeError("intent_ledger must be DurableIntentLedger")
         replay = ReplayRunner().replay(
@@ -221,6 +221,24 @@ class LocalRecoveryCoordinator:
                 actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
                 reason=reason,
             )
+        if not self._all_stops_confirmed(checkpoint):
+            return self._hard_halt("STOP_PROTECTION_UNCONFIRMED", checkpoint)
+        durable_facts = intent_ledger.reconciliation_facts()
+        if self._checkpoint_positions(checkpoint) != {
+            symbol: abs(quantity) for symbol, quantity in durable_facts.positions_by_symbol.items()
+        }:
+            return RecoveryResult(
+                disposition=RecoveryDisposition.PAUSED,
+                local_reconciliation_complete=False,
+                stop_protection_invariant_holds=True,
+                entry_authority_enabled=False,
+                actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
+                reason="DURABLE_POSITION_CHECKPOINT_MISMATCH",
+            )
+        reconciliation_outcome = audit_repository.derive_reconciliation_outcome(
+            intent_ledger=intent_ledger,
+            reconciliation_snapshot=reconciliation_snapshot,
+        )
         if not reconciliation_outcome.is_clean:
             return RecoveryResult(
                 disposition=RecoveryDisposition.PAUSED,
@@ -230,8 +248,6 @@ class LocalRecoveryCoordinator:
                 actions=(RecoveryAction.PAUSE_NEW_ENTRIES, RecoveryAction.RECONCILE_REQUIRED),
                 reason="RECONCILIATION_MISMATCH",
             )
-        if not self._all_stops_confirmed(checkpoint):
-            return self._hard_halt("STOP_PROTECTION_UNCONFIRMED", checkpoint)
         return RecoveryResult(
             disposition=RecoveryDisposition.RECONCILED,
             local_reconciliation_complete=True,
@@ -264,6 +280,15 @@ class LocalRecoveryCoordinator:
             position.stop_protection is StopProtectionEvidence.REMOTE_CONFIRMED
             for position in checkpoint.positions
         )
+
+    @staticmethod
+    def _checkpoint_positions(checkpoint: RecoveryCheckpoint) -> dict[str, Decimal]:
+        positions_by_symbol: dict[str, Decimal] = {}
+        for position in checkpoint.positions:
+            positions_by_symbol[position.symbol] = (
+                positions_by_symbol.get(position.symbol, ZERO) + position.quantity
+            )
+        return positions_by_symbol
 
     def _hard_halt(self, reason: str, checkpoint: RecoveryCheckpoint) -> RecoveryResult:
         return RecoveryResult(

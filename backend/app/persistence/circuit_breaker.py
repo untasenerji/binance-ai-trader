@@ -1,9 +1,8 @@
 """Fail-closed persistence authorization for any future entry-intent path."""
 
 from dataclasses import dataclass
-from typing import Protocol
 
-from app.exchange.contracts import ReconciliationOutcome
+from app.exchange.contracts import ReconciliationOutcome, ReconciliationSnapshot
 
 
 class PersistenceUnavailable(RuntimeError):
@@ -30,6 +29,11 @@ class PersistenceRecoveryEvidence:
             raise ValueError("recovery evidence requires a non-empty audited chain")
         if self.audit_last_sequence != self.audit_event_count:
             raise ValueError("recovery evidence requires a contiguous audited chain")
+        if (
+            not isinstance(self.audit_last_record_hash, str)
+            or len(self.audit_last_record_hash) != 64
+        ):
+            raise ValueError("recovery evidence requires a non-null audited head hash")
         if not isinstance(self.reconciliation_outcome, ReconciliationOutcome):
             raise TypeError("recovery evidence requires a typed reconciliation outcome")
         if any(
@@ -46,19 +50,6 @@ class PersistenceRecoveryEvidence:
             and self.reconciliation_outcome.is_clean
             and not self.unresolved_intent_ids
         )
-
-
-class RecoveryEvidenceRepository(Protocol):
-    def collect_persistence_recovery_evidence(
-        self,
-        *,
-        intent_ledger: "RecoveryIntentLedger",
-        reconciliation_outcome: ReconciliationOutcome,
-    ) -> PersistenceRecoveryEvidence: ...
-
-
-class RecoveryIntentLedger(Protocol):
-    def unresolved_client_order_ids(self) -> tuple[str, ...]: ...
 
 
 @dataclass(slots=True)
@@ -81,18 +72,23 @@ class PersistenceCircuitBreaker:
     def reset_after_verified_reconciliation(
         self,
         *,
-        audit_repository: RecoveryEvidenceRepository,
-        intent_ledger: RecoveryIntentLedger,
-        reconciliation_outcome: ReconciliationOutcome,
+        audit_repository: object,
+        intent_ledger: object,
+        reconciliation_snapshot: ReconciliationSnapshot,
     ) -> PersistenceRecoveryEvidence:
-        if not isinstance(reconciliation_outcome, ReconciliationOutcome):
-            raise TypeError("reconciliation_outcome must be ReconciliationOutcome")
-        if not hasattr(intent_ledger, "unresolved_client_order_ids"):
-            raise TypeError("intent_ledger must expose durable unresolved intent IDs")
+        from app.persistence.audit import AuditRepository
+        from app.simulation.intent_ledger import DurableIntentLedger
+
+        if not isinstance(audit_repository, AuditRepository):
+            raise TypeError("audit_repository must be the concrete audit repository")
+        if not isinstance(intent_ledger, DurableIntentLedger):
+            raise TypeError("intent_ledger must be the concrete durable intent ledger")
+        if not isinstance(reconciliation_snapshot, ReconciliationSnapshot):
+            raise TypeError("reconciliation_snapshot must be a typed exchange observation")
         try:
             evidence = audit_repository.collect_persistence_recovery_evidence(
                 intent_ledger=intent_ledger,
-                reconciliation_outcome=reconciliation_outcome,
+                reconciliation_snapshot=reconciliation_snapshot,
             )
         except Exception as error:
             self.record_write_failure(error)

@@ -7,8 +7,10 @@ Create Date: 2026-07-13
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import sqlalchemy as sa
@@ -38,12 +40,40 @@ def _utc_iso(value: object) -> str:
     return value.astimezone(UTC).isoformat()
 
 
+def _normalize_legacy_value(value: object) -> object:
+    """Repair historical JSON floats into the exact string form current replay accepts."""
+    if value is None or isinstance(value, bool | str | int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError("legacy audit float is not finite")
+        return format(Decimal(str(value)), "f")
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise TypeError("legacy audit Decimal is not finite")
+        return format(value, "f")
+    if isinstance(value, datetime):
+        return _utc_iso(value)
+    if isinstance(value, Mapping):
+        normalized: dict[str, object] = {}
+        for key, nested_value in value.items():
+            if not isinstance(key, str):
+                raise TypeError("legacy audit payload key is not a string")
+            normalized[key] = _normalize_legacy_value(nested_value)
+        return normalized
+    if isinstance(value, list | tuple):
+        return [_normalize_legacy_value(nested_value) for nested_value in value]
+    raise TypeError(f"legacy audit payload contains unsupported {type(value).__name__}")
+
+
 def _payload(value: object) -> dict[str, Any]:
     if isinstance(value, str):
         value = json.loads(value)
     if not isinstance(value, Mapping):
         raise TypeError("legacy audit payload is not a mapping")
-    normalized = dict(value)
+    normalized = _normalize_legacy_value(value)
+    if not isinstance(normalized, dict):
+        raise TypeError("legacy audit payload did not normalize to a mapping")
     json.dumps(normalized, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return normalized
 

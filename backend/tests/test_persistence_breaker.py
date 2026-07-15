@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import pytest
 from sqlalchemy import event
@@ -17,6 +17,7 @@ from app.persistence.audit import AuditRepository
 from app.persistence.circuit_breaker import (
     EntryIntentAuthorizationGate,
     PersistenceCircuitBreaker,
+    PersistenceRecoveryEvidence,
     PersistenceUnavailable,
 )
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
@@ -55,7 +56,16 @@ def _record(repository: AuditRepository, event_id: str = "evt-breaker") -> None:
     )
 
 
+def _clean_reconciliation_snapshot() -> ReconciliationSnapshot:
+    return ReconciliationSnapshot(
+        positions_by_symbol={},
+        normal_order_client_ids=frozenset(),
+        algo_order_client_ids=frozenset(),
+    )
+
+
 def _clean_reconciliation_outcome() -> ReconciliationOutcome:
+    snapshot = _clean_reconciliation_snapshot()
     return reconcile_local_state(
         local=LocalReconciliationState(
             positions_by_symbol={},
@@ -66,11 +76,7 @@ def _clean_reconciliation_outcome() -> ReconciliationOutcome:
             audit_chain_valid=True,
             replay_valid=True,
         ),
-        snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-        ),
+        snapshot=snapshot,
     )
 
 
@@ -90,7 +96,7 @@ def _open_breaker(
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_outcome=_clean_reconciliation_outcome(),
+        reconciliation_snapshot=_clean_reconciliation_snapshot(),
     )
     return breaker, ledger, repository
 
@@ -108,38 +114,94 @@ def test_breaker_starts_fail_closed_and_only_repository_derived_evidence_opens_i
         breaker.reset_after_verified_reconciliation(
             audit_repository=repository,
             intent_ledger=ledger,
-            reconciliation_outcome=reconcile_local_state(
-                local=LocalReconciliationState(
-                    positions_by_symbol={},
-                    normal_order_client_ids=frozenset(),
-                    algo_order_client_ids=frozenset(),
-                    required_stop_symbols=frozenset(),
-                    unresolved_unknown_intent_ids=frozenset({"unknown"}),
-                    audit_chain_valid=True,
-                    replay_valid=True,
-                ),
-                snapshot=ReconciliationSnapshot(
-                    positions_by_symbol={},
-                    normal_order_client_ids=frozenset(),
-                    algo_order_client_ids=frozenset(),
-                ),
+            reconciliation_snapshot=ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset({"unexpected-normal"}),
+                algo_order_client_ids=frozenset(),
             ),
         )
 
     with pytest.raises(TypeError):
         breaker.reset_after_verified_reconciliation(  # type: ignore[misc, call-arg]
-            {}  # type: ignore[arg-type]
+            {}
         )
 
     evidence = breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_outcome=_clean_reconciliation_outcome(),
+        reconciliation_snapshot=_clean_reconciliation_snapshot(),
     )
     assert evidence.write_probe_event_id.startswith("persistence-recovery-probe-")
     assert evidence.replay_valid
     assert evidence.projection_matches_replay
     gate.authorize_new_entry_intent()
+
+
+def test_recovery_evidence_rejects_missing_or_noncontiguous_audit_witnesses() -> None:
+    outcome = _clean_reconciliation_outcome()
+
+    with pytest.raises(ValueError, match="write-probe"):
+        PersistenceRecoveryEvidence("", 1, 1, "a" * 64, True, True, outcome, ())
+    with pytest.raises(ValueError, match="non-empty"):
+        PersistenceRecoveryEvidence("probe", 0, 1, "a" * 64, True, True, outcome, ())
+    with pytest.raises(ValueError, match="contiguous"):
+        PersistenceRecoveryEvidence("probe", 2, 1, "a" * 64, True, True, outcome, ())
+    with pytest.raises(ValueError, match="non-null"):
+        PersistenceRecoveryEvidence("probe", 1, 1, None, True, True, outcome, ())
+    with pytest.raises(ValueError, match="non-empty strings"):
+        PersistenceRecoveryEvidence("probe", 1, 1, "a" * 64, True, True, outcome, ("",))
+
+
+def test_breaker_rejects_nonconcrete_recovery_inputs(
+    session_factory: sessionmaker[Session],
+) -> None:
+    breaker, ledger, repository = _recovery_components(session_factory)
+    snapshot = _clean_reconciliation_snapshot()
+
+    with pytest.raises(TypeError, match="concrete audit"):
+        breaker.reset_after_verified_reconciliation(
+            audit_repository=object(),
+            intent_ledger=ledger,
+            reconciliation_snapshot=snapshot,
+        )
+    with pytest.raises(TypeError, match="concrete durable"):
+        breaker.reset_after_verified_reconciliation(
+            audit_repository=repository,
+            intent_ledger=object(),
+            reconciliation_snapshot=snapshot,
+        )
+    with pytest.raises(TypeError, match="typed exchange"):
+        breaker.reset_after_verified_reconciliation(
+            audit_repository=repository,
+            intent_ledger=ledger,
+            reconciliation_snapshot=cast(ReconciliationSnapshot, object()),
+        )
+
+
+def test_breaker_remains_halted_when_repository_recovery_collection_fails(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    breaker, ledger, repository = _recovery_components(session_factory)
+
+    def raise_collection_failure(**_: object) -> PersistenceRecoveryEvidence:
+        raise RuntimeError("simulated recovery collection failure")
+
+    monkeypatch.setattr(
+        repository,
+        "collect_persistence_recovery_evidence",
+        raise_collection_failure,
+    )
+
+    with pytest.raises(PersistenceUnavailable, match="RECOVERY_EVIDENCE_COLLECTION_FAILED"):
+        breaker.reset_after_verified_reconciliation(
+            audit_repository=repository,
+            intent_ledger=ledger,
+            reconciliation_snapshot=_clean_reconciliation_snapshot(),
+        )
+
+    assert not breaker.new_entries_allowed
+    assert breaker.halted_reason == "DATABASE_AUDIT_FAILURE: RuntimeError"
 
 
 def test_normalization_error_does_not_trip_an_open_breaker(
@@ -258,7 +320,7 @@ def test_restart_remains_closed_until_repository_evidence_is_recomputed(
     restarted_breaker.reset_after_verified_reconciliation(
         audit_repository=restarted_repository,
         intent_ledger=restarted_ledger,
-        reconciliation_outcome=_clean_reconciliation_outcome(),
+        reconciliation_snapshot=_clean_reconciliation_snapshot(),
     )
 
     assert restarted_breaker.new_entries_allowed

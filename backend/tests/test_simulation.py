@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 import pytest
+from conftest import actual_risk_policy_for
 
 from app.domain.types import Direction
 from app.simulation.failure import FailureAction, FailureCoordinator
@@ -49,6 +50,7 @@ def test_partial_fill_and_duplicate_event_are_local_and_idempotency_visible(
 ) -> None:
     simulator = ExchangeSimulator(
         intent_ledger=durable_intent_ledger,
+        actual_risk_policy=actual_risk_policy_for("plan-1"),
         fault_plan=FaultPlan.from_faults(
             (SimulatedFault.PARTIAL_FILL, SimulatedFault.DUPLICATE_EVENT)
         ),
@@ -80,6 +82,7 @@ def test_delayed_event_and_unknown_outcome_prevent_duplicate_economic_order(
 ) -> None:
     delayed = ExchangeSimulator(
         intent_ledger=durable_intent_ledger,
+        actual_risk_policy=actual_risk_policy_for("plan-1"),
         fault_plan=FaultPlan.from_faults((SimulatedFault.DELAYED_EVENT,)),
     )
     delayed.submit(_intent())
@@ -88,6 +91,7 @@ def test_delayed_event_and_unknown_outcome_prevent_duplicate_economic_order(
 
     unknown = ExchangeSimulator(
         intent_ledger=durable_intent_ledger,
+        actual_risk_policy=actual_risk_policy_for("plan-1"),
         fault_plan=FaultPlan.from_faults((SimulatedFault.UNKNOWN_503,)),
     )
     unknown_intent = _intent(client_id="UTA1-plan-EN-2-1", stage_index=2)
@@ -104,6 +108,10 @@ def test_delayed_event_and_unknown_outcome_prevent_duplicate_economic_order(
                     observed_at_ms=observed_at_ms,
                     stream_watermark_ms=observed_at_ms + 1,
                     found=False,
+                    query_reference=f"{source.value}-{observed_at_ms}",
+                    query_client_order_id=unknown_intent.client_order_id,
+                    query_economic_key=unknown_intent.economic_key,
+                    query_started_at_ms=observed_at_ms,
                 ),
             )
     unknown.resolve_unknown_as_absent(unknown_intent.client_order_id)
@@ -163,6 +171,7 @@ def test_stop_rejection_and_transport_faults_are_injected_without_network(
 
     rate_limited = ExchangeSimulator(
         intent_ledger=durable_intent_ledger,
+        actual_risk_policy=actual_risk_policy_for("plan-1"),
         fault_plan=FaultPlan.from_faults((SimulatedFault.RATE_LIMIT_429,)),
     )
     with pytest.raises(InjectedExchangeError) as rate_error:

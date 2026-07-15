@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -6,18 +7,47 @@ import pytest
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.schema import CreateSchema, DropSchema
 
-from app.exchange.contracts import (
-    LocalReconciliationState,
-    ReconciliationSnapshot,
-    reconcile_local_state,
-)
+from app.domain.types import Direction
+from app.exchange.contracts import ReconciliationSnapshot
 from app.persistence.audit import AuditRepository
 from app.persistence.circuit_breaker import PersistenceCircuitBreaker
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import Base
+from app.planning.fills import ActualRiskPolicy
 from app.simulation.intent_ledger import DurableIntentLedger
 
 LOCAL_POSTGRES_TEST_URL = "postgresql+psycopg://postgres@127.0.0.1:5432/uta"
+
+
+def actual_risk_policy_for(
+    plan_id: str,
+    *,
+    direction: Direction = Direction.LONG,
+    symbol: str = "BTCUSDT",
+    worst_stop_exit_price: Decimal = Decimal("1"),
+    risk_budget: Decimal = Decimal("100000"),
+) -> ActualRiskPolicy:
+    """A deliberately roomy but complete policy for simulator behavior tests."""
+    return ActualRiskPolicy(
+        plan_id=plan_id,
+        symbol=symbol,
+        direction=direction,
+        worst_stop_exit_price=worst_stop_exit_price,
+        exit_fee_rate=Decimal("0"),
+        funding_buffer_rate=Decimal("0"),
+        funding_interval_count=0,
+        risk_budget=risk_budget,
+        max_symbol_exposure_usdt=Decimal("100000"),
+        max_total_exposure_usdt=Decimal("100000"),
+        existing_symbol_exposure_usdt=Decimal("0"),
+        existing_total_exposure_usdt=Decimal("0"),
+        effective_leverage=2,
+        required_reserve_usdt=Decimal("0"),
+        effective_equity_usdt=Decimal("100000"),
+        protective_stop_reference=f"{plan_id}-simulated-stop",
+        reduce_only_exit_reference=f"{plan_id}-simulated-reduce-only-exit",
+        stop_confirmed=True,
+    )
 
 
 @pytest.fixture
@@ -25,22 +55,6 @@ def durable_intent_ledger(tmp_path: Path) -> Iterator[DurableIntentLedger]:
     """A local SQLite outbox with an explicitly verified test-only persistence gate."""
     engine = create_database_engine(f"sqlite:///{tmp_path / 'durable-intent-fixture.sqlite'}")
     create_schema(engine)
-    clean_reconciliation = reconcile_local_state(
-        local=LocalReconciliationState(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-            required_stop_symbols=frozenset(),
-            unresolved_unknown_intent_ids=frozenset(),
-            audit_chain_valid=True,
-            replay_valid=True,
-        ),
-        snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-        ),
-    )
     breaker = PersistenceCircuitBreaker()
     session_factory = create_session_factory(engine)
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
@@ -48,7 +62,11 @@ def durable_intent_ledger(tmp_path: Path) -> Iterator[DurableIntentLedger]:
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_outcome=clean_reconciliation,
+        reconciliation_snapshot=ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        ),
     )
     try:
         yield ledger

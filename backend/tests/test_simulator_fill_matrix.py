@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from conftest import actual_risk_policy_for
 
 from app.domain.types import Direction
 from app.exchange.contracts import (
@@ -82,6 +83,7 @@ def test_configurable_fill_sequence_keeps_delta_cumulative_financial_invariants(
     )
     simulator = ExchangeSimulator(
         intent_ledger=durable_intent_ledger,
+        actual_risk_policy=actual_risk_policy_for("matrix-plan"),
         fill_plan=FillSequencePlan.from_sequences((fills,)),
     )
 
@@ -117,6 +119,7 @@ def test_partial_fill_cancel_keeps_known_partial_quantity_across_restart_boundar
 ) -> None:
     simulator = ExchangeSimulator(
         intent_ledger=durable_intent_ledger,
+        actual_risk_policy=actual_risk_policy_for("matrix-plan"),
         fill_plan=FillSequencePlan.from_sequences(
             (
                 (
@@ -151,6 +154,7 @@ def test_unknown_failure_remains_paused_until_a_clean_typed_reconciliation_outco
 ) -> None:
     simulator = ExchangeSimulator(
         intent_ledger=durable_intent_ledger,
+        actual_risk_policy=actual_risk_policy_for("matrix-plan"),
         fault_plan=FaultPlan.from_faults((SimulatedFault.UNKNOWN_503,)),
     )
     coordinator = FailureCoordinator()

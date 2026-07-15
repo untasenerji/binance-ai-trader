@@ -1,16 +1,10 @@
 from datetime import UTC, datetime
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from sqlalchemy import Engine, text
 
-from app.exchange.contracts import (
-    LocalReconciliationState,
-    ReconciliationOutcome,
-    ReconciliationSnapshot,
-    reconcile_local_state,
-)
+from app.exchange.contracts import ReconciliationSnapshot
 from app.persistence.audit import AuditRepository
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import DurableOrderIntent
@@ -18,8 +12,6 @@ from app.security.recovery import (
     LocalRecoveryCoordinator,
     RecoveryCheckpoint,
     RecoveryDisposition,
-    SimulatedOpenPosition,
-    StopProtectionEvidence,
 )
 from app.simulation.intent_ledger import DurableIntentLedger, DurableIntentStatus
 
@@ -31,23 +23,11 @@ def audit_repository(tmp_path: Path) -> tuple[AuditRepository, Engine]:
     return AuditRepository(create_session_factory(engine)), engine
 
 
-def _clean_reconciliation() -> ReconciliationOutcome:
-    return reconcile_local_state(
-        local=LocalReconciliationState(
-            positions_by_symbol={"BTCUSDT": Decimal("0.005")},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-            required_stop_symbols=frozenset({"BTCUSDT"}),
-            unresolved_unknown_intent_ids=frozenset(),
-            audit_chain_valid=True,
-            replay_valid=True,
-        ),
-        snapshot=ReconciliationSnapshot(
-            positions_by_symbol={"BTCUSDT": Decimal("0.005")},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-            stop_protected_symbols=frozenset({"BTCUSDT"}),
-        ),
+def _clean_reconciliation_snapshot() -> ReconciliationSnapshot:
+    return ReconciliationSnapshot(
+        positions_by_symbol={},
+        normal_order_client_ids=frozenset(),
+        algo_order_client_ids=frozenset(),
     )
 
 
@@ -80,22 +60,12 @@ def test_restart_derives_recovery_from_actual_audit_replay_and_typed_reconciliat
     audit_repository: tuple[AuditRepository, Engine],
 ) -> None:
     repository, engine = audit_repository
-    checkpoint = RecoveryCheckpoint(
-        positions=(
-            SimulatedOpenPosition(
-                plan_id="recovery-plan",
-                symbol="BTCUSDT",
-                quantity=Decimal("0.005"),
-                stop_protection=StopProtectionEvidence.REMOTE_CONFIRMED,
-                stop_reference="stop-1",
-            ),
-        ),
-    )
+    checkpoint = RecoveryCheckpoint(positions=())
 
     result = LocalRecoveryCoordinator().recover_after_restart(
         checkpoint,
         audit_repository=repository,
-        reconciliation_outcome=_clean_reconciliation(),
+        reconciliation_snapshot=_clean_reconciliation_snapshot(),
         intent_ledger=_ledger(engine),
     )
 
@@ -116,7 +86,7 @@ def test_restart_hard_halts_when_a_privileged_audit_mutation_breaks_replay(
     result = LocalRecoveryCoordinator().recover_after_restart(
         RecoveryCheckpoint(positions=()),
         audit_repository=repository,
-        reconciliation_outcome=_clean_reconciliation(),
+        reconciliation_snapshot=_clean_reconciliation_snapshot(),
         intent_ledger=_ledger(engine),
     )
 
@@ -140,7 +110,7 @@ def test_restart_pauses_when_durable_projection_disagrees_with_valid_replay(
     result = LocalRecoveryCoordinator().recover_after_restart(
         RecoveryCheckpoint(positions=()),
         audit_repository=repository,
-        reconciliation_outcome=_clean_reconciliation(),
+        reconciliation_snapshot=_clean_reconciliation_snapshot(),
         intent_ledger=_ledger(engine),
     )
 
@@ -175,7 +145,7 @@ def test_restart_pauses_when_the_durable_ledger_still_has_an_unknown_intent(
     result = LocalRecoveryCoordinator().recover_after_restart(
         RecoveryCheckpoint(positions=()),
         audit_repository=repository,
-        reconciliation_outcome=_clean_reconciliation(),
+        reconciliation_snapshot=_clean_reconciliation_snapshot(),
         intent_ledger=ledger,
     )
 

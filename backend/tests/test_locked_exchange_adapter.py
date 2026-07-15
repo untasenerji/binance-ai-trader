@@ -84,10 +84,11 @@ def test_reconciliation_contract_reports_exchange_local_order_mismatch() -> None
         snapshot=ReconciliationSnapshot(
             positions_by_symbol={"BTCUSDT": Decimal("0")},
             normal_order_client_ids=frozenset({"normal-1"}),
-            algo_order_client_ids=frozenset({"manual-algo"}),
+            algo_order_client_ids=frozenset({"UTA1-plan-ST-1-1"}),
+            algo_orders=(_stop_order(),),
         ),
     )
 
     assert not outcome.is_clean
     assert outcome.missing_local_order_ids == ("algo-1",)
-    assert outcome.unexpected_exchange_order_ids == ("manual-algo",)
+    assert outcome.unexpected_exchange_order_ids == ("UTA1-plan-ST-1-1",)

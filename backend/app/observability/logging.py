@@ -39,6 +39,14 @@ _SENSITIVE_ASSIGNMENT_NAME = (
     r"secret|signature|token"
 )
 _ASSIGNMENT_PATTERN = re.compile(rf"(?i)\b({_SENSITIVE_ASSIGNMENT_NAME})\s*[:=]\s*([^\s,;;&]+)")
+_JSON_QUOTED_ASSIGNMENT_PATTERN = re.compile(
+    rf'(?i)(?P<prefix>"(?P<key>{_SENSITIVE_ASSIGNMENT_NAME})"\s*:\s*")'
+    r'(?P<value>(?:\\.|[^"])*)"'
+)
+_QUOTED_ASSIGNMENT_PATTERN = re.compile(
+    rf"(?i)(?P<prefix>\b(?:{_SENSITIVE_ASSIGNMENT_NAME})\s*[:=]\s*(?P<quote>['\"]))"
+    r"(?P<value>(?:\\.|(?!\2).)*)\2"
+)
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _BASIC_PATTERN = re.compile(r"(?i)\bbasic\s+[^\s,;]+")
 _URL_ENCODED_SEPARATOR = r"(?:[_-]|%5[fF]|%2[dD])"
@@ -59,7 +67,15 @@ _CAMEL_CASE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 def redact_text(value: str) -> str:
     """Remove recognizable secret assignments without returning their original values."""
-    redacted = _BASIC_PATTERN.sub("Basic [REDACTED]", value)
+    redacted = _JSON_QUOTED_ASSIGNMENT_PATTERN.sub(
+        lambda match: f'{match.group("prefix")}[REDACTED]"',
+        value,
+    )
+    redacted = _QUOTED_ASSIGNMENT_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]{match.group('quote')}",
+        redacted,
+    )
+    redacted = _BASIC_PATTERN.sub("Basic [REDACTED]", redacted)
     redacted = _BEARER_PATTERN.sub("Bearer [REDACTED]", redacted)
     redacted = _ASSIGNMENT_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", redacted)
     redacted = _URL_ENCODED_ASSIGNMENT_PATTERN.sub(

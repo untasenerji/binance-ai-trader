@@ -37,9 +37,17 @@ from app.persistence.reducer import (
 )
 
 if TYPE_CHECKING:
-    from app.exchange.contracts import ReconciliationOutcome
+    from app.exchange.contracts import ReconciliationOutcome, ReconciliationSnapshot
+    from app.simulation.intent_ledger import DurableIntentLedger
 
 type AuditJSONValue = None | bool | int | str | list["AuditJSONValue"] | dict[str, "AuditJSONValue"]
+
+
+class _UnspecifiedAuditHash:
+    pass
+
+
+_UNSPECIFIED_AUDIT_HASH = _UnspecifiedAuditHash()
 
 
 class AuditPayloadValidationError(ValueError):
@@ -324,21 +332,71 @@ class AuditRepository:
             projections = session.scalars(select(TradePlanProjection))
             return {projection.plan_id: projection.state for projection in projections}
 
+    def derive_reconciliation_outcome(
+        self,
+        *,
+        intent_ledger: "DurableIntentLedger",
+        reconciliation_snapshot: "ReconciliationSnapshot",
+    ) -> "ReconciliationOutcome":
+        """Build reconciliation from durable facts, not caller-provided health booleans."""
+        from app.exchange.contracts import (
+            LocalReconciliationState,
+            ReconciliationOutcome,
+            ReconciliationSnapshot,
+            reconcile_local_state,
+        )
+        from app.persistence.replay import ReplayRunner
+        from app.simulation.intent_ledger import DurableIntentLedger
+
+        if not isinstance(intent_ledger, DurableIntentLedger):
+            raise TypeError("intent_ledger must be a durable intent ledger")
+        if not isinstance(reconciliation_snapshot, ReconciliationSnapshot):
+            raise TypeError("reconciliation_snapshot must be a typed exchange observation")
+        events = self.list_audit_events()
+        head = self.audit_chain_head()
+        replay = ReplayRunner().replay(events, head)
+        audit_chain_valid = verify_hash_chain(
+            events,
+            expected_count=head.event_count,
+            expected_last_sequence=head.last_sequence,
+            expected_last_record_hash=head.last_record_hash,
+        )
+        reconciliation_facts = intent_ledger.reconciliation_facts()
+        outcome = reconcile_local_state(
+            local=LocalReconciliationState(
+                positions_by_symbol=reconciliation_facts.positions_by_symbol,
+                normal_order_client_ids=reconciliation_facts.normal_order_client_ids,
+                algo_order_client_ids=reconciliation_facts.algo_order_client_ids,
+                required_stop_symbols=reconciliation_facts.required_stop_symbols,
+                unresolved_unknown_intent_ids=(reconciliation_facts.unresolved_unknown_intent_ids),
+                audit_chain_valid=audit_chain_valid,
+                replay_valid=replay.is_valid,
+            ),
+            snapshot=reconciliation_snapshot,
+        )
+        if not isinstance(outcome, ReconciliationOutcome):
+            raise RuntimeError("reconciliation derivation did not return a typed outcome")
+        return outcome
+
     def collect_persistence_recovery_evidence(
         self,
         *,
-        intent_ledger: object,
-        reconciliation_outcome: "ReconciliationOutcome",
+        intent_ledger: "DurableIntentLedger",
+        reconciliation_snapshot: "ReconciliationSnapshot",
     ) -> PersistenceRecoveryEvidence:
-        """Generate reset evidence from committed storage, never caller-provided health flags."""
-        from app.exchange.contracts import ReconciliationOutcome
+        """Derive reset evidence from committed storage and typed observed records."""
+        from app.exchange.contracts import (
+            LocalReconciliationState,
+            ReconciliationSnapshot,
+            reconcile_local_state,
+        )
         from app.persistence.replay import ReplayRunner
+        from app.simulation.intent_ledger import DurableIntentLedger
 
-        if not isinstance(reconciliation_outcome, ReconciliationOutcome):
-            raise TypeError("reconciliation_outcome must be ReconciliationOutcome")
-        unresolved_client_order_ids = getattr(intent_ledger, "unresolved_client_order_ids", None)
-        if not callable(unresolved_client_order_ids):
-            raise TypeError("intent_ledger must expose durable unresolved intent IDs")
+        if not isinstance(intent_ledger, DurableIntentLedger):
+            raise TypeError("intent_ledger must be a durable intent ledger")
+        if not isinstance(reconciliation_snapshot, ReconciliationSnapshot):
+            raise TypeError("reconciliation_snapshot must be a typed exchange observation")
 
         probe_event_id = f"persistence-recovery-probe-{uuid4().hex}"
         self.record_delivery(
@@ -352,6 +410,25 @@ class AuditRepository:
         head = self.audit_chain_head()
         replay = ReplayRunner().replay(events, head)
         replayed_states = {plan_id: state.value for plan_id, state in replay.plan_states.items()}
+        audit_chain_valid = verify_hash_chain(
+            events,
+            expected_count=head.event_count,
+            expected_last_sequence=head.last_sequence,
+            expected_last_record_hash=head.last_record_hash,
+        )
+        reconciliation_facts = intent_ledger.reconciliation_facts()
+        reconciliation_outcome = reconcile_local_state(
+            local=LocalReconciliationState(
+                positions_by_symbol=reconciliation_facts.positions_by_symbol,
+                normal_order_client_ids=reconciliation_facts.normal_order_client_ids,
+                algo_order_client_ids=reconciliation_facts.algo_order_client_ids,
+                required_stop_symbols=reconciliation_facts.required_stop_symbols,
+                unresolved_unknown_intent_ids=(reconciliation_facts.unresolved_unknown_intent_ids),
+                audit_chain_valid=audit_chain_valid,
+                replay_valid=replay.is_valid,
+            ),
+            snapshot=reconciliation_snapshot,
+        )
         return PersistenceRecoveryEvidence(
             write_probe_event_id=probe_event_id,
             audit_event_count=head.event_count,
@@ -361,7 +438,7 @@ class AuditRepository:
             projection_matches_replay=replay.is_valid
             and self.projected_states() == replayed_states,
             reconciliation_outcome=reconciliation_outcome,
-            unresolved_intent_ids=tuple(sorted(unresolved_client_order_ids())),
+            unresolved_intent_ids=tuple(sorted(reconciliation_facts.unresolved_unknown_intent_ids)),
         )
 
     @staticmethod
@@ -543,7 +620,7 @@ def verify_hash_chain(
     *,
     expected_count: int | None = None,
     expected_last_sequence: int | None = None,
-    expected_last_record_hash: str | None = None,
+    expected_last_record_hash: str | None | _UnspecifiedAuditHash = _UNSPECIFIED_AUDIT_HASH,
 ) -> bool:
     if expected_count is not None and len(events) != expected_count:
         return False
@@ -593,4 +670,8 @@ def verify_hash_chain(
     actual_last_sequence = expected_sequence - 1
     if expected_last_sequence is not None and actual_last_sequence != expected_last_sequence:
         return False
-    return expected_last_record_hash is None or previous_hash == expected_last_record_hash
+    if isinstance(expected_last_record_hash, _UnspecifiedAuditHash):
+        return True
+    if not events:
+        return expected_last_record_hash is None
+    return isinstance(expected_last_record_hash, str) and previous_hash == expected_last_record_hash

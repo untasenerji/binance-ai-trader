@@ -6,16 +6,13 @@ from threading import Barrier
 from typing import Any
 
 import pytest
+from conftest import actual_risk_policy_for
 from sqlalchemy import event
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.unitofwork import UOWTransaction
 
 from app.domain.types import Direction
-from app.exchange.contracts import (
-    LocalReconciliationState,
-    ReconciliationSnapshot,
-    reconcile_local_state,
-)
+from app.exchange.contracts import ReconciliationSnapshot
 from app.persistence.audit import AuditRepository
 from app.persistence.circuit_breaker import PersistenceCircuitBreaker
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
@@ -55,26 +52,14 @@ def _open_ledger(session_factory: sessionmaker[Session]) -> DurableIntentLedger:
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
-    clean_reconciliation = reconcile_local_state(
-        local=LocalReconciliationState(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-            required_stop_symbols=frozenset(),
-            unresolved_unknown_intent_ids=frozenset(),
-            audit_chain_valid=True,
-            replay_valid=True,
-        ),
-        snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-        ),
-    )
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_outcome=clean_reconciliation,
+        reconciliation_snapshot=ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        ),
     )
     return ledger
 
@@ -105,6 +90,7 @@ def _intent(
 def _unknown_simulator(ledger: DurableIntentLedger) -> ExchangeSimulator:
     return ExchangeSimulator(
         intent_ledger=ledger,
+        actual_risk_policy=actual_risk_policy_for("plan-1"),
         fault_plan=FaultPlan.from_faults((SimulatedFault.UNKNOWN_503,)),
     )
 
@@ -122,6 +108,10 @@ def _record_bounded_absence_observations(
                     observed_at_ms=observed_at_ms,
                     stream_watermark_ms=observed_at_ms + 1,
                     found=False,
+                    query_reference=f"{source.value}-{observed_at_ms}",
+                    query_client_order_id=intent.client_order_id,
+                    query_economic_key=intent.economic_key,
+                    query_started_at_ms=observed_at_ms,
                 ),
             )
 
@@ -292,7 +282,10 @@ def test_database_failure_after_simulated_submit_leaves_a_durable_unresolved_att
     ledger: DurableIntentLedger,
 ) -> None:
     intent = _intent()
-    simulator = ExchangeSimulator(intent_ledger=ledger)
+    simulator = ExchangeSimulator(
+        intent_ledger=ledger,
+        actual_risk_policy=actual_risk_policy_for(intent.plan_id),
+    )
 
     def fail_flush(
         session: Session,

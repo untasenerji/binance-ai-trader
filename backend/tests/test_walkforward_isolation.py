@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 
 from app.domain.types import Direction
-from app.strategy.backtest import BacktestCosts, WalkForwardRunner
+from app.strategy.backtest import BacktestCosts, WalkForwardRunner, WalkForwardTrainingError
 from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, TrainableStrategy
 
 
@@ -114,21 +114,23 @@ def test_walk_forward_uses_a_fresh_factory_instance_per_window_and_global_entry_
     assert [window.result.trades[0].signal_bar_index for window in windows] == [3, 6]
 
 
-def test_walk_forward_snapshots_source_candles_before_a_strategy_mutates_future_data() -> None:
+def test_walk_forward_rejects_a_strategy_that_retains_future_candle_data() -> None:
     source = [_candle(index) for index in range(10)]
     observed_closes: list[Decimal] = []
 
     def factory() -> TrainableStrategy:
         return ExternalMutationStrategy(source, observed_closes)
 
-    WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-        factory,
-        source,
-        timeframe="1m",
-        costs=_costs(),
-    )
+    with pytest.raises(WalkForwardTrainingError, match="held-out"):
+        WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
+            factory,
+            source,
+            timeframe="1m",
+            costs=_costs(),
+        )
 
-    assert Decimal("999") not in observed_closes
+    assert observed_closes == []
+    assert source[-1].close_price == Decimal("109")
 
 
 def test_walk_forward_rejects_overlapping_test_windows() -> None:

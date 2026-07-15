@@ -1,7 +1,9 @@
 """Deterministic, close-only strategy research with explicit cost accounting."""
 
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+import hashlib
+import json
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 
 from app.domain.decimal_math import ZERO
@@ -297,6 +299,7 @@ class WalkForwardWindow:
     test_start: int
     test_end: int
     configuration_fingerprint: str
+    training_data_fingerprint: str
     result: BacktestResult
 
 
@@ -330,7 +333,7 @@ class WalkForwardRunner:
             segment = series[start:test_end]
             training_candles = tuple(series[start:train_end])
             trainer = strategy_factory()
-            frozen_strategy = self._fit_train_only(
+            frozen_strategy, training_data_fingerprint = self._fit_train_only(
                 trainer,
                 training_candles=training_candles,
                 timeframe=timeframe,
@@ -355,19 +358,28 @@ class WalkForwardRunner:
                     test_start=train_end,
                     test_end=test_end,
                     configuration_fingerprint=frozen_strategy.configuration_fingerprint,
+                    training_data_fingerprint=training_data_fingerprint,
                     result=BacktestResult(trades=test_trades),
                 )
             )
             start += self.step_size
         return tuple(windows)
 
-    @staticmethod
+    @classmethod
     def _fit_train_only(
+        cls,
         trainer: TrainableStrategy,
         *,
         training_candles: tuple[Candle, ...],
         timeframe: str,
-    ) -> FrozenStrategy:
+    ) -> tuple[FrozenStrategy, str]:
+        training_data_fingerprint = cls._training_data_fingerprint(training_candles)
+        cls._reject_held_out_candle_references(
+            trainer,
+            training_candles=training_candles,
+            path="trainer",
+            seen=set(),
+        )
         fit = getattr(trainer, "fit", None)
         if not callable(fit):
             raise WalkForwardTrainingError("walk-forward trainer must implement fit")
@@ -381,4 +393,120 @@ class WalkForwardRunner:
             raise WalkForwardTrainingError(
                 "frozen strategy training provenance does not match the train slice"
             )
-        return frozen_strategy
+        cls._reject_held_out_candle_references(
+            frozen_strategy.evaluator,
+            training_candles=training_candles,
+            path="frozen evaluator",
+            seen=set(),
+        )
+        return frozen_strategy, training_data_fingerprint
+
+    @staticmethod
+    def _training_data_fingerprint(training_candles: tuple[Candle, ...]) -> str:
+        canonical = json.dumps(
+            [
+                {
+                    "close_price": format(candle.close_price, "f"),
+                    "close_time_ms": candle.close_time_ms,
+                    "funding_rate": format(candle.funding_rate, "f"),
+                    "high_price": format(candle.high_price, "f"),
+                    "low_price": format(candle.low_price, "f"),
+                    "open_price": format(candle.open_price, "f"),
+                    "open_time_ms": candle.open_time_ms,
+                    "symbol": candle.symbol,
+                    "timeframe": candle.timeframe,
+                    "volume": format(candle.volume, "f"),
+                }
+                for candle in training_candles
+            ],
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    @classmethod
+    def _reject_held_out_candle_references(
+        cls,
+        value: object,
+        *,
+        training_candles: tuple[Candle, ...],
+        path: str,
+        seen: set[int],
+    ) -> None:
+        """Reject fit/freeze objects that retain market candles outside the train slice."""
+        if isinstance(value, Candle):
+            if value not in training_candles:
+                raise WalkForwardTrainingError(
+                    f"{path} retains held-out market data outside the train slice"
+                )
+            return
+        if value is None or isinstance(value, (bool, int, float, str, bytes, Decimal, Direction)):
+            return
+        value_id = id(value)
+        if value_id in seen:
+            return
+        seen.add(value_id)
+        if isinstance(value, Mapping):
+            for key, nested_value in value.items():
+                cls._reject_held_out_candle_references(
+                    key,
+                    training_candles=training_candles,
+                    path=f"{path}.key",
+                    seen=seen,
+                )
+                cls._reject_held_out_candle_references(
+                    nested_value,
+                    training_candles=training_candles,
+                    path=f"{path}[{key!r}]",
+                    seen=seen,
+                )
+            return
+        if isinstance(value, (tuple, list, set, frozenset)):
+            for index, nested_value in enumerate(value):
+                cls._reject_held_out_candle_references(
+                    nested_value,
+                    training_candles=training_candles,
+                    path=f"{path}[{index}]",
+                    seen=seen,
+                )
+            return
+        if is_dataclass(value) and not isinstance(value, type):
+            for descriptor in fields(value):
+                cls._reject_held_out_candle_references(
+                    getattr(value, descriptor.name),
+                    training_candles=training_candles,
+                    path=f"{path}.{descriptor.name}",
+                    seen=seen,
+                )
+            return
+        bound_instance = getattr(value, "__self__", None)
+        if bound_instance is not None and bound_instance is not value:
+            cls._reject_held_out_candle_references(
+                bound_instance,
+                training_candles=training_candles,
+                path=f"{path}.__self__",
+                seen=seen,
+            )
+        closure = getattr(value, "__closure__", None)
+        if closure is not None:
+            for cell in closure:
+                try:
+                    cell_value = cell.cell_contents
+                except ValueError:
+                    continue
+                cls._reject_held_out_candle_references(
+                    cell_value,
+                    training_candles=training_candles,
+                    path=f"{path}.__closure__",
+                    seen=seen,
+                )
+        attributes = getattr(value, "__dict__", None)
+        if isinstance(attributes, dict):
+            for name, nested_value in attributes.items():
+                cls._reject_held_out_candle_references(
+                    nested_value,
+                    training_candles=training_candles,
+                    path=f"{path}.{name}",
+                    seen=seen,
+                )

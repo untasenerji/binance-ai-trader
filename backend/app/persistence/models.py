@@ -105,6 +105,8 @@ class DurableOrderIntent(Base):
     price: Mapped[str] = mapped_column(String(64))
     filled_quantity: Mapped[str] = mapped_column(String(64), default="0")
     status: Mapped[str] = mapped_column(String(32))
+    submitted_at_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unknown_at_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
@@ -153,10 +155,79 @@ class DurableIntentAbsenceObservation(Base):
     )
     economic_key: Mapped[str] = mapped_column(String(256))
     source: Mapped[str] = mapped_column(String(48))
+    query_reference: Mapped[str] = mapped_column(String(128))
+    query_client_order_id: Mapped[str] = mapped_column(String(128))
+    query_economic_key: Mapped[str] = mapped_column(String(256))
+    query_started_at_ms: Mapped[int] = mapped_column(Integer)
     observed_at_ms: Mapped[int] = mapped_column(Integer)
     stream_watermark_ms: Mapped[int] = mapped_column(Integer)
     found: Mapped[bool] = mapped_column()
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableActualRiskPolicy(Base):
+    """Immutable plan policy required before simulator entry facts can be accepted."""
+
+    __tablename__ = "durable_actual_risk_policies"
+
+    plan_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    direction: Mapped[str] = mapped_column(String(16))
+    worst_stop_exit_price: Mapped[str] = mapped_column(String(64))
+    exit_fee_rate: Mapped[str] = mapped_column(String(64))
+    funding_buffer_rate: Mapped[str] = mapped_column(String(64))
+    funding_interval_count: Mapped[int] = mapped_column(Integer)
+    risk_budget: Mapped[str] = mapped_column(String(64))
+    max_symbol_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    max_total_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    existing_symbol_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    existing_total_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    effective_leverage: Mapped[int] = mapped_column(Integer)
+    required_reserve_usdt: Mapped[str] = mapped_column(String(64))
+    effective_equity_usdt: Mapped[str] = mapped_column(String(64))
+    protective_stop_reference: Mapped[str] = mapped_column(String(128))
+    reduce_only_exit_reference: Mapped[str] = mapped_column(String(128))
+    policy_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurablePlanProtection(Base):
+    """Latest local-only protection evidence for a confirmed simulator position."""
+
+    __tablename__ = "durable_plan_protections"
+
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("durable_actual_risk_policies.plan_id"), primary_key=True
+    )
+    protective_stop_reference: Mapped[str] = mapped_column(String(128))
+    reduce_only_exit_reference: Mapped[str] = mapped_column(String(128))
+    confirmed_position_quantity: Mapped[str] = mapped_column(String(64), default="0")
+    stop_confirmed: Mapped[bool] = mapped_column(default=False)
+    reduce_only_exit_confirmed: Mapped[bool] = mapped_column(default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class DurableActualRiskState(Base):
+    """Durable post-fill position/risk state re-evaluated from immutable fills."""
+
+    __tablename__ = "durable_actual_risk_states"
+
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("durable_actual_risk_policies.plan_id"), primary_key=True
+    )
+    confirmed_position_quantity: Mapped[str] = mapped_column(String(64), default="0")
+    average_entry_price: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    actual_notional_usdt: Mapped[str] = mapped_column(String(64), default="0")
+    actual_required_margin_usdt: Mapped[str] = mapped_column(String(64), default="0")
+    actual_stop_risk: Mapped[str] = mapped_column(String(64), default="0")
+    pending_entries_blocked: Mapped[bool] = mapped_column(default=False)
+    hard_halted: Mapped[bool] = mapped_column(default=False)
+    reason: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
 
 
 @event.listens_for(AuditEvent, "before_update")
@@ -167,6 +238,12 @@ def _reject_audit_update(*_: object) -> None:
 @event.listens_for(AuditEvent, "before_delete")
 def _reject_audit_delete(*_: object) -> None:
     raise AppendOnlyViolation("audit_events are append-only")
+
+
+@event.listens_for(ProcessedEvent, "before_update")
+@event.listens_for(ProcessedEvent, "before_delete")
+def _reject_processed_event_mutation(*_: object) -> None:
+    raise AppendOnlyViolation("processed_events are append-only")
 
 
 @event.listens_for(DurableIntentFill, "before_update")

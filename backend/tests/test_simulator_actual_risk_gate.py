@@ -3,9 +3,9 @@
 from decimal import Decimal
 
 import pytest
+from conftest import actual_risk_policy_for
 
 from app.domain.types import Direction
-from app.planning.fills import ActualRiskPolicy
 from app.simulation.intent_ledger import DurableIntentLedger
 from app.simulation.models import (
     OrderRole,
@@ -34,15 +34,10 @@ def test_actual_fill_risk_cancels_partial_entry_and_blocks_remaining_stages(
 ) -> None:
     simulator = ExchangeSimulator(
         intent_ledger=durable_intent_ledger,
-        actual_risk_policy=ActualRiskPolicy(
-            plan_id="actual-risk-plan",
-            direction=Direction.LONG,
+        actual_risk_policy=actual_risk_policy_for(
+            "actual-risk-plan",
             worst_stop_exit_price=Decimal("90"),
-            exit_fee_rate=Decimal("0"),
-            funding_buffer_rate=Decimal("0"),
-            funding_interval_count=0,
             risk_budget=Decimal("0.01"),
-            stop_confirmed=True,
         ),
         fill_plan=FillSequencePlan.from_sequences(
             (
