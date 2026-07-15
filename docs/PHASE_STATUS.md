@@ -33,7 +33,7 @@
 
 ## Third Independent Audit Remediation
 
-- Base revision: `6296e855`; no third-remediation checkpoint commit was created by instruction.
+- Base revision: `6296e855`; third-remediation implementation checkpoint: `760ecb4` (`fix: remediate third independent audit findings`).
 - `docs/THIRD_AUDIT_REMEDIATION_REPORT.md` records red-first regressions and local remediation evidence for the reported HIGH, MEDIUM, and LOW/hardening findings.
 - PostgreSQL-inclusive validation: 225 passed, 1 deliberate public-live deselection, 84.10% total coverage, and 68.40% true branch coverage (`844/1234`).
 - Windows full validation: 215 passed, 11 deliberate PostgreSQL/public-live deselections, 83.81% total coverage, and 67.83% true branch coverage (`837/1234`); frontend and security checks passed.

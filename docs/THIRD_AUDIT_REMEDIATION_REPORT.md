@@ -2,8 +2,8 @@
 
 **Date:** 2026-07-14
 **Base revision:** `6296e855f8fa2e53316d9cbfd9e06470eacb8aba`
-**Checkpoint commit:** None, by instruction.
-**Working-tree state:** Remediation is intentionally uncommitted pending user review.
+**Checkpoint commit:** `760ecb46849455fafd898d2a9c28a5fb24f33559` (`fix: remediate third independent audit findings`).
+**Working-tree state:** Remediation was checkpointed after 2026-07-15 validation; this document update records that checkpoint.
 
 ## Safety State
 
