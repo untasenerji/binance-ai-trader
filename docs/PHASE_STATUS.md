@@ -60,7 +60,7 @@
 
 ## Sixth Independent Audit Remediation
 
-- Base revision: `cd3b4dc48dd4fd571654acd56aa901cf0d708ec3`; no remediation commit was created because the audit requires results first.
+- Base revision: `cd3b4dc48dd4fd571654acd56aa901cf0d708ec3`; implementation checkpoint: `0e336b798988c0236745d4a5d7edebb6a51ebb24` (`fix: remediate sixth independent audit findings`).
 - `docs/SIXTH_AUDIT_REMEDIATION_REPORT.md` records red-first closure evidence for all five HIGH and three MEDIUM findings.
 - Deterministic backend validation: 356 non-PostgreSQL tests and 24 real-PostgreSQL tests passed; the credential-free `live_public` test remains deliberately **NOT VERIFIED**.
 - True app branch coverage is 66.36% (`1136/1712`); all configured high-risk module gates are at or above 70%.

@@ -2,8 +2,8 @@
 
 **Date:** 2026-07-15
 **Base revision:** `cd3b4dc48dd4fd571654acd56aa901cf0d708ec3`
-**Checkpoint:** Pending creation; the implementation hash will be recorded by a follow-up
-documentation commit.
+**Implementation checkpoint:** `0e336b798988c0236745d4a5d7edebb6a51ebb24`
+(`fix: remediate sixth independent audit findings`).
 
 ## Safety Boundary
 
@@ -125,9 +125,10 @@ green populated-upgrade, replay/recovery, retry, invariant, and real-role tests 
 - External credential-free `live_public` Binance connectivity: **NOT VERIFIED**.
 - Phase 14 remains **LOCKED** and requires its existing explicit acceptance process.
 
-## Final Working Tree
+## Git Checkpoint
 
-No commit was created. The final `git status --short` output is:
+The implementation checkpoint is `0e336b798988c0236745d4a5d7edebb6a51ebb24`.
+The verified pre-checkpoint `git status --short` output was:
 
 ```text
  M backend/alembic/env.py
