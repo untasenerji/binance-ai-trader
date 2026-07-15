@@ -137,7 +137,7 @@ def test_walk_forward_returns_only_out_of_sample_trades_deterministically() -> N
         _candle(
             index,
             open_price=str(100 + index),
-            high=str(102 + index),
+            high=str(101 + index),
             low=str(99 + index),
             close=str(101 + index),
         )
@@ -149,7 +149,7 @@ def test_walk_forward_returns_only_out_of_sample_trades_deterministically() -> N
         slippage_bps=Decimal("0"),
     )
     windows = WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-        AlwaysSignalStrategy,
+        lambda: VolatilityBreakoutStrategy(lookback=2),
         candles,
         timeframe="1m",
         costs=costs,

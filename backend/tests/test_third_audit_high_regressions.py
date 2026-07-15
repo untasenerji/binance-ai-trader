@@ -30,7 +30,6 @@ from app.planning.fills import ActualRiskPolicy, FillEvent, FillLedgerError
 from app.simulation.intent_ledger import (
     AbsenceEvidenceSource,
     BoundedAbsenceEvidence,
-    BoundedAbsenceEvidenceError,
     DurableIntentLedger,
     DurableIntentStatus,
     DurableRiskPolicyError,
@@ -626,20 +625,11 @@ def test_absence_recording_rejects_missing_timestamps_before_persisting(
     intent = _intent(client_order_id="absence-missing-times", plan_id="absence-times-plan")
     durable_intent_ledger.prepare(intent)
     durable_intent_ledger.mark_submitting(intent.client_order_id)
-    durable_intent_ledger.mark_unknown(intent.client_order_id)
-    simulator = ExchangeSimulator.reopen_after_restart(
-        intent_ledger=durable_intent_ledger,
-        now_ms=10,
-        unknown_query_plan=SimulatedUnknownQueryPlan.from_states(
-            (SimulatedUnknownRemoteState.ABSENT,)
-        ),
-    )
 
-    with pytest.raises(BoundedAbsenceEvidenceError, match="timestamps"):
-        simulator.query_unknown_source(
-            intent.client_order_id,
-            AbsenceEvidenceSource.TRADE_HISTORY,
-        )
+    with pytest.raises(IntentLifecycleError, match="timestamps"):
+        durable_intent_ledger.mark_unknown(intent.client_order_id)
+
+    assert durable_intent_ledger.list_absence_observations(intent.client_order_id) == ()
 
 
 @pytest.mark.postgresql

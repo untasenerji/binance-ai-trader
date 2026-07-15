@@ -52,18 +52,24 @@ class PersistenceRecoveryEvidence:
         )
 
 
-@dataclass(slots=True)
 class PersistenceCircuitBreaker:
     """Starts closed and can reopen only from repository-derived recovery evidence."""
 
-    halted_reason: str | None = "STARTUP_RECONCILIATION_REQUIRED"
+    __slots__ = ("__halted_reason",)
+
+    def __init__(self) -> None:
+        self.__halted_reason: str | None = "STARTUP_RECONCILIATION_REQUIRED"
+
+    @property
+    def halted_reason(self) -> str | None:
+        return self.__halted_reason
 
     @property
     def new_entries_allowed(self) -> bool:
-        return self.halted_reason is None
+        return self.__halted_reason is None
 
     def record_write_failure(self, error: Exception) -> None:
-        self.halted_reason = f"{PersistenceUnavailable.code}: {type(error).__name__}"
+        self.__halted_reason = f"{PersistenceUnavailable.code}: {type(error).__name__}"
 
     def require_new_entries_allowed(self) -> None:
         if not self.new_entries_allowed:
@@ -98,7 +104,7 @@ class PersistenceCircuitBreaker:
             raise TypeError("audit repository did not return PersistenceRecoveryEvidence")
         if not evidence.is_complete:
             raise PersistenceUnavailable("RECOVERY_EVIDENCE_INCOMPLETE")
-        self.halted_reason = None
+        self.__halted_reason = None
         return evidence
 
 

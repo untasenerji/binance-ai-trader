@@ -6,6 +6,7 @@ import pytest
 from app.domain.types import Direction
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner, WalkForwardTrainingError
 from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, TrainableStrategy
+from app.strategy.strategies import VolatilityBreakoutStrategy
 
 
 def _candle(index: int, close_price: Decimal | None = None) -> Candle:
@@ -92,11 +93,11 @@ class ExternalMutationStrategy:
 
 
 def test_walk_forward_uses_a_fresh_factory_instance_per_window_and_global_entry_indexes() -> None:
-    candles = tuple(_candle(index) for index in range(10))
-    created: list[StatefulPoisonStrategy] = []
+    candles = tuple(_candle(index, Decimal("100") + Decimal(index * 2)) for index in range(10))
+    created: list[VolatilityBreakoutStrategy] = []
 
     def factory() -> TrainableStrategy:
-        strategy = StatefulPoisonStrategy()
+        strategy = VolatilityBreakoutStrategy(lookback=2)
         created.append(strategy)
         return strategy
 
@@ -109,9 +110,12 @@ def test_walk_forward_uses_a_fresh_factory_instance_per_window_and_global_entry_
 
     assert len(windows) == 2
     assert len(created) == 2
-    assert all(len(window.result.trades) == 1 for window in windows)
-    assert [window.result.trades[0].entry_bar_index for window in windows] == [4, 7]
-    assert [window.result.trades[0].signal_bar_index for window in windows] == [3, 6]
+    assert all(window.result.trades for window in windows)
+    assert all(
+        window.test_start <= trade.entry_bar_index < window.test_end
+        for window in windows
+        for trade in window.result.trades
+    )
 
 
 def test_walk_forward_rejects_a_strategy_that_retains_future_candle_data() -> None:

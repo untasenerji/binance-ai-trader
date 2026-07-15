@@ -392,14 +392,10 @@ class DurableIntentLedger:
 
     def actual_risk_policy(self, plan_id: str) -> ActualRiskPolicy | None:
         with self._session_factory() as session:
-            version = session.scalar(
-                select(DurableActualRiskPolicyVersion)
-                .where(DurableActualRiskPolicyVersion.plan_id == plan_id)
-                .order_by(DurableActualRiskPolicyVersion.version.desc())
-                .limit(1)
-            )
-            row = version if version is not None else session.get(DurableActualRiskPolicy, plan_id)
-            return None if row is None else self._policy_from_row(row)
+            base = session.get(DurableActualRiskPolicy, plan_id)
+            if base is None:
+                return None
+            return self._validated_policy_lineage(session, base)
 
     def version_actual_risk_policy(self, policy: ActualRiskPolicy) -> int:
         """Append a validated policy revision without mutating earlier evidence."""
@@ -412,6 +408,7 @@ class DurableIntentLedger:
                 if base is None:
                     raise DurableRiskPolicyError("base actual-risk policy must exist first")
                 base_policy = self._policy_from_row(base)
+                self._validated_policy_lineage(session, base)
                 if (
                     policy.symbol != base_policy.symbol
                     or policy.direction is not base_policy.direction
@@ -698,7 +695,12 @@ class DurableIntentLedger:
                     self._cancel_unfilled_superseding_attempts(session, intent)
                     policy = session.get(DurableActualRiskPolicy, intent.plan_id)
                     if policy is not None:
-                        self._recalculate_actual_risk(session, policy)
+                        result = self._recalculate_actual_risk(session, policy)
+                        if (
+                            result.pending_entries_blocked
+                            and result.reason != "SIMULATED_PROTECTION_MISSING"
+                        ):
+                            self._cancel_known_active_entry_intents(session)
                         session.flush()
                 return receipt
         except (FillLedgerError, IntentLifecycleError):
@@ -921,6 +923,14 @@ class DurableIntentLedger:
         client_order_id: str,
     ) -> tuple[DurableAbsenceObservation, ...]:
         with self._session_factory() as session:
+            record = session.scalar(
+                select(DurableOrderIntent).where(
+                    DurableOrderIntent.client_order_id == client_order_id
+                )
+            )
+            if record is None:
+                raise KeyError(f"no durable intent for {client_order_id}")
+            self._validate_lifecycle_timeline(record)
             rows = session.scalars(
                 select(DurableIntentAbsenceObservation)
                 .where(DurableIntentAbsenceObservation.client_order_id == client_order_id)
@@ -929,7 +939,7 @@ class DurableIntentLedger:
                     DurableIntentAbsenceObservation.source.asc(),
                 )
             )
-            return tuple(self._to_absence_observation(row) for row in rows)
+            return tuple(self._validated_absence_observation(row, record) for row in rows)
 
     def fill_ledger_for_intent(self, client_order_id: str) -> FillLedger:
         with self._session_factory() as session:
@@ -981,7 +991,13 @@ class DurableIntentLedger:
                     positions_by_symbol.get(policy.symbol, ZERO) + signed_quantity
                 )
                 required_stop_symbols.add(policy.symbol)
-                # Rehearsal intent references are never exchange algo-order evidence.
+                if protection.stop_intent_reference != policy.protective_stop_reference:
+                    raise DurableRiskPolicyError(
+                        "durable expected Algo stop does not match its policy"
+                    )
+                # This is a local expected ID only. The snapshot still has to supply
+                # typed exchange-observed Algo evidence before reconciliation is clean.
+                algo_order_client_ids.add(policy.protective_stop_reference)
 
             active_normal_statuses = {
                 DurableIntentStatus.NEW.value,
@@ -1029,9 +1045,10 @@ class DurableIntentLedger:
                     raise IntentLifecycleError(
                         "durable intent is not in the required lifecycle state"
                     )
-                record.status = target_status.value
                 if timestamp_field is not None:
                     setattr(record, timestamp_field, timestamp_value)
+                record.status = target_status.value
+                self._validate_lifecycle_timeline(record)
                 record.updated_at = datetime.now(UTC)
                 session.flush()
                 return self._to_record(record)
@@ -1100,8 +1117,9 @@ class DurableIntentLedger:
                 return
         raise IntentLifecycleError("known outcome violates the durable intent lifecycle")
 
-    @staticmethod
-    def _to_record(record: DurableOrderIntent) -> DurableIntentRecord:
+    @classmethod
+    def _to_record(cls, record: DurableOrderIntent) -> DurableIntentRecord:
+        cls._validate_lifecycle_timeline(record)
         return DurableIntentRecord(
             client_order_id=record.client_order_id,
             economic_key=record.economic_key,
@@ -1138,6 +1156,70 @@ class DurableIntentLedger:
             stream_watermark_ms=row.stream_watermark_ms,
             found=row.found,
         )
+
+    @classmethod
+    def _validated_absence_observation(
+        cls,
+        row: DurableIntentAbsenceObservation,
+        record: DurableOrderIntent,
+    ) -> DurableAbsenceObservation:
+        cls._validate_lifecycle_timeline(record)
+        try:
+            observation = UnknownIntentObservation(
+                source=AbsenceEvidenceSource(row.source),
+                observed_at_ms=row.observed_at_ms,
+                stream_watermark_ms=row.stream_watermark_ms,
+                found=row.found,
+                query_reference=row.query_reference,
+                query_client_order_id=row.query_client_order_id,
+                query_economic_key=row.query_economic_key,
+                query_started_at_ms=row.query_started_at_ms,
+                attempt_number=row.attempt_number,
+                client_order_namespace=ClientOrderNamespace(row.client_order_namespace),
+                provenance_fingerprint=row.provenance_fingerprint,
+            )
+        except (TypeError, ValueError) as error:
+            raise BoundedAbsenceEvidenceError(
+                "durable absence observation has invalid time or provenance"
+            ) from error
+        if (
+            record.unknown_at_ms is None
+            or observation.query_started_at_ms < record.unknown_at_ms
+            or observation.observed_at_ms < record.unknown_at_ms
+            or observation.stream_watermark_ms < record.unknown_at_ms
+        ):
+            raise BoundedAbsenceEvidenceError("durable absence observation predates UNKNOWN time")
+        if (
+            observation.query_client_order_id != record.client_order_id
+            or observation.query_economic_key != record.economic_key
+            or observation.attempt_number != record.attempt_number
+            or observation.client_order_namespace is not ClientOrderNamespace.NORMAL
+        ):
+            raise BoundedAbsenceEvidenceError(
+                "durable absence observation identity does not match its intent"
+            )
+        return cls._to_absence_observation(row)
+
+    @staticmethod
+    def _validate_lifecycle_timeline(record: DurableOrderIntent) -> None:
+        for timestamp in (record.submitted_at_ms, record.unknown_at_ms):
+            if timestamp is not None and (
+                not isinstance(timestamp, int) or isinstance(timestamp, bool) or timestamp < 0
+            ):
+                raise IntentLifecycleError(
+                    "durable lifecycle timestamp must be a non-negative integer"
+                )
+        status = DurableIntentStatus(record.status)
+        if status is DurableIntentStatus.UNKNOWN and (
+            record.submitted_at_ms is None or record.unknown_at_ms is None
+        ):
+            raise IntentLifecycleError("UNKNOWN requires durable submission and UNKNOWN timestamps")
+        if record.unknown_at_ms is not None and (
+            record.submitted_at_ms is None or record.unknown_at_ms < record.submitted_at_ms
+        ):
+            raise IntentLifecycleError(
+                "UNKNOWN timestamp cannot precede durable submission timestamp"
+            )
 
     @staticmethod
     def _fill_event_from_row(row: DurableIntentFill) -> FillEvent:
@@ -1264,16 +1346,44 @@ class DurableIntentLedger:
         session: Session,
         plan_id: str,
     ) -> ActualRiskPolicy:
-        version = session.scalar(
-            select(DurableActualRiskPolicyVersion)
-            .where(DurableActualRiskPolicyVersion.plan_id == plan_id)
-            .order_by(DurableActualRiskPolicyVersion.version.desc())
-            .limit(1)
-        )
-        row = version if version is not None else session.get(DurableActualRiskPolicy, plan_id)
-        if row is None:
+        base = session.get(DurableActualRiskPolicy, plan_id)
+        if base is None:
             raise DurableRiskPolicyError("RISK_POLICY_MISSING")
-        return cls._policy_from_row(row)
+        return cls._validated_policy_lineage(session, base)
+
+    @classmethod
+    def _validated_policy_lineage(
+        cls,
+        session: Session,
+        base: DurableActualRiskPolicy,
+    ) -> ActualRiskPolicy:
+        base_policy = cls._policy_from_row(base)
+        latest = base_policy
+        expected_version = 2
+        versions = session.scalars(
+            select(DurableActualRiskPolicyVersion)
+            .where(DurableActualRiskPolicyVersion.plan_id == base.plan_id)
+            .order_by(DurableActualRiskPolicyVersion.version.asc())
+        )
+        for row in versions:
+            if row.version != expected_version:
+                raise DurableRiskPolicyError(
+                    "durable actual-risk policy version lineage is not contiguous"
+                )
+            policy = cls._policy_from_row(row)
+            if (
+                policy.plan_id != base_policy.plan_id
+                or policy.symbol != base_policy.symbol
+                or policy.direction is not base_policy.direction
+                or policy.protective_stop_reference != base_policy.protective_stop_reference
+                or policy.reduce_only_exit_reference != base_policy.reduce_only_exit_reference
+            ):
+                raise DurableRiskPolicyError(
+                    "durable policy lineage changed plan, side, symbol, or protection identity"
+                )
+            latest = policy
+            expected_version += 1
+        return latest
 
     @staticmethod
     def _policy_row_values(
@@ -1313,14 +1423,18 @@ class DurableIntentLedger:
         position_exposure = ZERO
         symbol_position_exposure = ZERO
         projected_plan_stop_risk = ZERO
+        plan_notionals: defaultdict[str, Decimal] = defaultdict(lambda: ZERO)
+        plan_policies: dict[str, ActualRiskPolicy] = {}
         for state in session.scalars(select(DurableActualRiskState)):
             state_policy = cls._latest_policy_from_session(session, state.plan_id)
+            plan_policies[state.plan_id] = state_policy
             notional = Decimal(state.actual_notional_usdt)
             stop_risk = Decimal(state.actual_stop_risk)
             if current_plan_result is not None and state.plan_id == policy.plan_id:
                 notional = current_plan_result.actual_notional_usdt
                 stop_risk = current_plan_result.actual_stop_risk
             position_exposure += notional
+            plan_notionals[state.plan_id] += notional
             if state_policy.symbol == policy.symbol:
                 symbol_position_exposure += notional
             if state.plan_id == policy.plan_id:
@@ -1340,6 +1454,9 @@ class DurableIntentLedger:
                 continue
             remaining_quantity = max(Decimal(row.quantity) - Decimal(row.filled_quantity), ZERO)
             pending_notional = remaining_quantity * Decimal(row.price)
+            row_policy = cls._latest_policy_from_session(session, row.plan_id)
+            plan_policies[row.plan_id] = row_policy
+            plan_notionals[row.plan_id] += pending_notional
             pending_exposure += pending_notional
             if row.symbol == policy.symbol:
                 symbol_pending_exposure += pending_notional
@@ -1352,6 +1469,8 @@ class DurableIntentLedger:
 
         if proposed_intent is not None:
             proposed_notional = proposed_intent.quantity * proposed_intent.price
+            plan_policies[policy.plan_id] = policy
+            plan_notionals[policy.plan_id] += proposed_notional
             pending_exposure += proposed_notional
             symbol_pending_exposure += proposed_notional
             projected_plan_stop_risk += cls._projected_pending_stop_risk(
@@ -1366,9 +1485,17 @@ class DurableIntentLedger:
             + symbol_pending_exposure
         )
         aggregate_total = policy.existing_total_exposure_usdt + position_exposure + pending_exposure
-        required_margin = (
-            aggregate_total / Decimal(policy.effective_leverage) + policy.required_reserve_usdt
-        )
+        required_margin = policy.existing_total_exposure_usdt / Decimal(policy.effective_leverage)
+        aggregate_reserve = ZERO
+        for plan_id, notional in plan_notionals.items():
+            if notional <= ZERO:
+                continue
+            plan_policy = plan_policies[plan_id]
+            required_margin += notional / Decimal(plan_policy.effective_leverage)
+            aggregate_reserve += plan_policy.required_reserve_usdt
+        if policy.existing_total_exposure_usdt > ZERO and plan_notionals[policy.plan_id] <= ZERO:
+            aggregate_reserve += policy.required_reserve_usdt
+        required_margin += aggregate_reserve
         reason: str | None = None
         if aggregate_symbol > policy.max_symbol_exposure_usdt:
             reason = "PROJECTED_SYMBOL_EXPOSURE_LIMIT_BREACH"
@@ -1384,7 +1511,7 @@ class DurableIntentLedger:
             aggregate_symbol_exposure_usdt=aggregate_symbol,
             aggregate_total_exposure_usdt=aggregate_total,
             required_margin_usdt=required_margin,
-            reserve_usdt=policy.required_reserve_usdt,
+            reserve_usdt=aggregate_reserve,
             projected_plan_stop_risk=projected_plan_stop_risk,
             blocked=reason is not None,
             reason=reason,
@@ -1423,7 +1550,8 @@ class DurableIntentLedger:
             proposed_intent=None,
             current_plan_result=result,
         )
-        if result.pending_entries_blocked or not portfolio.blocked:
+        transient_protection_gap = result.reason == "SIMULATED_PROTECTION_MISSING"
+        if result.pending_entries_blocked and not transient_protection_gap or not portfolio.blocked:
             return PositionRiskAssessment(
                 position_quantity=result.position_quantity,
                 average_entry_price=result.average_entry_price,
@@ -1499,6 +1627,21 @@ class DurableIntentLedger:
                 continue
             later.status = DurableIntentStatus.CANCELLED.value
             later.updated_at = datetime.now(UTC)
+
+    @staticmethod
+    def _cancel_known_active_entry_intents(session: Session) -> None:
+        active_statuses = {
+            DurableIntentStatus.NEW.value,
+            DurableIntentStatus.PARTIALLY_FILLED.value,
+        }
+        for row in session.scalars(
+            select(DurableOrderIntent).where(
+                DurableOrderIntent.role == OrderRole.ENTRY.value,
+                DurableOrderIntent.status.in_(active_statuses),
+            )
+        ):
+            row.status = DurableIntentStatus.CANCELLED.value
+            row.updated_at = datetime.now(UTC)
 
     @classmethod
     def _recalculate_actual_risk(
@@ -1636,6 +1779,7 @@ class DurableIntentLedger:
         session: Session,
         record: DurableOrderIntent,
     ) -> BoundedAbsenceEvidence:
+        DurableIntentLedger._validate_lifecycle_timeline(record)
         if record.submitted_at_ms is None or record.unknown_at_ms is None:
             raise BoundedAbsenceEvidenceError(
                 "durable submission and UNKNOWN timestamps are required"

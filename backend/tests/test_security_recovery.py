@@ -66,7 +66,7 @@ def _reconciliation_snapshot() -> ReconciliationSnapshot:
     )
 
 
-def test_restart_restores_rehearsal_but_cannot_claim_exchange_reconciliation(
+def test_restart_matches_typed_snapshot_but_cannot_enable_live_authority(
     tmp_path: Path,
     durable_intent_ledger: DurableIntentLedger,
     audit_repository: AuditRepository,
@@ -101,15 +101,12 @@ def test_restart_restores_rehearsal_but_cannot_claim_exchange_reconciliation(
         intent_ledger=durable_intent_ledger,
     )
 
-    assert result.disposition is RecoveryDisposition.PAUSED
-    assert not result.local_reconciliation_complete
+    assert result.disposition is RecoveryDisposition.RECONCILED
+    assert result.local_reconciliation_complete
     assert result.simulated_protection_invariant_holds
     assert result.entry_authority_enabled is False
-    assert result.actions == (
-        RecoveryAction.PAUSE_NEW_ENTRIES,
-        RecoveryAction.RECONCILE_REQUIRED,
-    )
-    assert result.reason == "RECONCILIATION_MISMATCH"
+    assert result.actions == ()
+    assert result.reason is None
 
 
 def test_network_partition_pauses_entries_and_requires_stop_reverification() -> None:

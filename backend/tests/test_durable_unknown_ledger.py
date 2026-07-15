@@ -208,10 +208,10 @@ def test_restart_keeps_prepared_submitting_and_unknown_intents_unresolved(
     unknown = _intent(client_order_id="unknown", stage_index=3)
     ledger.prepare(prepared)
     ledger.prepare(submitting)
-    ledger.mark_submitting(submitting.client_order_id)
+    ledger.mark_submitting(submitting.client_order_id, submitted_at_ms=500)
     ledger.prepare(unknown)
-    ledger.mark_submitting(unknown.client_order_id)
-    ledger.mark_unknown(unknown.client_order_id)
+    ledger.mark_submitting(unknown.client_order_id, submitted_at_ms=1_000)
+    ledger.mark_unknown(unknown.client_order_id, unknown_at_ms=1_000)
 
     restarted = DurableIntentLedger(
         session_factory,

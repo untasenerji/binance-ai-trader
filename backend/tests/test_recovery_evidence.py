@@ -138,6 +138,8 @@ def test_restart_pauses_when_the_durable_ledger_still_has_an_unknown_intent(
                 price="100",
                 filled_quantity="0",
                 status=DurableIntentStatus.UNKNOWN.value,
+                submitted_at_ms=0,
+                unknown_at_ms=0,
             )
         )
     ledger = DurableIntentLedger(session_factory)

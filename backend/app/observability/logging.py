@@ -68,17 +68,37 @@ _URL_ENCODED_ASSIGNMENT_PATTERN = re.compile(
 )
 _OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 _CAMEL_CASE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_UNICODE_ESCAPE_PATTERN = re.compile(r"\\u([0-9a-fA-F]{4})")
+_MAX_DECODE_LAYERS = 8
+
+
+def _decode_one_layer(value: str) -> str:
+    decoded = unquote(value)
+    decoded = decoded.replace(r"\\", "\\")
+    decoded = decoded.replace(r"\"", '"').replace(r"\'", "'")
+    return _UNICODE_ESCAPE_PATTERN.sub(
+        lambda match: chr(int(match.group(1), 16)),
+        decoded,
+    )
+
+
+def _bounded_decode(value: str) -> tuple[str, bool]:
+    decoded = value
+    for _ in range(_MAX_DECODE_LAYERS):
+        next_value = _decode_one_layer(decoded)
+        if next_value == decoded:
+            return decoded, False
+        decoded = next_value
+    if _decode_one_layer(decoded) != decoded:
+        return "[REDACTED]", True
+    return decoded, False
 
 
 def redact_text(value: str) -> str:
     """Remove recognizable secret assignments without returning their original values."""
-    redacted = value
-    for _ in range(3):
-        decoded = unquote(redacted)
-        if decoded == redacted:
-            break
-        redacted = decoded
-    redacted = redacted.replace(r"\"", '"').replace(r"\'", "'")
+    redacted, decode_limit_exceeded = _bounded_decode(value)
+    if decode_limit_exceeded:
+        return redacted
     redacted = _JSON_QUOTED_ASSIGNMENT_PATTERN.sub(
         lambda match: f'{match.group("prefix")}[REDACTED]"',
         redacted,
@@ -128,7 +148,10 @@ def redact_for_log(value: object) -> object:
 
 
 def _is_sensitive_field(key: str) -> bool:
-    separated_key = _CAMEL_CASE_BOUNDARY.sub(" ", key)
+    decoded_key, decode_limit_exceeded = _bounded_decode(key)
+    if decode_limit_exceeded:
+        return True
+    separated_key = _CAMEL_CASE_BOUNDARY.sub(" ", decoded_key)
     key_parts = re.split(r"[^a-z0-9]+", separated_key.casefold())
     compact_key = "".join(key_parts)
     return (

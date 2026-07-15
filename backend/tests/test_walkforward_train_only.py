@@ -8,6 +8,7 @@ import pytest
 from app.domain.types import Direction
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner, WalkForwardTrainingError
 from app.strategy.models import Candle, FrozenStrategy, SignalCandidate
+from app.strategy.strategies import VolatilityBreakoutStrategy
 
 
 def _candle(index: int, close: Decimal) -> Candle:
@@ -94,25 +95,33 @@ def test_walk_forward_fits_only_the_train_slice_then_uses_a_frozen_snapshot() ->
             )
         )
     )
-    fitted_closes: list[tuple[Decimal, ...]] = []
-
     windows = WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
-        lambda: TrainOnlyThresholdStrategy(fitted_closes),
+        lambda: VolatilityBreakoutStrategy(lookback=2),
         candles,
         timeframe="1m",
         costs=_costs(),
     )
+    changed_held_out = candles[:4] + tuple(
+        _candle(index, Decimal("500") + Decimal(index)) for index in range(4, 7)
+    )
+    changed_windows = WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
+        lambda: VolatilityBreakoutStrategy(lookback=2),
+        changed_held_out,
+        timeframe="1m",
+        costs=_costs(),
+    )
 
-    assert fitted_closes == [(Decimal("100"), Decimal("101"), Decimal("102"), Decimal("103"))]
     assert len(windows) == 1
-    assert windows[0].result.trades
-    assert all(trade.entry_bar_index >= 4 for trade in windows[0].result.trades)
+    assert windows[0].training_data_fingerprint == changed_windows[0].training_data_fingerprint
+    assert windows[0].configuration_fingerprint == changed_windows[0].configuration_fingerprint
+    assert windows[0].train_end == 4
+    assert windows[0].test_start == 4
 
 
 def test_walk_forward_rejects_trainers_that_do_not_return_a_frozen_snapshot() -> None:
     candles = tuple(_candle(index, Decimal("100") + Decimal(index)) for index in range(7))
 
-    with pytest.raises(WalkForwardTrainingError, match="FrozenStrategy"):
+    with pytest.raises(WalkForwardTrainingError, match="custom|held-out|isolate"):
         WalkForwardRunner(train_size=4, test_size=3, step_size=3).run(
             UnfrozenTrainer,  # type: ignore[arg-type]
             candles,

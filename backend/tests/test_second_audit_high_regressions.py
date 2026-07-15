@@ -198,9 +198,7 @@ def _intent() -> SimulatedOrderIntent:
 def test_unknown_intent_cannot_resolve_from_caller_supplied_timestamps_and_count(
     session_factory: sessionmaker[Session],
 ) -> None:
-    ledger = DurableIntentLedger(
-        session_factory, persistence_breaker=PersistenceCircuitBreaker(None)
-    )
+    ledger = DurableIntentLedger(session_factory, persistence_breaker=PersistenceCircuitBreaker())
     # This direct lifecycle setup bypasses entry authorization to isolate evidence handling.
     with session_factory.begin() as session:
         from app.persistence.models import DurableOrderIntent
@@ -380,9 +378,7 @@ def test_durable_intent_permits_partial_to_filled_progression(
 def test_durable_fill_facts_rebuild_multistage_vwap_and_fees_after_restart(
     session_factory: sessionmaker[Session],
 ) -> None:
-    ledger = DurableIntentLedger(
-        session_factory, persistence_breaker=PersistenceCircuitBreaker(None)
-    )
+    ledger = DurableIntentLedger(session_factory, persistence_breaker=PersistenceCircuitBreaker())
     first = _intent()
     second = SimulatedOrderIntent(
         client_order_id="audit-high-intent-stage-2",
@@ -444,9 +440,7 @@ def test_durable_fill_facts_rebuild_multistage_vwap_and_fees_after_restart(
 def test_unknown_absence_needs_durable_repeated_observations_from_every_source(
     session_factory: sessionmaker[Session],
 ) -> None:
-    ledger = DurableIntentLedger(
-        session_factory, persistence_breaker=PersistenceCircuitBreaker(None)
-    )
+    ledger = DurableIntentLedger(session_factory, persistence_breaker=PersistenceCircuitBreaker())
     intent = _intent()
     with session_factory.begin() as session:
         from app.persistence.models import DurableOrderIntent

@@ -41,6 +41,140 @@ def _query_provenance(row: Mapping[str, object]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _drop_absence_append_only_guard(bind: sa.Connection) -> None:
+    table_name = "durable_intent_absence_observations"
+    if bind.dialect.name == "sqlite":
+        for operation in ("update", "delete"):
+            bind.execute(sa.text(f"DROP TRIGGER IF EXISTS prevent_{table_name}_{operation}"))
+    elif bind.dialect.name == "postgresql":
+        bind.execute(
+            sa.text(
+                "DROP TRIGGER IF EXISTS "
+                "prevent_durable_intent_absence_observations_mutation "
+                "ON durable_intent_absence_observations"
+            )
+        )
+
+
+def _install_absence_append_only_guard(bind: sa.Connection) -> None:
+    table_name = "durable_intent_absence_observations"
+    if bind.dialect.name == "sqlite":
+        for operation in ("update", "delete"):
+            bind.execute(
+                sa.text(
+                    f"CREATE TRIGGER prevent_{table_name}_{operation} "
+                    f"BEFORE {operation.upper()} ON {table_name} "
+                    f"BEGIN SELECT RAISE(ABORT, '{table_name} are append-only'); END"
+                )
+            )
+    elif bind.dialect.name == "postgresql":
+        bind.execute(
+            sa.text(
+                "CREATE TRIGGER prevent_durable_intent_absence_observations_mutation "
+                "BEFORE UPDATE OR DELETE OR TRUNCATE "
+                "ON durable_intent_absence_observations FOR EACH STATEMENT "
+                "EXECUTE FUNCTION reject_immutable_evidence_mutation()"
+            )
+        )
+
+
+def _verify_absence_append_only_guard(bind: sa.Connection) -> None:
+    if bind.dialect.name == "sqlite":
+        guard_count = bind.scalar(
+            sa.text(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+                "AND name IN ('prevent_durable_intent_absence_observations_update', "
+                "'prevent_durable_intent_absence_observations_delete')"
+            )
+        )
+        if guard_count != 2:
+            raise RuntimeError("absence evidence append-only guards were not restored")
+    elif bind.dialect.name == "postgresql":
+        guard_count = bind.scalar(
+            sa.text(
+                "SELECT COUNT(*) FROM pg_trigger t "
+                "JOIN pg_class c ON c.oid = t.tgrelid "
+                "WHERE c.relname = 'durable_intent_absence_observations' "
+                "AND t.tgname = 'prevent_durable_intent_absence_observations_mutation' "
+                "AND NOT t.tgisinternal"
+            )
+        )
+        if guard_count != 1:
+            raise RuntimeError("absence evidence append-only guard was not restored")
+
+
+def _normalized_query_values(row: Mapping[str, object]) -> dict[str, object]:
+    submitted_at = row["submitted_at_ms"]
+    unknown_at = row["unknown_at_ms"]
+    observed_at = int(row["observed_at_ms"])
+    stream_watermark = int(row["stream_watermark_ms"])
+    if submitted_at is None or unknown_at is None:
+        raise RuntimeError("legacy absence evidence lacks submission or UNKNOWN time")
+    submitted_at = int(submitted_at)
+    unknown_at = int(unknown_at)
+    if min(submitted_at, unknown_at, observed_at, stream_watermark) < 0:
+        raise RuntimeError("legacy absence evidence contains a negative timestamp")
+    if submitted_at > unknown_at:
+        raise RuntimeError("legacy UNKNOWN time predates submission")
+
+    query_started = row["query_started_at_ms"]
+    query_started = unknown_at if query_started is None else int(query_started)
+    if query_started < unknown_at or query_started > observed_at:
+        raise RuntimeError("legacy query duration is not causally bounded")
+    if observed_at < unknown_at or stream_watermark < observed_at:
+        raise RuntimeError("legacy observation is not causally after UNKNOWN")
+
+    client_order_id = str(row["client_order_id"])
+    economic_key = str(row["economic_key"])
+    query_client_order_id = row["query_client_order_id"] or client_order_id
+    query_economic_key = row["query_economic_key"] or economic_key
+    query_reference = row["query_reference"]
+    if not query_reference:
+        reference_seed = (
+            f"{row['id']}:{client_order_id}:{economic_key}:{row['source']}:{observed_at}"
+        )
+        digest = hashlib.sha256(reference_seed.encode()).hexdigest()[:32]
+        query_reference = f"legacy-query:{row['id']}:{digest}"
+    normalized = {
+        **dict(row),
+        "attempt_number": int(row["attempt_number"]),
+        "client_order_namespace": "NORMAL",
+        "query_client_order_id": str(query_client_order_id),
+        "query_economic_key": str(query_economic_key),
+        "query_reference": str(query_reference),
+        "query_started_at_ms": query_started,
+    }
+    normalized["provenance_fingerprint"] = _query_provenance(normalized)
+    return normalized
+
+
+def _make_query_identity_columns_non_nullable(bind: sa.Connection) -> None:
+    columns = (
+        ("query_reference", sa.String(length=128)),
+        ("query_client_order_id", sa.String(length=128)),
+        ("query_economic_key", sa.String(length=256)),
+        ("query_started_at_ms", sa.Integer()),
+    )
+    if bind.dialect.name == "sqlite":
+        with op.batch_alter_table(
+            "durable_intent_absence_observations", recreate="always"
+        ) as batch_op:
+            for column_name, column_type in columns:
+                batch_op.alter_column(
+                    column_name,
+                    existing_type=column_type,
+                    nullable=False,
+                )
+        return
+    for column_name, column_type in columns:
+        op.alter_column(
+            "durable_intent_absence_observations",
+            column_name,
+            existing_type=column_type,
+            nullable=False,
+        )
+
+
 def _create_policy_version_table() -> None:
     op.create_table(
         "durable_actual_risk_policy_versions",
@@ -102,40 +236,52 @@ def upgrade() -> None:
             "provenance_fingerprint", sa.String(length=64), nullable=False, server_default=""
         ),
     )
-    rows = bind.execute(
-        sa.text(
-            "SELECT o.id, o.economic_key, o.source, o.query_reference, "
-            "o.query_client_order_id, o.query_economic_key, o.query_started_at_ms, "
-            "o.observed_at_ms, o.stream_watermark_ms, o.found, i.attempt_number "
-            "FROM durable_intent_absence_observations o "
-            "JOIN durable_order_intents i ON i.client_order_id = o.client_order_id"
+    _drop_absence_append_only_guard(bind)
+    try:
+        rows = tuple(
+            bind.execute(
+                sa.text(
+                    "SELECT o.id, o.client_order_id, o.economic_key, o.source, "
+                    "o.query_reference, o.query_client_order_id, o.query_economic_key, "
+                    "o.query_started_at_ms, o.observed_at_ms, o.stream_watermark_ms, "
+                    "o.found, i.attempt_number, i.submitted_at_ms, i.unknown_at_ms "
+                    "FROM durable_intent_absence_observations o "
+                    "JOIN durable_order_intents i "
+                    "ON i.client_order_id = o.client_order_id ORDER BY o.id"
+                )
+            ).mappings()
         )
-    ).mappings()
-    for row in rows:
-        bind.execute(
-            sa.text(
-                "UPDATE durable_intent_absence_observations "
-                "SET attempt_number = :attempt_number, provenance_fingerprint = :fingerprint "
-                "WHERE id = :id"
-            ),
-            {
-                "attempt_number": row["attempt_number"],
-                "fingerprint": _query_provenance(row),
-                "id": row["id"],
-            },
+        for row in rows:
+            normalized = _normalized_query_values(row)
+            bind.execute(
+                sa.text(
+                    "UPDATE durable_intent_absence_observations SET "
+                    "query_reference = :query_reference, "
+                    "query_client_order_id = :query_client_order_id, "
+                    "query_economic_key = :query_economic_key, "
+                    "query_started_at_ms = :query_started_at_ms, "
+                    "attempt_number = :attempt_number, "
+                    "client_order_namespace = :client_order_namespace, "
+                    "provenance_fingerprint = :provenance_fingerprint WHERE id = :id"
+                ),
+                normalized,
+            )
+        _make_query_identity_columns_non_nullable(bind)
+        op.create_index(
+            "uq_absence_query_reference",
+            "durable_intent_absence_observations",
+            ["query_reference"],
+            unique=True,
         )
-    op.create_index(
-        "uq_absence_query_reference",
-        "durable_intent_absence_observations",
-        ["query_reference"],
-        unique=True,
-    )
-    op.create_index(
-        "uq_absence_provenance_fingerprint",
-        "durable_intent_absence_observations",
-        ["provenance_fingerprint"],
-        unique=True,
-    )
+        op.create_index(
+            "uq_absence_provenance_fingerprint",
+            "durable_intent_absence_observations",
+            ["provenance_fingerprint"],
+            unique=True,
+        )
+    finally:
+        _install_absence_append_only_guard(bind)
+        _verify_absence_append_only_guard(bind)
 
     op.rename_table("durable_plan_protections", "durable_simulated_protections")
     for old_name, new_name in (
@@ -198,6 +344,34 @@ def upgrade() -> None:
         return
     if bind.dialect.name != "postgresql":
         return
+    bind.execute(
+        sa.text(
+            "ALTER ROLE uta_runtime WITH NOSUPERUSER NOCREATEROLE NOCREATEDB "
+            "NOREPLICATION NOBYPASSRLS NOINHERIT"
+        )
+    )
+    bind.execute(
+        sa.text(
+            "DO $$ BEGIN IF NOT EXISTS "
+            "(SELECT 1 FROM pg_roles WHERE rolname = 'uta_policy_config') THEN "
+            "CREATE ROLE uta_policy_config NOLOGIN; END IF; END $$"
+        )
+    )
+    bind.execute(
+        sa.text(
+            "ALTER ROLE uta_policy_config WITH NOLOGIN NOSUPERUSER NOCREATEROLE "
+            "NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT"
+        )
+    )
+    bind.execute(
+        sa.text(
+            "DO $$ BEGIN "
+            "EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', "
+            "current_database()); "
+            "EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM uta_runtime', "
+            "current_database()); END $$"
+        )
+    )
     for table_name in immutable_policy_tables:
         bind.execute(
             sa.text(
@@ -207,7 +381,9 @@ def upgrade() -> None:
             )
         )
         bind.execute(sa.text(f"REVOKE ALL ON TABLE {table_name} FROM uta_runtime"))
-        bind.execute(sa.text(f"GRANT SELECT, INSERT ON TABLE {table_name} TO uta_runtime"))
+        bind.execute(sa.text(f"GRANT SELECT ON TABLE {table_name} TO uta_runtime"))
+        bind.execute(sa.text(f"REVOKE ALL ON TABLE {table_name} FROM uta_policy_config"))
+        bind.execute(sa.text(f"GRANT SELECT, INSERT ON TABLE {table_name} TO uta_policy_config"))
     for table_name in (
         "durable_simulated_protections",
         "durable_actual_risk_states",
@@ -217,8 +393,13 @@ def upgrade() -> None:
         bind.execute(sa.text(f"GRANT SELECT, INSERT, UPDATE ON TABLE {table_name} TO uta_runtime"))
     bind.execute(
         sa.text(
+            "REVOKE ALL ON SEQUENCE durable_actual_risk_policy_versions_id_seq FROM uta_runtime"
+        )
+    )
+    bind.execute(
+        sa.text(
             "GRANT USAGE, SELECT ON SEQUENCE durable_actual_risk_policy_versions_id_seq "
-            "TO uta_runtime"
+            "TO uta_policy_config"
         )
     )
 

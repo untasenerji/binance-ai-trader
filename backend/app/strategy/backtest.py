@@ -578,10 +578,14 @@ class WalkForwardRunner:
             TrendPullbackStrategy,
             VolatilityBreakoutStrategy,
         )
+        if type(trainer) not in trusted_trainer_types:
+            raise WalkForwardTrainingError(
+                "custom walk-forward trainers cannot isolate held-out data with trusted "
+                "train-only proof"
+            )
         _TrainingIsolationGuard.for_window(
             training_candles,
             held_out_candles,
-            reject_unproven_scalars=type(trainer) not in trusted_trainer_types,
         ).inspect(trainer, path="trainer")
         fit = getattr(trainer, "fit", None)
         if not callable(fit):

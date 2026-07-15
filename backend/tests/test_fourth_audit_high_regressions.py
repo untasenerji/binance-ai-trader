@@ -1,6 +1,5 @@
 """Red-first counterexamples from the fourth independent audit."""
 
-from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -64,7 +63,8 @@ from app.strategy.backtest import (
     FundingSettlement,
     WalkForwardRunner,
 )
-from app.strategy.models import Candle, FrozenStrategy, SignalCandidate
+from app.strategy.models import Candle
+from app.strategy.strategies import VolatilityBreakoutStrategy
 
 
 def _policy(
@@ -720,38 +720,6 @@ def test_policy_revisions_are_append_only_and_preserve_plan_protection_identity(
     assert durable_intent_ledger.actual_risk_policy(base.plan_id) == revised
 
 
-class _AlwaysLongTrainer:
-    strategy_id = "fourth-audit-funding"
-
-    def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
-        del timeframe
-
-        def evaluate(
-            evaluation_candles: Sequence[Candle],
-            *,
-            timeframe: str,
-        ) -> SignalCandidate:
-            candle = evaluation_candles[-1]
-            return SignalCandidate(
-                strategy_id=self.strategy_id,
-                symbol=candle.symbol,
-                direction=Direction.LONG,
-                reference_price=candle.close_price,
-                invalidation_price=candle.low_price,
-                timeframe=timeframe,
-                valid_until_ms=candle.close_time_ms + 60_000,
-                reason_codes=("FOURTH_AUDIT_FUNDING",),
-            )
-
-        return FrozenStrategy(
-            strategy_id=self.strategy_id,
-            training_candle_count=len(candles),
-            training_end_ms=candles[-1].close_time_ms,
-            configuration_fingerprint="always-long-v1",
-            evaluator=evaluate,
-        )
-
-
 def _candles() -> tuple[Candle, ...]:
     return tuple(
         Candle(
@@ -759,10 +727,10 @@ def _candles() -> tuple[Candle, ...]:
             timeframe="1m",
             open_time_ms=index * 60_000,
             close_time_ms=(index + 1) * 60_000 - 1,
-            open_price=Decimal("100"),
-            high_price=Decimal("102"),
-            low_price=Decimal("99"),
-            close_price=Decimal("101"),
+            open_price=Decimal("100") + Decimal(index * 2),
+            high_price=Decimal("100") + Decimal(index * 2),
+            low_price=Decimal("99") + Decimal(index * 2),
+            close_price=Decimal("100") + Decimal(index * 2),
             volume=Decimal("1"),
         )
         for index in range(5)
@@ -783,7 +751,7 @@ def test_walk_forward_passes_funding_settlements_exactly_like_direct_backtest() 
         rate=Decimal("0.01"),
         mark_price=Decimal("104"),
     )
-    frozen = _AlwaysLongTrainer().fit(candles[:2], timeframe="1m")
+    frozen = VolatilityBreakoutStrategy(lookback=2).fit(candles[:2], timeframe="1m")
     direct = BacktestEngine().run(
         frozen,
         candles,
@@ -795,7 +763,7 @@ def test_walk_forward_passes_funding_settlements_exactly_like_direct_backtest() 
     direct_test_trades = tuple(trade for trade in direct.trades if 2 <= trade.entry_bar_index < 5)
 
     windows = WalkForwardRunner(train_size=2, test_size=3, step_size=3).run(
-        _AlwaysLongTrainer,
+        lambda: VolatilityBreakoutStrategy(lookback=2),
         candles,
         timeframe="1m",
         costs=costs,
@@ -841,7 +809,10 @@ def test_postgresql_runtime_cannot_mutate_or_truncate_durable_risk_policy() -> N
         DurableIntentLedger(create_session_factory(admin_engine)).register_actual_risk_policy(base)
         runtime_ledger = DurableIntentLedger(create_session_factory(runtime_engine))
         revised = replace(base, risk_budget=Decimal("50"))
-        assert runtime_ledger.version_actual_risk_policy(revised) == 2
+        with pytest.raises(DBAPIError):
+            runtime_ledger.version_actual_risk_policy(revised)
+        admin_ledger = DurableIntentLedger(create_session_factory(admin_engine))
+        assert admin_ledger.version_actual_risk_policy(revised) == 2
         assert runtime_ledger.actual_risk_policy(plan_id) == revised
         with runtime_engine.connect() as connection:
             assert connection.scalar(text("SELECT current_user")) == "uta_runtime"
@@ -853,12 +824,11 @@ def test_postgresql_runtime_cannot_mutate_or_truncate_durable_risk_policy() -> N
                 "durable_actual_risk_policy_versions",
             )
             for table_name in policy_tables:
-                for privilege in ("SELECT", "INSERT"):
-                    assert connection.scalar(
-                        text("SELECT has_table_privilege(current_user, :table_name, :privilege)"),
-                        {"table_name": table_name, "privilege": privilege},
-                    )
-                for privilege in ("UPDATE", "DELETE", "TRUNCATE"):
+                assert connection.scalar(
+                    text("SELECT has_table_privilege(current_user, :table_name, 'SELECT')"),
+                    {"table_name": table_name},
+                )
+                for privilege in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
                     assert not connection.scalar(
                         text("SELECT has_table_privilege(current_user, :table_name, :privilege)"),
                         {"table_name": table_name, "privilege": privilege},
@@ -867,6 +837,7 @@ def test_postgresql_runtime_cannot_mutate_or_truncate_durable_risk_policy() -> N
                 statement
                 for table_name in policy_tables
                 for statement in (
+                    f"INSERT INTO {table_name} SELECT * FROM {table_name} WHERE plan_id = :plan_id",
                     f"UPDATE {table_name} SET risk_budget = '999999' WHERE plan_id = :plan_id",
                     f"DELETE FROM {table_name} WHERE plan_id = :plan_id",
                     f"TRUNCATE {table_name}",
