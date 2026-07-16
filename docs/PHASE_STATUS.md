@@ -67,3 +67,12 @@
 - Populated published-`0009` and populated-`0008` upgrades, replay/recovery, SQLite retry, PostgreSQL role graphs, transaction crash/restart, financial properties, stop contracts, walk-forward isolation, and adversarial redaction passed locally.
 - Hosted GitHub Actions remains **NOT VERIFIED**. No API key, signer, authenticated transport, testnet path, test order, or live-order path was added.
 - Phase 14 remains **LOCKED**.
+
+## Seventh Independent Audit Remediation
+
+- Base revision: `2d21ebedd0cc180d04820ccfa3314edf88ff1b72`; implementation checkpoint: `a26ca31` (`fix: remediate seventh independent audit findings`).
+- `docs/SEVENTH_AUDIT_REMEDIATION_REPORT.md` records red-first regression coverage for every reported HIGH blocker and the resulting architecture changes.
+- Local validation: 395 non-PostgreSQL tests and 27 real-PostgreSQL tests passed; the configured true-branch gates all passed, including `intent_ledger` at 70.12% and `fills` at 70.63%.
+- Published `0009` and prior forward-only `0011` migrations remain byte-identical to HEAD; new migration behavior is forward-only in `0012_account_scope_safety.py`.
+- Hosted GitHub Actions and external `live_public` remain **NOT VERIFIED**. No API key, signer, authenticated transport, testnet path, test order, or live-order path was added.
+- Phase 14 remains **LOCKED**.
