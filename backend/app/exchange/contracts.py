@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
@@ -203,6 +204,124 @@ class AlgoOrderObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class ExchangeAlgoOrderObservation:
+    """Fresh adapter-attested Algo state; local order intents cannot impersonate it.
+
+    This is a data-only Phase-13 contract. No transport, signer, credential, or
+    exchange request implementation is supplied by this type.
+    """
+
+    source: str
+    account_id: str
+    fetched_at: datetime
+    server_time: datetime
+    freshness_window: timedelta
+    correlation_id: str
+    client_algo_id: str
+    symbol: str
+    direction: Direction
+    algo_type: AlgoOrderType
+    trigger_price: Decimal
+    close_position: bool
+    quantity: Decimal | None = None
+    working_type: StopWorkingType = StopWorkingType.MARK_PRICE
+    status: AlgoOrderStatus = AlgoOrderStatus.NEW
+    plan_id: str | None = None
+    policy_version: int | None = None
+    account_envelope_version: int | None = None
+    policy_fingerprint: str | None = None
+    account_envelope_fingerprint: str | None = None
+    stop_contract_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.source != "authenticated_exchange_adapter":
+            raise ValueError("exchange observations require authenticated adapter provenance")
+        if not self.account_id or not self.correlation_id:
+            raise ValueError("exchange observations require account and query correlation IDs")
+        if self.fetched_at.tzinfo is None or self.server_time.tzinfo is None:
+            raise ValueError("exchange observation timestamps must be timezone-aware")
+        if (
+            not isinstance(self.freshness_window, timedelta)
+            or self.freshness_window <= timedelta(0)
+            or self.freshness_window > timedelta(minutes=10)
+        ):
+            raise ValueError("exchange observation freshness window is invalid")
+        fetched_at = self.fetched_at.astimezone(UTC)
+        server_time = self.server_time.astimezone(UTC)
+        if server_time > fetched_at + timedelta(seconds=5):
+            raise ValueError("exchange observation server time cannot follow fetch time")
+        if not self.is_fresh():
+            raise ValueError("exchange observation is not fresh")
+        if (
+            not self.client_algo_id
+            or not self.symbol
+            or not isinstance(self.direction, Direction)
+            or not isinstance(self.algo_type, AlgoOrderType)
+            or not isinstance(self.trigger_price, Decimal)
+            or not self.trigger_price.is_finite()
+            or self.trigger_price <= ZERO
+            or not isinstance(self.close_position, bool)
+            or not isinstance(self.working_type, StopWorkingType)
+            or not isinstance(self.status, AlgoOrderStatus)
+        ):
+            raise ValueError("exchange-observed Algo fields are invalid")
+        if self.quantity is not None and (
+            not isinstance(self.quantity, Decimal)
+            or not self.quantity.is_finite()
+            or self.quantity <= ZERO
+        ):
+            raise ValueError("exchange-observed Algo quantity must be a positive Decimal")
+        for version in (self.policy_version, self.account_envelope_version):
+            if version is not None and (
+                not isinstance(version, int) or isinstance(version, bool) or version < 1
+            ):
+                raise ValueError("exchange-observed Algo policy versions are invalid")
+        for fingerprint in (
+            self.policy_fingerprint,
+            self.account_envelope_fingerprint,
+            self.stop_contract_fingerprint,
+        ):
+            if fingerprint is not None and (
+                not isinstance(fingerprint, str) or len(fingerprint) != 64
+            ):
+                raise ValueError("exchange-observed Algo fingerprints are invalid")
+
+    @property
+    def side(self) -> OrderSide:
+        return OrderSide.SELL if self.direction is Direction.LONG else OrderSide.BUY
+
+    def is_fresh(self, now: datetime | None = None) -> bool:
+        """Recheck the bounded observation lifetime at every evidence boundary."""
+        checked_at = (now or datetime.now(UTC)).astimezone(UTC)
+        return checked_at - self.fetched_at.astimezone(UTC) <= self.freshness_window
+
+    def canonical_record(self) -> dict[str, object]:
+        return {
+            "source": self.source,
+            "account_id": self.account_id,
+            "fetched_at": self.fetched_at,
+            "server_time": self.server_time,
+            "freshness_window": self.freshness_window,
+            "correlation_id": self.correlation_id,
+            "client_algo_id": self.client_algo_id,
+            "symbol": self.symbol,
+            "direction": self.direction,
+            "algo_type": self.algo_type,
+            "trigger_price": self.trigger_price,
+            "close_position": self.close_position,
+            "quantity": self.quantity,
+            "working_type": self.working_type,
+            "status": self.status,
+            "plan_id": self.plan_id,
+            "policy_version": self.policy_version,
+            "account_envelope_version": self.account_envelope_version,
+            "policy_fingerprint": self.policy_fingerprint,
+            "account_envelope_fingerprint": self.account_envelope_fingerprint,
+            "stop_contract_fingerprint": self.stop_contract_fingerprint,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ExpectedStopContract:
     """Complete local expectation that an exchange-observed stop must match."""
 
@@ -222,9 +341,10 @@ class ExpectedStopContract:
     policy_fingerprint: str
     account_envelope_fingerprint: str
     fingerprint: str = ""
+    account_id: str = "v1-primary"
 
     def __post_init__(self) -> None:
-        if not self.plan_id or not self.symbol or not self.client_algo_id:
+        if not self.account_id or not self.plan_id or not self.symbol or not self.client_algo_id:
             raise ValueError("expected stop contract needs durable identity")
         if not isinstance(self.position_side, Direction):
             raise TypeError("expected stop position side must be typed")
@@ -264,6 +384,7 @@ class ExpectedStopContract:
     def expected_fingerprint(self) -> str:
         canonical = json.dumps(
             {
+                "account_id": self.account_id,
                 "account_envelope_fingerprint": self.account_envelope_fingerprint,
                 "account_envelope_version": self.account_envelope_version,
                 "active_status": self.active_status.value,
@@ -288,7 +409,10 @@ class ExpectedStopContract:
 
     def matches(self, observed: object) -> bool:
         return (
-            isinstance(observed, (AlgoOrderIntent, AlgoOrderObservation))
+            type(observed) is ExchangeAlgoOrderObservation
+            and observed.source == "authenticated_exchange_adapter"
+            and observed.is_fresh()
+            and observed.account_id == self.account_id
             and observed.client_algo_id == self.client_algo_id
             and observed.plan_id == self.plan_id
             and observed.symbol == self.symbol
@@ -316,10 +440,11 @@ class ExchangeProtectionEvidence:
     symbol: str
     direction: Direction
     position_quantity: Decimal
-    stop_order: AlgoOrderIntent
+    stop_order: ExchangeAlgoOrderObservation
     reduce_only_exit_reference: str
     position_observed_at_ms: int
     protection_observed_at_ms: int
+    expected_stop_contract: ExpectedStopContract | None = None
 
     def __post_init__(self) -> None:
         if not self.plan_id or not self.symbol or not self.reduce_only_exit_reference:
@@ -332,8 +457,8 @@ class ExchangeProtectionEvidence:
             raise ValueError("exchange position quantity must be a positive Decimal")
         if not isinstance(self.direction, Direction):
             raise TypeError("exchange protection direction must be typed")
-        if type(self.stop_order) is not AlgoOrderIntent:
-            raise TypeError("exchange protection requires a concrete algo stop record")
+        if type(self.stop_order) is not ExchangeAlgoOrderObservation:
+            raise TypeError("exchange protection requires an exchange Algo observation")
         if (
             self.stop_order.symbol != self.symbol
             or self.stop_order.direction is not self.direction
@@ -348,6 +473,17 @@ class ExchangeProtectionEvidence:
             for value in timestamps
         ):
             raise ValueError("exchange protection timestamps must be non-negative integers")
+        if type(self.expected_stop_contract) is not ExpectedStopContract:
+            raise TypeError("exchange protection requires a durable expected stop contract")
+        if (
+            self.expected_stop_contract.plan_id != self.plan_id
+            or self.expected_stop_contract.symbol != self.symbol
+            or self.expected_stop_contract.position_side is not self.direction
+            or not self.expected_stop_contract.matches(self.stop_order)
+        ):
+            raise ValueError("exchange protection does not match its durable expected stop")
+        if self.protection_observed_at_ms < self.position_observed_at_ms:
+            raise ValueError("exchange protection must not predate the observed position")
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,8 +579,9 @@ class ReconciliationSnapshot:
     positions_by_symbol: Mapping[str, Decimal]
     normal_order_client_ids: frozenset[str]
     algo_order_client_ids: frozenset[str]
-    algo_orders: tuple[AlgoOrderIntent | AlgoOrderObservation, ...] = ()
+    algo_orders: tuple[ExchangeAlgoOrderObservation, ...] = ()
     stop_protected_symbols: frozenset[str] = frozenset()
+    account_id: str = "v1-primary"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -460,10 +597,12 @@ class ReconciliationSnapshot:
         supplied_algo_ids = _normalize_identifiers(
             self.algo_order_client_ids, field_name="algo order IDs"
         )
-        if any(
-            type(order) not in {AlgoOrderIntent, AlgoOrderObservation} for order in self.algo_orders
-        ):
-            raise TypeError("algo snapshot records must be typed Algo observations")
+        if not self.account_id:
+            raise ValueError("reconciliation snapshots require an account ID")
+        if any(type(order) is not ExchangeAlgoOrderObservation for order in self.algo_orders):
+            raise TypeError("algo snapshot records must be ExchangeAlgoOrderObservation values")
+        if any(order.account_id != self.account_id for order in self.algo_orders):
+            raise ValueError("exchange observations must match the snapshot account")
         observed_algo_ids = frozenset(order.client_algo_id for order in self.algo_orders)
         if len(observed_algo_ids) != len(self.algo_orders):
             raise ValueError("algo snapshot records must not duplicate client IDs")
@@ -471,13 +610,23 @@ class ReconciliationSnapshot:
             raise ValueError("algo order IDs must match concrete algo snapshot records")
         object.__setattr__(self, "algo_order_client_ids", observed_algo_ids)
         object.__setattr__(self, "algo_orders", tuple(self.algo_orders))
+        normalized_protected_symbols = _normalize_identifiers(
+            self.stop_protected_symbols,
+            field_name="stop-protected symbols",
+        )
+        active_stop_symbols = {
+            order.symbol
+            for order in self.algo_orders
+            if order.algo_type is AlgoOrderType.STOP_MARKET
+            and order.close_position
+            and order.status is AlgoOrderStatus.NEW
+        }
+        if not normalized_protected_symbols <= active_stop_symbols:
+            raise ValueError("stop-protected symbols require fresh exchange stop observations")
         object.__setattr__(
             self,
             "stop_protected_symbols",
-            _normalize_identifiers(
-                self.stop_protected_symbols,
-                field_name="stop-protected symbols",
-            ),
+            normalized_protected_symbols,
         )
 
 

@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -7,6 +8,7 @@ from app.exchange import locked_adapter
 from app.exchange.contracts import (
     AlgoOrderIntent,
     AlgoOrderType,
+    ExchangeAlgoOrderObservation,
     NormalOrderIntent,
     NormalOrderType,
     ReconciliationSnapshot,
@@ -32,6 +34,24 @@ def _normal_order() -> NormalOrderIntent:
 
 def _stop_order() -> AlgoOrderIntent:
     return AlgoOrderIntent(
+        client_algo_id="UTA1-plan-ST-1-1",
+        symbol="BTCUSDT",
+        direction=Direction.LONG,
+        algo_type=AlgoOrderType.STOP_MARKET,
+        trigger_price=Decimal("990"),
+        close_position=True,
+    )
+
+
+def _observed_stop_order() -> ExchangeAlgoOrderObservation:
+    now = datetime.now(UTC)
+    return ExchangeAlgoOrderObservation(
+        source="authenticated_exchange_adapter",
+        account_id="v1-primary",
+        fetched_at=now,
+        server_time=now,
+        freshness_window=timedelta(seconds=30),
+        correlation_id="locked-adapter-reconciliation",
         client_algo_id="UTA1-plan-ST-1-1",
         symbol="BTCUSDT",
         direction=Direction.LONG,
@@ -85,7 +105,7 @@ def test_reconciliation_contract_reports_exchange_local_order_mismatch() -> None
             positions_by_symbol={"BTCUSDT": Decimal("0")},
             normal_order_client_ids=frozenset({"normal-1"}),
             algo_order_client_ids=frozenset({"UTA1-plan-ST-1-1"}),
-            algo_orders=(_stop_order(),),
+            algo_orders=(_observed_stop_order(),),
         ),
     )
 

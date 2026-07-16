@@ -23,10 +23,17 @@ class EntryAuthorizationCapability:
     exchange_snapshot_fingerprint: str
     account_envelope_fingerprints: tuple[str, ...]
     fingerprint: str
+    account_id: str = "v1-primary"
+    failure_epoch: int = 0
+    recovery_epoch: int = 0
+    envelope_version: int = 0
+    grant_generation: int = 0
 
     def __post_init__(self) -> None:
         if not self.grant_id:
             raise ValueError("entry capability grant ID is required")
+        if not self.account_id:
+            raise ValueError("entry capability account ID is required")
         if self.issued_at.tzinfo is None or self.expires_at.tzinfo is None:
             raise ValueError("entry capability timestamps must be timezone-aware")
         if self.expires_at <= self.issued_at:
@@ -40,6 +47,14 @@ class EntryAuthorizationCapability:
         ):
             if not isinstance(value, str) or len(value) != 64:
                 raise ValueError("entry capability fingerprints must be SHA-256 values")
+        for epoch in (
+            self.failure_epoch,
+            self.recovery_epoch,
+            self.envelope_version,
+            self.grant_generation,
+        ):
+            if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+                raise ValueError("entry capability fencing epochs must be non-negative integers")
 
     def require_current(self, now: datetime | None = None) -> None:
         checked_at = now or datetime.now(UTC)

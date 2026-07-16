@@ -186,7 +186,9 @@ def frozen_strategy_from_fit(result: StrategyFitResult) -> FrozenStrategy:
     """Build one reviewed evaluator solely from immutable fit provenance."""
     if type(result) is not StrategyFitResult:
         raise TypeError("walk-forward execution requires an exact fit result")
+    result.verify_fingerprint()
     specification = result.specification
+    specification.verify_fingerprint()
     if specification.kind is StrategyKind.NO_TRADE_BASELINE:
         trainer: Strategy = NoTradeBaseline()
     elif specification.kind is StrategyKind.TREND_PULLBACK:

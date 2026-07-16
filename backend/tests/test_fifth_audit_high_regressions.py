@@ -2,7 +2,7 @@
 
 from collections.abc import Iterator, Sequence
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -16,13 +16,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from alembic import command
 from app.domain.types import Direction
 from app.exchange.contracts import (
-    AlgoOrderIntent,
+    ExchangeAlgoOrderObservation,
     LocalReconciliationState,
     ReconciliationSnapshot,
     reconcile_local_state,
 )
 from app.persistence.audit import AuditRepository
-from app.persistence.circuit_breaker import PersistenceCircuitBreaker
+from app.persistence.circuit_breaker import PersistenceCircuitBreaker, PersistenceUnavailable
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import (
     DurableActualRiskPolicyVersion,
@@ -511,7 +511,14 @@ def test_reconciliation_matches_durable_expected_algo_stop(
     facts = durable_intent_ledger.reopen_after_restart().reconciliation_facts()
     expected_quantity = Decimal("0.01") if direction is Direction.LONG else Decimal("-0.01")
     contract = facts.expected_stop_contracts[0]
-    stop = AlgoOrderIntent(
+    observed_at = datetime.now(UTC)
+    stop = ExchangeAlgoOrderObservation(
+        source="authenticated_exchange_adapter",
+        account_id=contract.account_id,
+        fetched_at=observed_at,
+        server_time=observed_at,
+        freshness_window=timedelta(seconds=30),
+        correlation_id=f"{plan_id}-reconciliation-query",
         client_algo_id=contract.client_algo_id,
         symbol=contract.symbol,
         direction=contract.position_side,
@@ -668,10 +675,40 @@ def _assert_populated_0008_upgrade(
         engine.dispose()
 
 
-def test_sqlite_populated_0008_upgrades_to_head_and_recovers(tmp_path: Path) -> None:
+def test_sqlite_populated_0008_complete_evidence_upgrades_to_head_and_recovers(
+    tmp_path: Path,
+) -> None:
     database_url = f"sqlite:///{tmp_path / 'populated-0008.sqlite'}"
-    _populate_legacy_0008(database_url)
-    _assert_populated_0008_upgrade(database_url)
+    _populate_legacy_0008(database_url, nullable_query_fields=False)
+    _assert_populated_0008_upgrade(
+        database_url,
+        expected_query_reference="legacy-complete-query",
+    )
+
+
+def test_sqlite_populated_0008_null_query_provenance_stays_quarantined(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'populated-0008-null-query.sqlite'}"
+    _populate_legacy_0008(database_url, nullable_query_fields=True)
+    command.upgrade(_migration_config(database_url), "head")
+    engine = create_database_engine(database_url)
+    try:
+        session_factory = create_session_factory(engine)
+        breaker = PersistenceCircuitBreaker()
+        ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
+        repository = AuditRepository(session_factory, persistence_breaker=breaker)
+        assert ledger.list_absence_observations("legacy-0008-client") == ()
+        with pytest.raises(PersistenceUnavailable, match="UNRESOLVED_QUARANTINE"):
+            breaker.reset_after_verified_reconciliation(
+                audit_repository=repository,
+                intent_ledger=ledger,
+                reconciliation_snapshot=ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                ),
+            )
+    finally:
+        engine.dispose()
 
 
 def test_sqlite_populated_0008_temporarily_manages_append_only_trigger(
@@ -688,9 +725,9 @@ def test_sqlite_populated_0008_temporarily_manages_append_only_trigger(
 def test_sqlite_policy_owner_migration_downgrades_and_reapplies(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'policy-owner-roundtrip.sqlite'}"
     config = _migration_config(database_url)
-    command.upgrade(config, "head")
+    command.upgrade(config, "0011_forward_invariants")
     command.downgrade(config, "0009_evidence_risk_hardening")
-    command.upgrade(config, "head")
+    command.upgrade(config, "0011_forward_invariants")
 
     engine = create_database_engine(database_url)
     try:
@@ -724,8 +761,38 @@ def fifth_postgresql_database() -> Iterator[str]:
 def test_postgresql_populated_0008_upgrades_to_head_and_recovers(
     fifth_postgresql_database: str,
 ) -> None:
-    _populate_legacy_0008(fifth_postgresql_database)
-    _assert_populated_0008_upgrade(fifth_postgresql_database)
+    _populate_legacy_0008(fifth_postgresql_database, nullable_query_fields=False)
+    _assert_populated_0008_upgrade(
+        fifth_postgresql_database,
+        expected_query_reference="legacy-complete-query",
+    )
+
+
+@pytest.mark.postgresql
+def test_postgresql_populated_0008_null_query_provenance_stays_quarantined(
+    fifth_postgresql_database: str,
+) -> None:
+    _populate_legacy_0008(fifth_postgresql_database, nullable_query_fields=True)
+    command.upgrade(_migration_config(fifth_postgresql_database), "head")
+    engine = create_database_engine(fifth_postgresql_database)
+    try:
+        session_factory = create_session_factory(engine)
+        breaker = PersistenceCircuitBreaker()
+        ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
+        repository = AuditRepository(session_factory, persistence_breaker=breaker)
+        assert ledger.list_absence_observations("legacy-0008-client") == ()
+        with pytest.raises(PersistenceUnavailable, match="UNRESOLVED_QUARANTINE"):
+            breaker.reset_after_verified_reconciliation(
+                audit_repository=repository,
+                intent_ledger=ledger,
+                reconciliation_snapshot=ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                ),
+            )
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.postgresql
@@ -863,7 +930,7 @@ def test_postgresql_policy_owner_migration_downgrades_and_reapplies(
     fifth_postgresql_database: str,
 ) -> None:
     config = _migration_config(fifth_postgresql_database)
-    command.upgrade(config, "head")
+    command.upgrade(config, "0011_forward_invariants")
     engine = create_database_engine(fifth_postgresql_database)
     try:
         command.downgrade(config, "0009_evidence_risk_hardening")
@@ -875,7 +942,7 @@ def test_postgresql_policy_owner_migration_downgrades_and_reapplies(
                 )
             )
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "0011_forward_invariants")
         with engine.connect() as connection:
             assert not connection.scalar(
                 text(

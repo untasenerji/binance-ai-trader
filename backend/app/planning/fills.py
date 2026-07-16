@@ -2,14 +2,17 @@
 
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
+from types import MappingProxyType
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
+
+V1_DEFAULT_ACCOUNT_ID = "v1-primary"
 
 
 class FillLedgerError(ValueError):
@@ -127,9 +130,10 @@ class PortfolioExposureSlice:
     leverage: int
     required_margin_usdt: Decimal
     source_state: ExposureSourceState
+    account_id: str = V1_DEFAULT_ACCOUNT_ID
 
     def __post_init__(self) -> None:
-        if not self.slice_id or not self.plan_id or not self.symbol:
+        if not self.slice_id or not self.plan_id or not self.symbol or not self.account_id:
             raise FillLedgerError("portfolio exposure slices need durable identity")
         if not isinstance(self.direction, Direction):
             raise TypeError("portfolio exposure direction must be typed")
@@ -151,6 +155,7 @@ class PortfolioExposureSlice:
 
     def canonical_record(self) -> dict[str, object]:
         return {
+            "account_id": self.account_id,
             "direction": self.direction.value,
             "leverage": self.leverage,
             "notional_usdt": format(self.notional_usdt, "f"),
@@ -181,9 +186,15 @@ class AccountPortfolioEnvelope:
     exposure_slices: tuple[PortfolioExposureSlice, ...] = ()
     reconciliation_required: bool = False
     fingerprint: str = ""
+    # V1 supports exactly one configured account. account_scope remains a legacy
+    # label so existing durable rows can be replayed without treating it as tenancy.
+    account_id: str = V1_DEFAULT_ACCOUNT_ID
+    symbol_exposure_caps_usdt: Mapping[str, Decimal] | None = None
+    effective_from: datetime | None = None
+    superseded_by: int | None = None
 
     def __post_init__(self) -> None:
-        if not self.account_scope:
+        if not self.account_scope or not self.account_id:
             raise FillLedgerError("portfolio envelope needs an account scope")
         if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 1:
             raise FillLedgerError("portfolio envelope version must be positive")
@@ -215,6 +226,31 @@ class AccountPortfolioEnvelope:
             raise FillLedgerError("portfolio envelope financial caps must be positive")
         if self.required_reserve_usdt > self.max_required_margin_usdt:
             raise FillLedgerError("portfolio reserve cannot exceed maximum required margin")
+        raw_symbol_caps = self.symbol_exposure_caps_usdt
+        if raw_symbol_caps is None:
+            raw_symbol_caps = {"*": self.max_symbol_exposure_usdt}
+        if not isinstance(raw_symbol_caps, Mapping) or not raw_symbol_caps:
+            raise FillLedgerError("portfolio envelope needs a non-empty symbol cap map")
+        normalized_symbol_caps: dict[str, Decimal] = {}
+        for symbol, cap in raw_symbol_caps.items():
+            if not isinstance(symbol, str) or not symbol:
+                raise FillLedgerError("portfolio envelope symbol cap keys must be non-empty")
+            if not isinstance(cap, Decimal) or not cap.is_finite() or cap <= ZERO:
+                raise FillLedgerError("portfolio envelope symbol caps must be positive Decimals")
+            normalized_symbol_caps[symbol] = cap
+        object.__setattr__(
+            self,
+            "symbol_exposure_caps_usdt",
+            MappingProxyType(dict(sorted(normalized_symbol_caps.items()))),
+        )
+        if self.effective_from is not None and self.effective_from.tzinfo is None:
+            raise FillLedgerError("portfolio envelope effective_from must be timezone-aware")
+        if self.superseded_by is not None and (
+            not isinstance(self.superseded_by, int)
+            or isinstance(self.superseded_by, bool)
+            or self.superseded_by <= self.version
+        ):
+            raise FillLedgerError("portfolio envelope superseded_by must follow its version")
         for count in (self.open_position_count, self.pending_order_count):
             if not isinstance(count, int) or isinstance(count, bool) or count < 0:
                 raise FillLedgerError("portfolio envelope counts must be non-negative integers")
@@ -222,15 +258,18 @@ class AccountPortfolioEnvelope:
             raise TypeError("portfolio envelope reconciliation flag must be boolean")
         if any(type(item) is not PortfolioExposureSlice for item in self.exposure_slices):
             raise TypeError("portfolio envelope exposure slices must be exact typed values")
+        if any(item.account_id != self.account_id for item in self.exposure_slices):
+            raise FillLedgerError("portfolio exposure slices must match their account envelope")
         slice_ids = [item.slice_id for item in self.exposure_slices]
         if len(slice_ids) != len(set(slice_ids)):
             raise FillLedgerError("portfolio envelope exposure slice IDs must be unique")
         ordered_slices = tuple(sorted(self.exposure_slices, key=lambda item: item.slice_id))
         object.__setattr__(self, "exposure_slices", ordered_slices)
         expected = self.expected_fingerprint()
-        if self.fingerprint and self.fingerprint != expected:
+        legacy_expected = self._legacy_expected_fingerprint()
+        if self.fingerprint and self.fingerprint not in {expected, legacy_expected}:
             raise FillLedgerError("portfolio envelope fingerprint is invalid")
-        object.__setattr__(self, "fingerprint", expected)
+        object.__setattr__(self, "fingerprint", self.fingerprint or expected)
 
     @property
     def effective_equity_usdt(self) -> Decimal:
@@ -246,6 +285,14 @@ class AccountPortfolioEnvelope:
             ZERO,
         )
 
+    def symbol_exposure_cap_usdt(self, symbol: str) -> Decimal:
+        caps = self.symbol_exposure_caps_usdt
+        assert caps is not None
+        cap = caps.get(symbol, caps.get("*"))
+        if cap is None:
+            raise FillLedgerError(f"portfolio envelope has no symbol cap for {symbol}")
+        return cap
+
     @property
     def existing_required_margin_usdt(self) -> Decimal:
         return sum((item.required_margin_usdt for item in self.exposure_slices), ZERO)
@@ -253,10 +300,53 @@ class AccountPortfolioEnvelope:
     def expected_fingerprint(self) -> str:
         canonical = json.dumps(
             {
+                "account_id": self.account_id,
                 "account_scope": self.account_scope,
                 "bot_equity_cap_usdt": format(self.bot_equity_cap_usdt, "f"),
                 "daily_remaining_risk_usdt": format(self.daily_remaining_risk_usdt, "f"),
                 "exposure_slices": [item.canonical_record() for item in self.exposure_slices],
+                "max_required_margin_usdt": format(self.max_required_margin_usdt, "f"),
+                "max_symbol_exposure_usdt": format(self.max_symbol_exposure_usdt, "f"),
+                "max_total_exposure_usdt": format(self.max_total_exposure_usdt, "f"),
+                "open_position_count": self.open_position_count,
+                "pending_order_count": self.pending_order_count,
+                "reconciliation_required": self.reconciliation_required,
+                "required_reserve_usdt": format(self.required_reserve_usdt, "f"),
+                "effective_from": (
+                    None
+                    if self.effective_from is None
+                    else self.effective_from.astimezone(UTC).isoformat()
+                ),
+                "superseded_by": self.superseded_by,
+                "symbol_exposure_caps_usdt": {
+                    symbol: format(cap, "f")
+                    for symbol, cap in sorted((self.symbol_exposure_caps_usdt or {}).items())
+                },
+                "verified_account_equity_usdt": format(self.verified_account_equity_usdt, "f"),
+                "version": self.version,
+                "weekly_remaining_risk_usdt": format(self.weekly_remaining_risk_usdt, "f"),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _legacy_expected_fingerprint(self) -> str:
+        """Accept only historical rows whose old immutable fingerprint still verifies."""
+        canonical = json.dumps(
+            {
+                "account_scope": self.account_scope,
+                "bot_equity_cap_usdt": format(self.bot_equity_cap_usdt, "f"),
+                "daily_remaining_risk_usdt": format(self.daily_remaining_risk_usdt, "f"),
+                "exposure_slices": [
+                    {
+                        key: value
+                        for key, value in item.canonical_record().items()
+                        if key != "account_id"
+                    }
+                    for item in self.exposure_slices
+                ],
                 "max_required_margin_usdt": format(self.max_required_margin_usdt, "f"),
                 "max_symbol_exposure_usdt": format(self.max_symbol_exposure_usdt, "f"),
                 "max_total_exposure_usdt": format(self.max_total_exposure_usdt, "f"),
@@ -324,7 +414,7 @@ class ActualRiskPolicy:
 
     @property
     def max_symbol_exposure_usdt(self) -> Decimal:
-        return self.portfolio_envelope.max_symbol_exposure_usdt
+        return self.portfolio_envelope.symbol_exposure_cap_usdt(self.symbol)
 
     @property
     def max_total_exposure_usdt(self) -> Decimal:

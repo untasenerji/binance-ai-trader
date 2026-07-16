@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -6,7 +7,7 @@ from conftest import actual_risk_policy_for
 
 from app.domain.types import Direction
 from app.exchange.contracts import (
-    AlgoOrderIntent,
+    ExchangeAlgoOrderObservation,
     ReconciliationSnapshot,
 )
 from app.observability.recovery import RecoveryAction
@@ -54,7 +55,13 @@ def _reconciliation_snapshot(ledger: DurableIntentLedger) -> ReconciliationSnaps
         normal_order_client_ids=frozenset({"UTA1-recovery-EN-1"}),
         algo_order_client_ids=frozenset({"recovery-simulated-stop"}),
         algo_orders=(
-            AlgoOrderIntent(
+            ExchangeAlgoOrderObservation(
+                source="authenticated_exchange_adapter",
+                account_id=contract.account_id,
+                fetched_at=datetime.now(UTC),
+                server_time=datetime.now(UTC),
+                freshness_window=timedelta(seconds=30),
+                correlation_id="security-recovery-reconciliation",
                 client_algo_id=contract.client_algo_id,
                 symbol=contract.symbol,
                 direction=contract.position_side,

@@ -69,7 +69,7 @@ def test_structured_log_redacts_nested_fields_and_secret_like_text() -> None:
     assert emitted == [serialized]
     assert "placeholder-value" not in serialized
     assert "[REDACTED]" in serialized
-    assert redact_for_log({"secret": "value"}) == {"secret": "[REDACTED]"}
+    assert redact_for_log({"secret": "value"}) == {"[REDACTED]": "[REDACTED]"}
 
 
 def test_structured_log_redacts_camel_case_headers_queries_and_nested_values() -> None:

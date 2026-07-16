@@ -413,26 +413,13 @@ def test_breaker_derives_reconciliation_from_repository_ledger_and_algo_stop_rec
 
 
 def test_stop_protection_cannot_be_forged_by_a_symbol_boolean_without_an_algo_stop_record() -> None:
-    outcome = reconcile_local_state(
-        local=LocalReconciliationState(
-            positions_by_symbol={"BTCUSDT": Decimal("0.005")},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-            required_stop_symbols=frozenset({"BTCUSDT"}),
-            unresolved_unknown_intent_ids=frozenset(),
-            audit_chain_valid=True,
-            replay_valid=True,
-        ),
-        snapshot=ReconciliationSnapshot(
+    with pytest.raises(ValueError, match="fresh exchange stop observations"):
+        ReconciliationSnapshot(
             positions_by_symbol={"BTCUSDT": Decimal("0.005")},
             normal_order_client_ids=frozenset(),
             algo_order_client_ids=frozenset(),
             stop_protected_symbols=frozenset({"BTCUSDT"}),
-        ),
-    )
-
-    assert not outcome.is_clean
-    assert outcome.missing_stop_symbols == ("BTCUSDT",)
+        )
 
 
 def test_unknown_absence_requires_causal_query_evidence_and_rehydrates_after_restart(

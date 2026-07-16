@@ -1,6 +1,6 @@
 """Target risky validation branches called out by the fourth audit."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, cast
 
@@ -9,8 +9,11 @@ import pytest
 from app.domain.types import Direction
 from app.exchange.contracts import (
     AlgoOrderIntent,
+    AlgoOrderStatus,
     AlgoOrderType,
+    ExchangeAlgoOrderObservation,
     ExchangeProtectionEvidence,
+    ExpectedStopContract,
     LiveProtectionEvidenceGate,
     LocalReconciliationState,
     NormalOrderIntent,
@@ -19,6 +22,8 @@ from app.exchange.contracts import (
     OrderSide,
     PositionAmount,
     ReconciliationSnapshot,
+    StopQuantitySemantics,
+    StopWorkingType,
 )
 from app.exchange.contracts import (
     PositionQuantityMismatch as ReconciliationPositionMismatch,
@@ -112,6 +117,68 @@ def _algo(**overrides: object) -> AlgoOrderIntent:
     return AlgoOrderIntent(**cast(Any, values))
 
 
+def _exchange_algo(**overrides: object) -> ExchangeAlgoOrderObservation:
+    now = datetime.now(UTC)
+    values: dict[str, object] = {
+        "source": "authenticated_exchange_adapter",
+        "account_id": "v1-primary",
+        "fetched_at": now,
+        "server_time": now,
+        "freshness_window": timedelta(seconds=30),
+        "correlation_id": "branch-reconciliation-query",
+        "client_algo_id": "algo-branch",
+        "symbol": "BTCUSDT",
+        "direction": Direction.LONG,
+        "algo_type": AlgoOrderType.STOP_MARKET,
+        "trigger_price": Decimal("90"),
+        "close_position": True,
+        "quantity": None,
+    }
+    values.update(overrides)
+    return ExchangeAlgoOrderObservation(**cast(Any, values))
+
+
+def _expected_stop() -> ExpectedStopContract:
+    return ExpectedStopContract(
+        account_id="v1-primary",
+        plan_id="plan-branch",
+        symbol="BTCUSDT",
+        position_side=Direction.LONG,
+        expected_order_side=OrderSide.SELL,
+        client_algo_id="algo-branch",
+        algo_type=AlgoOrderType.STOP_MARKET,
+        trigger_price=Decimal("90"),
+        working_type=StopWorkingType.MARK_PRICE,
+        close_position=True,
+        quantity_semantics=StopQuantitySemantics.CLOSE_POSITION_FULL,
+        active_status=AlgoOrderStatus.NEW,
+        policy_version=1,
+        account_envelope_version=1,
+        policy_fingerprint="a" * 64,
+        account_envelope_fingerprint="b" * 64,
+    )
+
+
+def _protected_exchange_stop() -> ExchangeAlgoOrderObservation:
+    contract = _expected_stop()
+    return _exchange_algo(
+        client_algo_id=contract.client_algo_id,
+        symbol=contract.symbol,
+        direction=contract.position_side,
+        algo_type=contract.algo_type,
+        trigger_price=contract.trigger_price,
+        close_position=contract.close_position,
+        working_type=contract.working_type,
+        status=contract.active_status,
+        plan_id=contract.plan_id,
+        policy_version=contract.policy_version,
+        account_envelope_version=contract.account_envelope_version,
+        policy_fingerprint=contract.policy_fingerprint,
+        account_envelope_fingerprint=contract.account_envelope_fingerprint,
+        stop_contract_fingerprint=contract.fingerprint,
+    )
+
+
 @pytest.mark.parametrize(
     "overrides",
     (
@@ -129,7 +196,8 @@ def test_algo_contract_rejects_invalid_protective_records(
 
 
 def test_exchange_evidence_gate_accepts_only_complete_side_correct_evidence() -> None:
-    stop = _algo()
+    stop = _protected_exchange_stop()
+    contract = _expected_stop()
     evidence = ExchangeProtectionEvidence(
         plan_id="plan-branch",
         symbol="BTCUSDT",
@@ -139,6 +207,7 @@ def test_exchange_evidence_gate_accepts_only_complete_side_correct_evidence() ->
         reduce_only_exit_reference="reduce-branch",
         position_observed_at_ms=1,
         protection_observed_at_ms=2,
+        expected_stop_contract=contract,
     )
 
     assert stop.side is OrderSide.SELL
@@ -154,6 +223,7 @@ def test_exchange_evidence_gate_accepts_only_complete_side_correct_evidence() ->
             reduce_only_exit_reference="reduce-branch",
             position_observed_at_ms=1,
             protection_observed_at_ms=2,
+            expected_stop_contract=contract,
         )
     with pytest.raises(ValueError, match="position quantity"):
         ExchangeProtectionEvidence(
@@ -165,6 +235,7 @@ def test_exchange_evidence_gate_accepts_only_complete_side_correct_evidence() ->
             reduce_only_exit_reference="reduce-branch",
             position_observed_at_ms=1,
             protection_observed_at_ms=2,
+            expected_stop_contract=contract,
         )
     with pytest.raises(ValueError, match="does not protect"):
         ExchangeProtectionEvidence(
@@ -176,6 +247,7 @@ def test_exchange_evidence_gate_accepts_only_complete_side_correct_evidence() ->
             reduce_only_exit_reference="reduce-branch",
             position_observed_at_ms=1,
             protection_observed_at_ms=2,
+            expected_stop_contract=contract,
         )
     with pytest.raises(ValueError, match="timestamps"):
         ExchangeProtectionEvidence(
@@ -187,6 +259,7 @@ def test_exchange_evidence_gate_accepts_only_complete_side_correct_evidence() ->
             reduce_only_exit_reference="reduce-branch",
             position_observed_at_ms=-1,
             protection_observed_at_ms=2,
+            expected_stop_contract=contract,
         )
 
 
@@ -207,7 +280,10 @@ def test_reconciliation_records_reject_ambiguous_or_untyped_content() -> None:
             normal_order_client_ids=frozenset({""}),
             algo_order_client_ids=frozenset(),
         )
-    duplicate = (_algo(client_algo_id="duplicate"), _algo(client_algo_id="duplicate"))
+    duplicate = (
+        _exchange_algo(client_algo_id="duplicate"),
+        _exchange_algo(client_algo_id="duplicate"),
+    )
     with pytest.raises(ValueError, match="duplicate"):
         ReconciliationSnapshot(
             positions_by_symbol={},
@@ -220,7 +296,7 @@ def test_reconciliation_records_reject_ambiguous_or_untyped_content() -> None:
             positions_by_symbol={},
             normal_order_client_ids=frozenset(),
             algo_order_client_ids=frozenset({"different"}),
-            algo_orders=(_algo(),),
+            algo_orders=(_exchange_algo(),),
         )
     with pytest.raises(TypeError, match="boolean"):
         LocalReconciliationState(

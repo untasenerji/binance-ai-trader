@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -10,16 +11,16 @@ from enum import StrEnum
 from typing import ClassVar
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
 from app.exchange.contracts import (
-    AlgoOrderIntent,
     AlgoOrderStatus,
     AlgoOrderType,
+    ExchangeAlgoOrderObservation,
     ExpectedStopContract,
     LocalReconciliationState,
     OrderSide,
@@ -41,20 +42,28 @@ from app.persistence.models import (
     AuditChainHead,
     AuditEvent,
     DurableAccountPortfolioEnvelope,
+    DurableAccountSafetyState,
+    DurableAccountScopeLock,
     DurableActualRiskPolicy,
     DurableActualRiskPolicyVersion,
     DurableActualRiskState,
     DurableEntryAuthorizationGrant,
     DurableEntryAuthorizationRevocation,
+    DurableEvidenceQuarantine,
+    DurableEvidenceQuarantineResolution,
     DurableIntentAbsenceObservation,
     DurableIntentFill,
     DurableOrderIntent,
+    DurablePortfolioEnvelopeHead,
+    DurablePortfolioEnvelopeSupersession,
     DurableRiskReductionRequirement,
     DurableSimulatedProtection,
+    MigrationQuarantineRecord,
     TradePlanProjection,
 )
 from app.persistence.replay import ReplayRunner
 from app.planning.fills import (
+    V1_DEFAULT_ACCOUNT_ID,
     AccountPortfolioEnvelope,
     ActualRiskPolicy,
     ExposureSourceState,
@@ -126,6 +135,8 @@ _TERMINAL_STATUSES = frozenset(
 _REQUIRED_ABSENCE_SOURCES = frozenset(AbsenceEvidenceSource)
 _SIMULATED_QUERY_WRITE_CAPABILITY = object()
 _ENTRY_CAPABILITY_TTL = timedelta(minutes=5)
+_ACCOUNT_LOCKS_GUARD = threading.Lock()
+_ACCOUNT_LOCKS: dict[str, threading.RLock] = {}
 
 
 class IntentLedgerError(RuntimeError):
@@ -146,6 +157,53 @@ class BoundedAbsenceEvidenceError(IntentLedgerError):
 
 class DurableRiskPolicyError(IntentLedgerError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedQuarantineResolutionEvidence:
+    """Fresh operator-attested reconciliation evidence for one quarantined action."""
+
+    account_id: str
+    economic_key: str
+    client_order_id: str
+    query_reference: str
+    observed_at: datetime
+    source: str = "operator_verified_reconciliation"
+    fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            self.source != "operator_verified_reconciliation"
+            or not self.account_id
+            or not self.economic_key
+            or not self.client_order_id
+            or not self.query_reference
+        ):
+            raise ValueError("verified quarantine evidence needs durable reconciliation identity")
+        if self.observed_at.tzinfo is None:
+            raise ValueError("verified quarantine evidence timestamp must be timezone-aware")
+        if self.observed_at.astimezone(UTC) > datetime.now(UTC) + timedelta(seconds=5):
+            raise ValueError("verified quarantine evidence cannot come from the future")
+        expected = self.expected_fingerprint()
+        if self.fingerprint and self.fingerprint != expected:
+            raise ValueError("verified quarantine evidence fingerprint is invalid")
+        object.__setattr__(self, "fingerprint", expected)
+
+    def expected_fingerprint(self) -> str:
+        canonical = json.dumps(
+            {
+                "account_id": self.account_id,
+                "client_order_id": self.client_order_id,
+                "economic_key": self.economic_key,
+                "observed_at": self.observed_at.astimezone(UTC).isoformat(),
+                "query_reference": self.query_reference,
+                "source": self.source,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +331,7 @@ class UnknownIntentObservation:
 
 @dataclass(frozen=True, slots=True)
 class DurableIntentRecord:
+    account_id: str
     client_order_id: str
     economic_key: str
     attempt_number: int
@@ -291,6 +350,7 @@ class DurableIntentRecord:
 
 @dataclass(frozen=True, slots=True)
 class DurableAbsenceObservation:
+    account_id: str
     client_order_id: str
     economic_key: str
     source: AbsenceEvidenceSource
@@ -308,6 +368,7 @@ class DurableAbsenceObservation:
 
 @dataclass(frozen=True, slots=True)
 class SimulatedProtectionEvidence:
+    account_id: str
     plan_id: str
     stop_intent_reference: str
     reduce_only_exit_intent_reference: str
@@ -322,12 +383,24 @@ class SimulatedProtectionEvidence:
 
 @dataclass(frozen=True, slots=True)
 class DurableReconciliationFacts:
+    account_id: str
     positions_by_symbol: dict[str, Decimal]
     normal_order_client_ids: frozenset[str]
     algo_order_client_ids: frozenset[str]
     required_stop_symbols: frozenset[str]
     unresolved_unknown_intent_ids: frozenset[str]
     expected_stop_contracts: tuple[ExpectedStopContract, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioEnvelopeHead:
+    """The current immutable risk authority for the single supported V1 account."""
+
+    account_id: str
+    version: int
+    fingerprint: str
+    effective_from: datetime
+    superseded_by: int | None
 
 
 class DurableIntentLedger:
@@ -338,8 +411,12 @@ class DurableIntentLedger:
         session_factory: sessionmaker[Session],
         *,
         persistence_breaker: PersistenceCircuitBreaker | None = None,
+        account_id: str = V1_DEFAULT_ACCOUNT_ID,
     ) -> None:
+        if account_id != V1_DEFAULT_ACCOUNT_ID:
+            raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
         self._session_factory = session_factory
+        self._account_id = account_id
         self._persistence_breaker = (
             persistence_breaker if persistence_breaker is not None else PersistenceCircuitBreaker()
         )
@@ -353,7 +430,297 @@ class DurableIntentLedger:
         return DurableIntentLedger(
             self._session_factory,
             persistence_breaker=PersistenceCircuitBreaker(),
+            account_id=self._account_id,
         )
+
+    @staticmethod
+    def _local_account_lock(account_id: str) -> threading.RLock:
+        with _ACCOUNT_LOCKS_GUARD:
+            lock = _ACCOUNT_LOCKS.get(account_id)
+            if lock is None:
+                lock = threading.RLock()
+                _ACCOUNT_LOCKS[account_id] = lock
+            return lock
+
+    def _require_v1_account(self, account_id: str) -> None:
+        if account_id != self._account_id or account_id != V1_DEFAULT_ACCOUNT_ID:
+            raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
+
+    @classmethod
+    def _account_safety_state_for_update(
+        cls,
+        session: Session,
+        account_id: str,
+    ) -> DurableAccountSafetyState:
+        if account_id != V1_DEFAULT_ACCOUNT_ID:
+            raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
+        statement = select(DurableAccountSafetyState).where(
+            DurableAccountSafetyState.account_id == account_id
+        )
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:account_id))"),
+                {"account_id": account_id},
+            )
+            statement = statement.with_for_update()
+        state = session.scalar(statement)
+        if state is None:
+            session.add(
+                DurableAccountSafetyState(
+                    account_id=account_id,
+                    failure_epoch=0,
+                    recovery_epoch=0,
+                    envelope_version=0,
+                    envelope_fingerprint=None,
+                    grant_generation=0,
+                    recovery_required=True,
+                )
+            )
+            session.add(DurableAccountScopeLock(account_id=account_id, lock_generation=0))
+            session.flush()
+            state = session.get(DurableAccountSafetyState, account_id)
+        if state is None:
+            raise PersistenceUnavailable("ACCOUNT_SAFETY_STATE_MISSING")
+        lock_statement = select(DurableAccountScopeLock).where(
+            DurableAccountScopeLock.account_id == account_id
+        )
+        if session.get_bind().dialect.name == "postgresql":
+            lock_statement = lock_statement.with_for_update()
+        lock_row = session.scalar(lock_statement)
+        if lock_row is None:
+            session.add(DurableAccountScopeLock(account_id=account_id, lock_generation=0))
+            session.flush()
+        return state
+
+    @staticmethod
+    def _lock_account_risk_rows(session: Session, account_id: str) -> None:
+        """Lock every account-wide risk input before a fill is projected and committed."""
+        queries = (
+            select(DurablePortfolioEnvelopeHead).where(
+                DurablePortfolioEnvelopeHead.account_id == account_id
+            ),
+            select(DurableActualRiskPolicy).where(DurableActualRiskPolicy.account_id == account_id),
+            select(DurableActualRiskState).where(DurableActualRiskState.account_id == account_id),
+            select(DurableSimulatedProtection).where(
+                DurableSimulatedProtection.account_id == account_id
+            ),
+            select(DurableRiskReductionRequirement).where(
+                DurableRiskReductionRequirement.account_id == account_id
+            ),
+            select(DurableOrderIntent).where(DurableOrderIntent.account_id == account_id),
+            select(DurableIntentFill).where(DurableIntentFill.account_id == account_id),
+        )
+        for statement in queries:
+            if session.get_bind().dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            tuple(session.scalars(statement))
+
+    @classmethod
+    def _unresolved_quarantine_count(
+        cls,
+        session: Session,
+        *,
+        account_id: str,
+        economic_key: str | None = None,
+    ) -> int:
+        statement = (
+            select(DurableEvidenceQuarantine.id)
+            .outerjoin(
+                DurableEvidenceQuarantineResolution,
+                DurableEvidenceQuarantineResolution.quarantine_id
+                == DurableEvidenceQuarantine.quarantine_id,
+            )
+            .where(
+                DurableEvidenceQuarantine.account_id == account_id,
+                DurableEvidenceQuarantineResolution.id.is_(None),
+            )
+        )
+        if economic_key is not None:
+            statement = statement.where(DurableEvidenceQuarantine.economic_key == economic_key)
+        durable_count = len(tuple(session.scalars(statement)))
+        if economic_key is not None:
+            return durable_count
+        migrated_quarantine_ids = frozenset(
+            session.scalars(
+                select(DurableEvidenceQuarantine.quarantine_id).where(
+                    DurableEvidenceQuarantine.quarantine_id.like("migration-quarantine-%")
+                )
+            )
+        )
+        migration_count = sum(
+            f"migration-quarantine-{row_id}" not in migrated_quarantine_ids
+            for row_id in session.scalars(
+                select(MigrationQuarantineRecord.id).where(
+                    MigrationQuarantineRecord.reconciliation_required.is_(True)
+                )
+            )
+        )
+        return durable_count + migration_count
+
+    @classmethod
+    def _require_no_unresolved_quarantine(
+        cls,
+        session: Session,
+        *,
+        account_id: str,
+        economic_key: str | None = None,
+    ) -> None:
+        if cls._unresolved_quarantine_count(
+            session,
+            account_id=account_id,
+            economic_key=economic_key,
+        ):
+            raise PersistenceUnavailable("UNRESOLVED_QUARANTINE")
+
+    def record_evidence_quarantine(
+        self,
+        *,
+        account_id: str,
+        economic_key: str,
+        client_order_id: str,
+        query_reference: str,
+        provenance_fingerprint: str,
+        reason: str,
+        evidence: dict[str, object] | None = None,
+    ) -> str:
+        """Persist an immutable deny record without altering original provenance."""
+        self._require_v1_account(account_id)
+        if (
+            not economic_key
+            or not client_order_id
+            or not query_reference
+            or not reason
+            or len(provenance_fingerprint) != 64
+        ):
+            raise ValueError("quarantine requires complete original economic provenance")
+        with self._local_account_lock(account_id):
+            with self._session_factory.begin() as session:
+                safety_state = self._account_safety_state_for_update(session, account_id)
+                existing = session.scalar(
+                    select(DurableEvidenceQuarantine).where(
+                        DurableEvidenceQuarantine.account_id == account_id,
+                        DurableEvidenceQuarantine.economic_key == economic_key,
+                        DurableEvidenceQuarantine.provenance_fingerprint == provenance_fingerprint,
+                    )
+                )
+                if existing is not None:
+                    return existing.quarantine_id
+                quarantine_id = f"quarantine-{uuid4().hex}"
+                session.add(
+                    DurableEvidenceQuarantine(
+                        quarantine_id=quarantine_id,
+                        account_id=account_id,
+                        economic_key=economic_key,
+                        client_order_id=client_order_id,
+                        query_reference=query_reference,
+                        provenance_fingerprint=provenance_fingerprint,
+                        reason=reason,
+                        evidence=evidence or {},
+                    )
+                )
+                safety_state.grant_generation += 1
+                safety_state.recovery_required = True
+                safety_state.updated_at = datetime.now(UTC)
+                return quarantine_id
+
+    def resolve_evidence_quarantine(
+        self,
+        quarantine_id: str,
+        *,
+        operator_id: str,
+        verified_evidence: VerifiedQuarantineResolutionEvidence | None = None,
+        verified_evidence_fingerprint: str | None = None,
+    ) -> str:
+        if not quarantine_id or not operator_id:
+            raise ValueError("quarantine resolution requires an operator identity")
+        if verified_evidence is None:
+            raise ValueError("quarantine resolution requires typed new verified evidence")
+        if type(verified_evidence) is not VerifiedQuarantineResolutionEvidence:
+            raise TypeError("quarantine resolution requires exact verified evidence")
+        if verified_evidence_fingerprint is not None:
+            raise ValueError("quarantine resolution does not accept caller-supplied fingerprints")
+        with self._local_account_lock(self._account_id):
+            with self._session_factory.begin() as session:
+                quarantine = session.scalar(
+                    select(DurableEvidenceQuarantine).where(
+                        DurableEvidenceQuarantine.quarantine_id == quarantine_id
+                    )
+                )
+                if quarantine is None:
+                    raise KeyError(f"unknown quarantine {quarantine_id}")
+                self._require_v1_account(quarantine.account_id)
+                if (
+                    verified_evidence.account_id != quarantine.account_id
+                    or verified_evidence.economic_key != quarantine.economic_key
+                    or verified_evidence.client_order_id != quarantine.client_order_id
+                    or verified_evidence.fingerprint == quarantine.provenance_fingerprint
+                    or (
+                        quarantine.query_reference is not None
+                        and verified_evidence.query_reference == quarantine.query_reference
+                    )
+                ):
+                    raise ValueError(
+                        "quarantine resolution requires new verified evidence "
+                        "for the original identity"
+                    )
+                safety_state = self._account_safety_state_for_update(session, quarantine.account_id)
+                existing = session.scalar(
+                    select(DurableEvidenceQuarantineResolution).where(
+                        DurableEvidenceQuarantineResolution.quarantine_id == quarantine_id
+                    )
+                )
+                if existing is not None:
+                    return existing.resolution_id
+                resolution_id = f"quarantine-resolution-{uuid4().hex}"
+                session.add(
+                    DurableEvidenceQuarantineResolution(
+                        resolution_id=resolution_id,
+                        quarantine_id=quarantine_id,
+                        account_id=quarantine.account_id,
+                        operator_id=operator_id,
+                        verified_evidence_source=verified_evidence.source,
+                        verified_query_reference=verified_evidence.query_reference,
+                        verified_evidence_fingerprint=verified_evidence.fingerprint,
+                        verified_at=verified_evidence.observed_at.astimezone(UTC),
+                    )
+                )
+                safety_state.grant_generation += 1
+                safety_state.recovery_required = True
+                safety_state.updated_at = datetime.now(UTC)
+                return resolution_id
+
+    def entry_authorization_capability(self) -> EntryAuthorizationCapability:
+        """Expose a re-derived capability only for gate verification tests and callers."""
+        return self._derive_entry_authorization_capability()
+
+    def publish_portfolio_envelope_head(
+        self,
+        envelope: AccountPortfolioEnvelope,
+    ) -> PortfolioEnvelopeHead:
+        if type(envelope) is not AccountPortfolioEnvelope:
+            raise TypeError("portfolio envelope head requires an exact envelope")
+        self._require_v1_account(envelope.account_id)
+        with self._local_account_lock(envelope.account_id):
+            with self._session_factory.begin() as session:
+                self._account_safety_state_for_update(session, envelope.account_id)
+                self._register_portfolio_envelope(session, envelope)
+                row = session.scalar(
+                    select(DurablePortfolioEnvelopeHead)
+                    .where(
+                        DurablePortfolioEnvelopeHead.account_id == envelope.account_id,
+                        DurablePortfolioEnvelopeHead.version == envelope.version,
+                    )
+                    .limit(1)
+                )
+                if row is None:
+                    raise DurableRiskPolicyError("portfolio envelope head was not persisted")
+                return PortfolioEnvelopeHead(
+                    account_id=row.account_id,
+                    version=row.version,
+                    fingerprint=row.envelope_fingerprint,
+                    effective_from=self._as_utc(row.effective_from),
+                    superseded_by=row.superseded_by,
+                )
 
     def issue_entry_authorization_capability(
         self,
@@ -366,6 +733,8 @@ class DurableIntentLedger:
             raise TypeError("entry authorization requires typed recovery evidence")
         if type(reconciliation_snapshot) is not ReconciliationSnapshot:
             raise TypeError("entry authorization requires a typed exchange snapshot")
+        if reconciliation_snapshot.account_id != self._account_id:
+            raise PersistenceUnavailable("V1_SECOND_ACCOUNT_UNSUPPORTED")
         if not evidence.is_complete:
             raise PersistenceUnavailable("RECOVERY_EVIDENCE_INCOMPLETE")
 
@@ -374,6 +743,11 @@ class DurableIntentLedger:
         grant_id = f"entry-capability-{uuid4().hex}"
         try:
             with self._session_factory.begin() as session:
+                safety_state = self._account_safety_state_for_update(session, self._account_id)
+                self._require_no_unresolved_quarantine(
+                    session,
+                    account_id=self._account_id,
+                )
                 events, head, replay_valid, projection_matches = self._audit_replay_state(session)
                 if (
                     not replay_valid
@@ -397,6 +771,7 @@ class DurableIntentLedger:
                     raise PersistenceUnavailable("RECOVERY_WRITE_PROBE_MISSING")
                 prior_grant = session.scalar(
                     select(DurableEntryAuthorizationGrant)
+                    .where(DurableEntryAuthorizationGrant.account_id == self._account_id)
                     .order_by(DurableEntryAuthorizationGrant.id.desc())
                     .limit(1)
                 )
@@ -429,15 +804,24 @@ class DurableIntentLedger:
                 ):
                     raise PersistenceUnavailable("RECOVERY_RECONCILIATION_CHANGED")
 
+                safety_state.recovery_epoch += 1
+                safety_state.grant_generation += 1
+                safety_state.recovery_required = False
+                safety_state.updated_at = issued_at
+
                 snapshot_payload = self._snapshot_payload(reconciliation_snapshot)
                 snapshot_fingerprint = self._canonical_fingerprint(snapshot_payload)
                 local_state_payload = self._local_state_payload(facts)
                 local_state_fingerprint = self._canonical_fingerprint(local_state_payload)
                 grant_payload = {
+                    "account_id": self._account_id,
                     "audit_event_count": head.event_count,
                     "audit_last_record_hash": head.last_record_hash,
                     "audit_last_sequence": head.last_sequence,
+                    "envelope_version": safety_state.envelope_version,
                     "exchange_snapshot_fingerprint": snapshot_fingerprint,
+                    "failure_epoch": safety_state.failure_epoch,
+                    "grant_generation": safety_state.grant_generation,
                     "expires_at": expires_at.isoformat(),
                     "grant_id": grant_id,
                     "issued_at": issued_at.isoformat(),
@@ -445,6 +829,7 @@ class DurableIntentLedger:
                     "projection_matches_replay": projection_matches,
                     "reconciliation_clean": outcome.is_clean,
                     "reconciliation_fingerprint": reconciliation_fingerprint,
+                    "recovery_epoch": safety_state.recovery_epoch,
                     "recovery_probe_event_id": evidence.write_probe_event_id,
                     "recovery_status": "VERIFIED",
                     "replay_valid": replay_valid,
@@ -453,6 +838,11 @@ class DurableIntentLedger:
                 capability_fingerprint = self._canonical_fingerprint(grant_payload)
                 session.add(
                     DurableEntryAuthorizationGrant(
+                        account_id=self._account_id,
+                        failure_epoch=safety_state.failure_epoch,
+                        recovery_epoch=safety_state.recovery_epoch,
+                        envelope_version=safety_state.envelope_version,
+                        grant_generation=safety_state.grant_generation,
                         grant_id=grant_id,
                         recovery_probe_event_id=evidence.write_probe_event_id,
                         recovery_status="VERIFIED",
@@ -486,6 +876,7 @@ class DurableIntentLedger:
         with self._session_factory() as session:
             grant = session.scalar(
                 select(DurableEntryAuthorizationGrant)
+                .where(DurableEntryAuthorizationGrant.account_id == self._account_id)
                 .order_by(DurableEntryAuthorizationGrant.id.desc())
                 .limit(1)
             )
@@ -498,6 +889,26 @@ class DurableIntentLedger:
             )
             if revoked is not None:
                 raise PersistenceUnavailable("DURABLE_ENTRY_AUTHORIZATION_REVOKED")
+            safety_state = session.get(DurableAccountSafetyState, self._account_id)
+            if safety_state is None:
+                raise PersistenceUnavailable("ACCOUNT_SAFETY_STATE_MISSING")
+            self._require_no_unresolved_quarantine(session, account_id=self._account_id)
+            if (
+                safety_state.recovery_required
+                or grant.account_id != self._account_id
+                or grant.failure_epoch != safety_state.failure_epoch
+                or grant.recovery_epoch != safety_state.recovery_epoch
+                or grant.grant_generation != safety_state.grant_generation
+            ):
+                raise PersistenceUnavailable("DURABLE_ENTRY_AUTHORIZATION_EPOCH_STALE")
+            bootstrap_envelope_grant = (
+                grant.envelope_version == 0 and safety_state.envelope_version == 1
+            )
+            if (
+                not bootstrap_envelope_grant
+                and grant.envelope_version != safety_state.envelope_version
+            ):
+                raise PersistenceUnavailable("DURABLE_ENTRY_AUTHORIZATION_EPOCH_STALE")
             if (
                 grant.recovery_status != "VERIFIED"
                 or not grant.replay_valid
@@ -513,10 +924,14 @@ class DurableIntentLedger:
                 raise PersistenceUnavailable("ENTRY_AUTHORIZATION_CAPABILITY_EXPIRED")
             expected_grant_fingerprint = self._canonical_fingerprint(
                 {
+                    "account_id": grant.account_id,
                     "audit_event_count": grant.audit_event_count,
                     "audit_last_record_hash": grant.audit_last_record_hash,
                     "audit_last_sequence": grant.audit_last_sequence,
+                    "envelope_version": grant.envelope_version,
                     "exchange_snapshot_fingerprint": (grant.exchange_snapshot_fingerprint),
+                    "failure_epoch": grant.failure_epoch,
+                    "grant_generation": grant.grant_generation,
                     "expires_at": expires_at.isoformat(),
                     "grant_id": grant.grant_id,
                     "issued_at": issued_at.isoformat(),
@@ -524,6 +939,7 @@ class DurableIntentLedger:
                     "projection_matches_replay": grant.projection_matches_replay,
                     "reconciliation_clean": grant.reconciliation_clean,
                     "reconciliation_fingerprint": (grant.reconciliation_fingerprint),
+                    "recovery_epoch": grant.recovery_epoch,
                     "recovery_probe_event_id": grant.recovery_probe_event_id,
                     "recovery_status": grant.recovery_status,
                     "replay_valid": grant.replay_valid,
@@ -571,10 +987,15 @@ class DurableIntentLedger:
             envelope_fingerprints = self._current_envelope_fingerprints(session)
             capability_fingerprint = self._canonical_fingerprint(
                 {
+                    "account_id": self._account_id,
                     "account_envelope_fingerprints": envelope_fingerprints,
                     "current_local_state_fingerprint": self._local_state_fingerprint(facts),
                     "current_unresolved_intent_count": len(facts.unresolved_unknown_intent_ids),
                     "durable_grant_fingerprint": grant.capability_fingerprint,
+                    "envelope_version": safety_state.envelope_version,
+                    "failure_epoch": safety_state.failure_epoch,
+                    "grant_generation": safety_state.grant_generation,
+                    "recovery_epoch": safety_state.recovery_epoch,
                 }
             )
             return EntryAuthorizationCapability(
@@ -586,31 +1007,55 @@ class DurableIntentLedger:
                 exchange_snapshot_fingerprint=grant.exchange_snapshot_fingerprint,
                 account_envelope_fingerprints=envelope_fingerprints,
                 fingerprint=capability_fingerprint,
+                account_id=self._account_id,
+                failure_epoch=safety_state.failure_epoch,
+                recovery_epoch=safety_state.recovery_epoch,
+                envelope_version=safety_state.envelope_version,
+                grant_generation=safety_state.grant_generation,
             )
 
     def _record_entry_authorization_revocation(self, reason: str) -> None:
-        with self._session_factory.begin() as session:
-            grant = session.scalar(
-                select(DurableEntryAuthorizationGrant)
-                .order_by(DurableEntryAuthorizationGrant.id.desc())
-                .limit(1)
-            )
-            if grant is None:
-                return
-            existing = session.scalar(
-                select(DurableEntryAuthorizationRevocation.id)
-                .where(DurableEntryAuthorizationRevocation.grant_id == grant.grant_id)
-                .limit(1)
-            )
-            if existing is not None:
-                return
-            session.add(
-                DurableEntryAuthorizationRevocation(
-                    revocation_id=f"entry-revocation-{uuid4().hex}",
-                    grant_id=grant.grant_id,
-                    reason=reason[:128],
+        """Fence grants before attempting the append-only revocation record.
+
+        The state transaction is deliberately separate: a later revocation insert
+        outage cannot roll back the failure epoch that makes every old grant stale.
+        """
+        with self._local_account_lock(self._account_id):
+            with self._session_factory.begin() as session:
+                safety_state = self._account_safety_state_for_update(session, self._account_id)
+                safety_state.failure_epoch += 1
+                safety_state.grant_generation += 1
+                safety_state.recovery_required = True
+                safety_state.updated_at = datetime.now(UTC)
+            with self._session_factory.begin() as session:
+                grant = session.scalar(
+                    select(DurableEntryAuthorizationGrant)
+                    .where(DurableEntryAuthorizationGrant.account_id == self._account_id)
+                    .order_by(DurableEntryAuthorizationGrant.id.desc())
+                    .limit(1)
                 )
-            )
+                if grant is None:
+                    return
+                existing = session.scalar(
+                    select(DurableEntryAuthorizationRevocation.id)
+                    .where(DurableEntryAuthorizationRevocation.grant_id == grant.grant_id)
+                    .limit(1)
+                )
+                if existing is not None:
+                    return
+                self._entry_revocation_checkpoint("before_revocation_append")
+                session.add(
+                    DurableEntryAuthorizationRevocation(
+                        revocation_id=f"entry-revocation-{uuid4().hex}",
+                        account_id=self._account_id,
+                        grant_id=grant.grant_id,
+                        reason=reason[:128],
+                    )
+                )
+
+    @staticmethod
+    def _entry_revocation_checkpoint(_phase: str) -> None:
+        """Fault-injection seam proving epoch fencing precedes the revocation append."""
 
     @staticmethod
     def _canonical_fingerprint(payload: object) -> str:
@@ -629,19 +1074,26 @@ class DurableIntentLedger:
     @classmethod
     def _snapshot_payload(cls, snapshot: ReconciliationSnapshot) -> dict[str, object]:
         return {
+            "account_id": snapshot.account_id,
             "algo_order_client_ids": sorted(snapshot.algo_order_client_ids),
             "algo_orders": [
                 {
+                    "account_id": order.account_id,
                     "account_envelope_fingerprint": order.account_envelope_fingerprint,
                     "account_envelope_version": order.account_envelope_version,
                     "algo_type": order.algo_type.value,
                     "client_algo_id": order.client_algo_id,
                     "close_position": order.close_position,
+                    "correlation_id": order.correlation_id,
                     "direction": order.direction.value,
+                    "fetched_at": order.fetched_at.astimezone(UTC).isoformat(),
+                    "freshness_window_ms": int(order.freshness_window.total_seconds() * 1000),
                     "plan_id": order.plan_id,
                     "policy_fingerprint": order.policy_fingerprint,
                     "policy_version": order.policy_version,
                     "quantity": (None if order.quantity is None else format(order.quantity, "f")),
+                    "server_time": order.server_time.astimezone(UTC).isoformat(),
+                    "source": order.source,
                     "status": order.status.value,
                     "stop_contract_fingerprint": order.stop_contract_fingerprint,
                     "symbol": order.symbol,
@@ -662,14 +1114,26 @@ class DurableIntentLedger:
     def _snapshot_from_payload(payload: dict[str, object]) -> ReconciliationSnapshot:
         raw_positions = payload.get("positions_by_symbol")
         raw_orders = payload.get("algo_orders")
-        if not isinstance(raw_positions, dict) or not isinstance(raw_orders, list):
+        account_id = payload.get("account_id")
+        if (
+            not isinstance(raw_positions, dict)
+            or not isinstance(raw_orders, list)
+            or not isinstance(account_id, str)
+            or not account_id
+        ):
             raise PersistenceUnavailable("EXCHANGE_SNAPSHOT_EVIDENCE_INVALID")
         try:
             positions = {
                 str(symbol): Decimal(str(quantity)) for symbol, quantity in raw_positions.items()
             }
             orders = tuple(
-                AlgoOrderIntent(
+                ExchangeAlgoOrderObservation(
+                    source=str(item["source"]),
+                    account_id=str(item["account_id"]),
+                    fetched_at=datetime.fromisoformat(str(item["fetched_at"])),
+                    server_time=datetime.fromisoformat(str(item["server_time"])),
+                    freshness_window=timedelta(milliseconds=int(item["freshness_window_ms"])),
+                    correlation_id=str(item["correlation_id"]),
                     client_algo_id=str(item["client_algo_id"]),
                     symbol=str(item["symbol"]),
                     direction=Direction(str(item["direction"])),
@@ -713,6 +1177,7 @@ class DurableIntentLedger:
             if len(orders) != len(raw_orders):
                 raise ValueError("all Algo observations must be structured")
             return ReconciliationSnapshot(
+                account_id=account_id,
                 positions_by_symbol=positions,
                 normal_order_client_ids=DurableIntentLedger._string_set_from_payload(
                     payload,
@@ -744,6 +1209,7 @@ class DurableIntentLedger:
             "algo_order_client_ids": sorted(facts.algo_order_client_ids),
             "expected_stop_contracts": [
                 {
+                    "account_id": contract.account_id,
                     "account_envelope_fingerprint": (contract.account_envelope_fingerprint),
                     "account_envelope_version": contract.account_envelope_version,
                     "active_status": contract.active_status.value,
@@ -789,6 +1255,7 @@ class DurableIntentLedger:
         try:
             contracts = tuple(
                 ExpectedStopContract(
+                    account_id=str(item["account_id"]),
                     plan_id=str(item["plan_id"]),
                     symbol=str(item["symbol"]),
                     position_side=Direction(str(item["position_side"])),
@@ -943,41 +1410,34 @@ class DurableIntentLedger:
 
     @classmethod
     def _current_envelope_fingerprints(cls, session: Session) -> tuple[str, ...]:
-        latest_by_scope: dict[str, DurableAccountPortfolioEnvelope] = {}
-        for row in session.scalars(
-            select(DurableAccountPortfolioEnvelope).order_by(
-                DurableAccountPortfolioEnvelope.account_scope.asc(),
-                DurableAccountPortfolioEnvelope.version.asc(),
+        heads = tuple(
+            session.scalars(
+                select(DurablePortfolioEnvelopeHead)
+                .where(DurablePortfolioEnvelopeHead.account_id == V1_DEFAULT_ACCOUNT_ID)
+                .order_by(DurablePortfolioEnvelopeHead.version.asc())
             )
+        )
+        if not heads:
+            return ()
+        current = heads[-1]
+        safety_state = session.get(DurableAccountSafetyState, V1_DEFAULT_ACCOUNT_ID)
+        if (
+            safety_state is None
+            or safety_state.envelope_version != current.version
+            or safety_state.envelope_fingerprint != current.envelope_fingerprint
         ):
-            cls._envelope_from_row(row)
-            latest_by_scope[row.account_scope] = row
-        if len(latest_by_scope) > 1:
-            raise PersistenceUnavailable("MULTIPLE_ACCOUNT_ENVELOPE_SCOPES")
-        for row in latest_by_scope.values():
-            if row.reconciliation_required:
-                raise PersistenceUnavailable("ACCOUNT_ENVELOPE_RECONCILIATION_REQUIRED")
-        current = {
-            (row.account_scope, row.version): row.envelope_fingerprint
-            for row in latest_by_scope.values()
-        }
-        for base in session.scalars(select(DurableActualRiskPolicy)):
-            policy = cls._validated_policy_lineage(session, base)
-            key = (
-                policy.portfolio_envelope.account_scope,
-                policy.portfolio_envelope.version,
-            )
-            if current.get(key) != policy.portfolio_envelope.fingerprint:
-                raise PersistenceUnavailable("ACCOUNT_ENVELOPE_POLICY_LINK_STALE")
-        return tuple(sorted(current.values()))
+            raise PersistenceUnavailable("ACCOUNT_ENVELOPE_HEAD_STATE_INVALID")
+        return (current.envelope_fingerprint,)
 
     def register_actual_risk_policy(self, policy: ActualRiskPolicy) -> ActualRiskPolicy:
         """Persist an immutable entry policy before it can authorize simulator fills."""
         if not isinstance(policy, ActualRiskPolicy):
             raise TypeError("actual-risk policy must be typed")
+        self._require_v1_account(policy.portfolio_envelope.account_id)
         fingerprint = self._policy_fingerprint(policy)
         try:
             with self._session_factory.begin() as session:
+                self._account_safety_state_for_update(session, self._account_id)
                 self._register_portfolio_envelope(session, policy.portfolio_envelope)
                 self._assert_account_envelope_consistency(
                     session,
@@ -994,6 +1454,7 @@ class DurableIntentLedger:
                 session.add(
                     DurableActualRiskPolicy(
                         plan_id=policy.plan_id,
+                        account_id=self._account_id,
                         symbol=policy.symbol,
                         direction=policy.direction.value,
                         worst_stop_exit_price=format(policy.worst_stop_exit_price, "f"),
@@ -1023,6 +1484,7 @@ class DurableIntentLedger:
                 session.add(
                     DurableSimulatedProtection(
                         plan_id=policy.plan_id,
+                        account_id=self._account_id,
                         stop_intent_reference=policy.protective_stop_reference,
                         reduce_only_exit_intent_reference=policy.reduce_only_exit_reference,
                         protected_position_quantity=format(ZERO, "f"),
@@ -1033,6 +1495,7 @@ class DurableIntentLedger:
                 session.add(
                     DurableActualRiskState(
                         plan_id=policy.plan_id,
+                        account_id=self._account_id,
                         position_quantity=format(ZERO, "f"),
                         average_entry_price=None,
                         actual_notional_usdt=format(ZERO, "f"),
@@ -1055,18 +1518,24 @@ class DurableIntentLedger:
             base = session.get(DurableActualRiskPolicy, plan_id)
             if base is None:
                 return None
+            if base.account_id != self._account_id:
+                raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
             return self._validated_policy_lineage(session, base)
 
     def version_actual_risk_policy(self, policy: ActualRiskPolicy) -> int:
         """Append a validated policy revision without mutating earlier evidence."""
         if not isinstance(policy, ActualRiskPolicy):
             raise TypeError("actual-risk policy must be typed")
+        self._require_v1_account(policy.portfolio_envelope.account_id)
         fingerprint = self._policy_fingerprint(policy)
         try:
             with self._session_factory.begin() as session:
+                self._account_safety_state_for_update(session, self._account_id)
                 base = session.get(DurableActualRiskPolicy, policy.plan_id)
                 if base is None:
                     raise DurableRiskPolicyError("base actual-risk policy must exist first")
+                if base.account_id != self._account_id:
+                    raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
                 base_policy = self._policy_from_row(session, base)
                 self._validated_policy_lineage(session, base)
                 if (
@@ -1134,6 +1603,12 @@ class DurableIntentLedger:
                     raise DurableRiskPolicyError(
                         "durable policy and protection evidence are required"
                     )
+                if (
+                    policy.account_id != self._account_id
+                    or protection.account_id != self._account_id
+                ):
+                    raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
+                self._account_safety_state_for_update(session, self._account_id)
                 fills = self._fill_ledger_for_plan(session, plan_id)
                 if fills.filled_quantity != protected_position_quantity:
                     raise DurableRiskPolicyError(
@@ -1158,6 +1633,9 @@ class DurableIntentLedger:
                 policy = session.get(DurableActualRiskPolicy, plan_id)
                 if policy is None:
                     raise DurableRiskPolicyError("no durable actual-risk policy for this plan")
+                if policy.account_id != self._account_id:
+                    raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
+                self._account_safety_state_for_update(session, self._account_id)
                 result = self._recalculate_actual_risk(session, policy)
                 session.flush()
                 return result
@@ -1178,16 +1656,27 @@ class DurableIntentLedger:
         """Recompute pending, position, aggregate, margin, reserve, and stop risk."""
         if intent.role is not OrderRole.ENTRY:
             raise DurableRiskPolicyError("projected entry risk requires an ENTRY intent")
+        self._require_v1_account(intent.account_id)
         with self._session_factory() as session:
+            self._require_no_unresolved_quarantine(
+                session,
+                account_id=self._account_id,
+                economic_key=intent.economic_key,
+            )
             policy_row = session.get(DurableActualRiskPolicy, intent.plan_id)
             if policy_row is None:
                 raise DurableRiskPolicyError("RISK_POLICY_MISSING")
+            if policy_row.account_id != self._account_id:
+                raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
             policy = self._latest_policy_from_session(session, intent.plan_id)
             if policy.symbol != intent.symbol or policy.direction is not intent.direction:
                 raise DurableRiskPolicyError("RISK_POLICY_PLAN_MISMATCH")
             open_requirement = session.scalar(
                 select(DurableRiskReductionRequirement)
-                .where(DurableRiskReductionRequirement.status == RiskReductionStatus.OPEN.value)
+                .where(
+                    DurableRiskReductionRequirement.account_id == self._account_id,
+                    DurableRiskReductionRequirement.status == RiskReductionStatus.OPEN.value,
+                )
                 .limit(1)
             )
             if open_requirement is not None:
@@ -1205,8 +1694,15 @@ class DurableIntentLedger:
             return self._projected_portfolio_risk(session, policy, proposed_intent=intent)
 
     def prepare(self, intent: SimulatedOrderIntent) -> DurableIntentRecord:
+        self._require_v1_account(intent.account_id)
         try:
             with self._session_factory.begin() as session:
+                self._account_safety_state_for_update(session, self._account_id)
+                self._require_no_unresolved_quarantine(
+                    session,
+                    account_id=self._account_id,
+                    economic_key=intent.economic_key,
+                )
                 latest = self._latest_for_economic_key(session, intent.economic_key)
                 if (
                     latest is not None
@@ -1226,6 +1722,7 @@ class DurableIntentLedger:
                 if intent.role is OrderRole.ENTRY:
                     self._entry_gate.authorize_new_entry_intent()
                 record = DurableOrderIntent(
+                    account_id=self._account_id,
                     economic_key=intent.economic_key,
                     attempt_number=attempt_number,
                     client_order_id=intent.client_order_id,
@@ -1288,15 +1785,33 @@ class DurableIntentLedger:
         *,
         materialize_simulated_protection: bool = False,
     ) -> FillLedgerReceipt:
+        """Serialize local SQLite account fills before using the durable lock protocol."""
+        with self._local_account_lock(self._account_id):
+            return self._record_fill_locked(
+                event,
+                materialize_simulated_protection=materialize_simulated_protection,
+            )
+
+    def _record_fill_locked(
+        self,
+        event: FillEvent,
+        *,
+        materialize_simulated_protection: bool,
+    ) -> FillLedgerReceipt:
         """Atomically persist a fill and every resulting rehearsal safety decision."""
         try:
             with self._session_factory.begin() as session:
+                safety_state = self._account_safety_state_for_update(session, self._account_id)
+                self._lock_account_risk_rows(session, self._account_id)
                 intent = self._record_for_update(session, event.client_order_id)
+                if intent.account_id != self._account_id:
+                    raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
                 status = DurableIntentStatus(intent.status)
                 existing_rows = tuple(
                     session.scalars(
                         select(DurableIntentFill).where(
-                            DurableIntentFill.client_order_id == event.client_order_id
+                            DurableIntentFill.client_order_id == event.client_order_id,
+                            DurableIntentFill.account_id == self._account_id,
                         )
                     )
                 )
@@ -1308,6 +1823,7 @@ class DurableIntentLedger:
                     select(DurableIntentFill).where(
                         DurableIntentFill.client_order_id == event.client_order_id,
                         DurableIntentFill.trade_id == event.trade_id,
+                        DurableIntentFill.account_id == self._account_id,
                     )
                 )
                 if existing is not None:
@@ -1327,6 +1843,7 @@ class DurableIntentLedger:
                     raise IntentLifecycleError("durable fills exceed the planned quantity")
                 session.add(
                     DurableIntentFill(
+                        account_id=self._account_id,
                         client_order_id=event.client_order_id,
                         trade_id=event.trade_id,
                         semantic_fingerprint=fingerprint,
@@ -1371,8 +1888,13 @@ class DurableIntentLedger:
                     self._cancel_unfilled_superseding_attempts(session, intent)
                     policy = session.get(DurableActualRiskPolicy, intent.plan_id)
                     if policy is None:
+                        safety_state.grant_generation += 1
+                        safety_state.recovery_required = True
+                        self._cancel_known_active_entry_intents(session, self._account_id)
                         session.flush()
                         return receipt
+                    if policy.account_id != self._account_id:
+                        raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
                     self._fill_uow_checkpoint("before_protection_evaluation")
                     if materialize_simulated_protection:
                         self._materialize_simulated_protection_in_session(
@@ -1380,11 +1902,18 @@ class DurableIntentLedger:
                             policy,
                         )
                     self._fill_uow_checkpoint("after_protection_evaluation")
-                    result = self._recalculate_actual_risk(session, policy)
+                    results = tuple(
+                        self._recalculate_actual_risk(session, account_policy)
+                        for account_policy in session.scalars(
+                            select(DurableActualRiskPolicy).where(
+                                DurableActualRiskPolicy.account_id == self._account_id
+                            )
+                        )
+                    )
                     self._fill_uow_checkpoint("after_actual_risk")
-                    if result.pending_entries_blocked:
+                    if any(result.pending_entries_blocked for result in results):
                         self._fill_uow_checkpoint("before_pending_cancel")
-                        self._cancel_known_active_entry_intents(session)
+                        self._cancel_known_active_entry_intents(session, self._account_id)
                         self._fill_uow_checkpoint("after_pending_cancel")
                     session.flush()
                 return receipt
@@ -1525,6 +2054,7 @@ class DurableIntentLedger:
                         "absence query provenance fingerprint is invalid"
                     )
                 row = DurableIntentAbsenceObservation(
+                    account_id=record.account_id,
                     client_order_id=record.client_order_id,
                     economic_key=record.economic_key,
                     source=observation.source.value,
@@ -1574,6 +2104,11 @@ class DurableIntentLedger:
                 record = self._record_for_update(session, client_order_id)
                 if DurableIntentStatus(record.status) is not DurableIntentStatus.UNKNOWN:
                     raise IntentLifecycleError("only UNKNOWN intents can resolve as absent")
+                self._require_no_unresolved_quarantine(
+                    session,
+                    account_id=record.account_id,
+                    economic_key=record.economic_key,
+                )
                 self._derive_bounded_absence_evidence(session, record)
                 record.status = DurableIntentStatus.ABSENT.value
                 record.updated_at = datetime.now(UTC)
@@ -1589,7 +2124,8 @@ class DurableIntentLedger:
         with self._session_factory() as session:
             record = session.scalar(
                 select(DurableOrderIntent).where(
-                    DurableOrderIntent.client_order_id == client_order_id
+                    DurableOrderIntent.client_order_id == client_order_id,
+                    DurableOrderIntent.account_id == self._account_id,
                 )
             )
             if record is None:
@@ -1599,7 +2135,9 @@ class DurableIntentLedger:
     def list_intents(self) -> tuple[DurableIntentRecord, ...]:
         with self._session_factory() as session:
             records = session.scalars(
-                select(DurableOrderIntent).order_by(DurableOrderIntent.id.asc())
+                select(DurableOrderIntent)
+                .where(DurableOrderIntent.account_id == self._account_id)
+                .order_by(DurableOrderIntent.id.asc())
             )
             return tuple(self._to_record(record) for record in records)
 
@@ -1610,7 +2148,8 @@ class DurableIntentLedger:
         with self._session_factory() as session:
             record = session.scalar(
                 select(DurableOrderIntent).where(
-                    DurableOrderIntent.client_order_id == client_order_id
+                    DurableOrderIntent.client_order_id == client_order_id,
+                    DurableOrderIntent.account_id == self._account_id,
                 )
             )
             if record is None:
@@ -1618,7 +2157,10 @@ class DurableIntentLedger:
             self._validate_lifecycle_timeline(record)
             rows = session.scalars(
                 select(DurableIntentAbsenceObservation)
-                .where(DurableIntentAbsenceObservation.client_order_id == client_order_id)
+                .where(
+                    DurableIntentAbsenceObservation.client_order_id == client_order_id,
+                    DurableIntentAbsenceObservation.account_id == self._account_id,
+                )
                 .order_by(
                     DurableIntentAbsenceObservation.observed_at_ms.asc(),
                     DurableIntentAbsenceObservation.source.asc(),
@@ -1668,13 +2210,23 @@ class DurableIntentLedger:
         required_stop_symbols: set[str] = set()
         algo_order_client_ids: set[str] = set()
         expected_stop_contracts: list[ExpectedStopContract] = []
-        for state in session.scalars(select(DurableActualRiskState)):
+        for state in session.scalars(
+            select(DurableActualRiskState).where(
+                DurableActualRiskState.account_id == V1_DEFAULT_ACCOUNT_ID
+            )
+        ):
             policy_row = session.get(DurableActualRiskPolicy, state.plan_id)
             protection = session.get(DurableSimulatedProtection, state.plan_id)
             if policy_row is None or protection is None:
                 raise DurableRiskPolicyError(
                     "durable reconciliation facts require complete risk and protection records"
                 )
+            if (
+                policy_row.account_id != V1_DEFAULT_ACCOUNT_ID
+                or protection.account_id != V1_DEFAULT_ACCOUNT_ID
+                or state.account_id != V1_DEFAULT_ACCOUNT_ID
+            ):
+                raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
             version_row = session.scalar(
                 select(DurableActualRiskPolicyVersion)
                 .where(DurableActualRiskPolicyVersion.plan_id == state.plan_id)
@@ -1697,6 +2249,7 @@ class DurableIntentLedger:
             algo_order_client_ids.add(policy.protective_stop_reference)
             expected_stop_contracts.append(
                 ExpectedStopContract(
+                    account_id=policy.portfolio_envelope.account_id,
                     plan_id=policy.plan_id,
                     symbol=policy.symbol,
                     position_side=policy.direction,
@@ -1723,15 +2276,24 @@ class DurableIntentLedger:
         }
         normal_order_client_ids = frozenset(
             row.client_order_id
-            for row in session.scalars(select(DurableOrderIntent))
+            for row in session.scalars(
+                select(DurableOrderIntent).where(
+                    DurableOrderIntent.account_id == V1_DEFAULT_ACCOUNT_ID
+                )
+            )
             if row.status in active_normal_statuses and row.role != OrderRole.STOP.value
         )
         unresolved_unknown_intent_ids = frozenset(
             row.client_order_id
-            for row in session.scalars(select(DurableOrderIntent))
+            for row in session.scalars(
+                select(DurableOrderIntent).where(
+                    DurableOrderIntent.account_id == V1_DEFAULT_ACCOUNT_ID
+                )
+            )
             if row.status in {status.value for status in _UNRESOLVED_STATUSES}
         )
         return DurableReconciliationFacts(
+            account_id=V1_DEFAULT_ACCOUNT_ID,
             positions_by_symbol=positions_by_symbol,
             normal_order_client_ids=normal_order_client_ids,
             algo_order_client_ids=frozenset(algo_order_client_ids),
@@ -1851,6 +2413,7 @@ class DurableIntentLedger:
     def _to_record(cls, record: DurableOrderIntent) -> DurableIntentRecord:
         cls._validate_lifecycle_timeline(record)
         return DurableIntentRecord(
+            account_id=record.account_id,
             client_order_id=record.client_order_id,
             economic_key=record.economic_key,
             attempt_number=record.attempt_number,
@@ -1871,7 +2434,10 @@ class DurableIntentLedger:
     def _to_absence_observation(
         row: DurableIntentAbsenceObservation,
     ) -> DurableAbsenceObservation:
+        if row.query_reference is None:
+            raise BoundedAbsenceEvidenceError("durable absence observation has no query provenance")
         return DurableAbsenceObservation(
+            account_id=row.account_id,
             client_order_id=row.client_order_id,
             economic_key=row.economic_key,
             source=AbsenceEvidenceSource(row.source),
@@ -1894,6 +2460,8 @@ class DurableIntentLedger:
         record: DurableOrderIntent,
     ) -> DurableAbsenceObservation:
         cls._validate_lifecycle_timeline(record)
+        if row.query_reference is None:
+            raise BoundedAbsenceEvidenceError("durable absence observation has no query provenance")
         try:
             observation = UnknownIntentObservation(
                 source=AbsenceEvidenceSource(row.source),
@@ -1992,6 +2560,32 @@ class DurableIntentLedger:
     def _policy_fingerprint(policy: ActualRiskPolicy) -> str:
         canonical = json.dumps(
             {
+                "account_id": policy.portfolio_envelope.account_id,
+                "direction": policy.direction.value,
+                "effective_leverage": policy.effective_leverage,
+                "exit_fee_rate": format(policy.exit_fee_rate, "f"),
+                "funding_buffer_rate": format(policy.funding_buffer_rate, "f"),
+                "funding_interval_count": policy.funding_interval_count,
+                "account_envelope_fingerprint": policy.portfolio_envelope.fingerprint,
+                "account_envelope_scope": policy.portfolio_envelope.account_scope,
+                "account_envelope_version": policy.portfolio_envelope.version,
+                "plan_id": policy.plan_id,
+                "protective_stop_reference": policy.protective_stop_reference,
+                "reduce_only_exit_reference": policy.reduce_only_exit_reference,
+                "risk_budget": format(policy.risk_budget, "f"),
+                "symbol": policy.symbol,
+                "worst_stop_exit_price": format(policy.worst_stop_exit_price, "f"),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    @staticmethod
+    def _legacy_policy_fingerprint(policy: ActualRiskPolicy) -> str:
+        canonical = json.dumps(
+            {
                 "direction": policy.direction.value,
                 "effective_leverage": policy.effective_leverage,
                 "exit_fee_rate": format(policy.exit_fee_rate, "f"),
@@ -2019,15 +2613,27 @@ class DurableIntentLedger:
         session: Session,
         row: DurableActualRiskPolicy | DurableActualRiskPolicyVersion,
     ) -> ActualRiskPolicy:
-        envelope_row = session.scalar(
-            select(DurableAccountPortfolioEnvelope).where(
-                DurableAccountPortfolioEnvelope.account_scope == row.account_envelope_scope,
-                DurableAccountPortfolioEnvelope.version == row.account_envelope_version,
+        account_id = getattr(row, "account_id", V1_DEFAULT_ACCOUNT_ID)
+        if account_id != V1_DEFAULT_ACCOUNT_ID:
+            raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
+        head_row = session.scalar(
+            select(DurablePortfolioEnvelopeHead).where(
+                DurablePortfolioEnvelopeHead.account_id == account_id,
+                DurablePortfolioEnvelopeHead.version == row.account_envelope_version,
             )
         )
-        if envelope_row is None:
-            raise DurableRiskPolicyError("durable account portfolio envelope is missing")
-        envelope = cls._envelope_from_row(envelope_row)
+        if head_row is not None:
+            envelope = cls._envelope_head_from_row(head_row)
+        else:
+            envelope_row = session.scalar(
+                select(DurableAccountPortfolioEnvelope).where(
+                    DurableAccountPortfolioEnvelope.account_scope == row.account_envelope_scope,
+                    DurableAccountPortfolioEnvelope.version == row.account_envelope_version,
+                )
+            )
+            if envelope_row is None:
+                raise DurableRiskPolicyError("durable account portfolio envelope is missing")
+            envelope = cls._envelope_from_row(envelope_row)
         if envelope.fingerprint != row.account_envelope_fingerprint:
             raise DurableRiskPolicyError("durable policy envelope fingerprint is invalid")
         policy = ActualRiskPolicy(
@@ -2044,7 +2650,10 @@ class DurableIntentLedger:
             reduce_only_exit_reference=row.reduce_only_exit_reference,
             portfolio_envelope=envelope,
         )
-        if row.policy_fingerprint != cls._policy_fingerprint(policy):
+        if row.policy_fingerprint not in {
+            cls._policy_fingerprint(policy),
+            cls._legacy_policy_fingerprint(policy),
+        }:
             raise DurableRiskPolicyError("durable actual-risk policy fingerprint is invalid")
         return policy
 
@@ -2053,6 +2662,7 @@ class DurableIntentLedger:
         row: DurableSimulatedProtection,
     ) -> SimulatedProtectionEvidence:
         return SimulatedProtectionEvidence(
+            account_id=row.account_id,
             plan_id=row.plan_id,
             stop_intent_reference=row.stop_intent_reference,
             reduce_only_exit_intent_reference=row.reduce_only_exit_intent_reference,
@@ -2083,6 +2693,8 @@ class DurableIntentLedger:
         base = session.get(DurableActualRiskPolicy, plan_id)
         if base is None:
             raise DurableRiskPolicyError("RISK_POLICY_MISSING")
+        if base.account_id != V1_DEFAULT_ACCOUNT_ID:
+            raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
         return cls._validated_policy_lineage(session, base)
 
     @classmethod
@@ -2096,7 +2708,10 @@ class DurableIntentLedger:
         expected_version = 2
         versions = session.scalars(
             select(DurableActualRiskPolicyVersion)
-            .where(DurableActualRiskPolicyVersion.plan_id == base.plan_id)
+            .where(
+                DurableActualRiskPolicyVersion.plan_id == base.plan_id,
+                DurableActualRiskPolicyVersion.account_id == base.account_id,
+            )
             .order_by(DurableActualRiskPolicyVersion.version.asc())
         )
         for row in versions:
@@ -2128,6 +2743,7 @@ class DurableIntentLedger:
         fingerprint: str,
     ) -> dict[str, object]:
         return {
+            "account_id": policy.portfolio_envelope.account_id,
             "symbol": policy.symbol,
             "direction": policy.direction.value,
             "worst_stop_exit_price": format(policy.worst_stop_exit_price, "f"),
@@ -2158,6 +2774,7 @@ class DurableIntentLedger:
                 raise TypeError("durable exposure slices must be a list")
             slices = tuple(
                 PortfolioExposureSlice(
+                    account_id=str(item.get("account_id", row.account_id)),
                     slice_id=str(item["slice_id"]),
                     plan_id=str(item["plan_id"]),
                     symbol=str(item["symbol"]),
@@ -2175,6 +2792,7 @@ class DurableIntentLedger:
                 raise TypeError("durable exposure slices must be structured")
             envelope = AccountPortfolioEnvelope(
                 account_scope=row.account_scope,
+                account_id=row.account_id,
                 version=row.version,
                 verified_account_equity_usdt=Decimal(row.verified_account_equity_usdt),
                 bot_equity_cap_usdt=Decimal(row.bot_equity_cap_usdt),
@@ -2194,12 +2812,163 @@ class DurableIntentLedger:
             raise DurableRiskPolicyError("durable account envelope is invalid") from error
         return envelope
 
+    @staticmethod
+    def _envelope_head_from_row(row: DurablePortfolioEnvelopeHead) -> AccountPortfolioEnvelope:
+        try:
+            raw_slices = row.exposure_slices
+            raw_caps = row.symbol_exposure_caps_usdt
+            if not isinstance(raw_slices, list) or not isinstance(raw_caps, dict):
+                raise TypeError("durable account envelope head must be structured")
+            slices = tuple(
+                PortfolioExposureSlice(
+                    account_id=str(item.get("account_id", row.account_id)),
+                    slice_id=str(item["slice_id"]),
+                    plan_id=str(item["plan_id"]),
+                    symbol=str(item["symbol"]),
+                    direction=Direction(str(item["direction"])),
+                    notional_usdt=Decimal(str(item["notional_usdt"])),
+                    leverage=int(str(item["leverage"])),
+                    required_margin_usdt=Decimal(str(item["required_margin_usdt"])),
+                    source_state=ExposureSourceState(str(item["source_state"])),
+                )
+                for raw_item in raw_slices
+                if isinstance(raw_item, dict)
+                for item in (raw_item,)
+            )
+            if len(slices) != len(raw_slices):
+                raise TypeError("durable envelope head slices must be structured")
+            return AccountPortfolioEnvelope(
+                account_scope=row.account_scope,
+                account_id=row.account_id,
+                version=row.version,
+                verified_account_equity_usdt=Decimal(row.verified_account_equity_usdt),
+                bot_equity_cap_usdt=Decimal(row.bot_equity_cap_usdt),
+                required_reserve_usdt=Decimal(row.required_reserve_usdt),
+                max_total_exposure_usdt=Decimal(row.max_total_exposure_usdt),
+                max_symbol_exposure_usdt=max(Decimal(str(value)) for value in raw_caps.values()),
+                symbol_exposure_caps_usdt={
+                    str(symbol): Decimal(str(cap)) for symbol, cap in raw_caps.items()
+                },
+                max_required_margin_usdt=Decimal(row.max_required_margin_usdt),
+                daily_remaining_risk_usdt=Decimal(row.daily_remaining_risk_usdt),
+                weekly_remaining_risk_usdt=Decimal(row.weekly_remaining_risk_usdt),
+                open_position_count=row.open_position_count,
+                pending_order_count=row.pending_order_count,
+                exposure_slices=slices,
+                reconciliation_required=row.reconciliation_required,
+                fingerprint=row.envelope_fingerprint,
+                # Historical heads have NULL provenance; recent heads preserve the
+                # operator-supplied timestamp that was part of their fingerprint.
+                effective_from=(
+                    None
+                    if row.fingerprint_effective_from is None
+                    else DurableIntentLedger._as_utc(row.fingerprint_effective_from)
+                ),
+                superseded_by=row.superseded_by,
+            )
+        except (KeyError, TypeError, ValueError, FillLedgerError) as error:
+            raise DurableRiskPolicyError("durable account envelope head is invalid") from error
+
     @classmethod
     def _register_portfolio_envelope(
         cls,
         session: Session,
         envelope: AccountPortfolioEnvelope,
     ) -> None:
+        if envelope.account_id != V1_DEFAULT_ACCOUNT_ID:
+            raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
+        if envelope.superseded_by is not None:
+            raise DurableRiskPolicyError(
+                "portfolio envelope supersession is derived from append-only head history"
+            )
+        safety_state = cls._account_safety_state_for_update(session, envelope.account_id)
+        current_head = session.scalar(
+            select(DurablePortfolioEnvelopeHead)
+            .where(DurablePortfolioEnvelopeHead.account_id == envelope.account_id)
+            .order_by(DurablePortfolioEnvelopeHead.version.desc())
+            .limit(1)
+        )
+        if current_head is not None:
+            if current_head.version == envelope.version:
+                if current_head.envelope_fingerprint != envelope.fingerprint:
+                    raise DurableRiskPolicyError(
+                        "account envelope version already has conflicting durable facts"
+                    )
+            elif envelope.version <= current_head.version:
+                raise DurableRiskPolicyError("ACCOUNT_ENVELOPE_STALE")
+            elif envelope.version != current_head.version + 1:
+                raise DurableRiskPolicyError("account envelope versions must be contiguous")
+            else:
+                session.add(
+                    DurablePortfolioEnvelopeSupersession(
+                        account_id=envelope.account_id,
+                        superseded_version=current_head.version,
+                        superseded_by=envelope.version,
+                    )
+                )
+                session.add(
+                    DurablePortfolioEnvelopeHead(
+                        account_id=envelope.account_id,
+                        account_scope=envelope.account_scope,
+                        version=envelope.version,
+                        verified_account_equity_usdt=format(
+                            envelope.verified_account_equity_usdt, "f"
+                        ),
+                        bot_equity_cap_usdt=format(envelope.bot_equity_cap_usdt, "f"),
+                        required_reserve_usdt=format(envelope.required_reserve_usdt, "f"),
+                        max_total_exposure_usdt=format(envelope.max_total_exposure_usdt, "f"),
+                        symbol_exposure_caps_usdt={
+                            symbol: format(cap, "f")
+                            for symbol, cap in (envelope.symbol_exposure_caps_usdt or {}).items()
+                        },
+                        max_required_margin_usdt=format(envelope.max_required_margin_usdt, "f"),
+                        daily_remaining_risk_usdt=format(envelope.daily_remaining_risk_usdt, "f"),
+                        weekly_remaining_risk_usdt=format(envelope.weekly_remaining_risk_usdt, "f"),
+                        open_position_count=envelope.open_position_count,
+                        pending_order_count=envelope.pending_order_count,
+                        reconciliation_required=envelope.reconciliation_required,
+                        exposure_slices=[
+                            item.canonical_record() for item in envelope.exposure_slices
+                        ],
+                        envelope_fingerprint=envelope.fingerprint,
+                        fingerprint_effective_from=envelope.effective_from,
+                        effective_from=envelope.effective_from or datetime.now(UTC),
+                        superseded_by=envelope.superseded_by,
+                    )
+                )
+                safety_state.envelope_version = envelope.version
+                safety_state.envelope_fingerprint = envelope.fingerprint
+                safety_state.grant_generation += 1
+                safety_state.recovery_required = True
+        else:
+            session.add(
+                DurablePortfolioEnvelopeHead(
+                    account_id=envelope.account_id,
+                    account_scope=envelope.account_scope,
+                    version=envelope.version,
+                    verified_account_equity_usdt=format(envelope.verified_account_equity_usdt, "f"),
+                    bot_equity_cap_usdt=format(envelope.bot_equity_cap_usdt, "f"),
+                    required_reserve_usdt=format(envelope.required_reserve_usdt, "f"),
+                    max_total_exposure_usdt=format(envelope.max_total_exposure_usdt, "f"),
+                    symbol_exposure_caps_usdt={
+                        symbol: format(cap, "f")
+                        for symbol, cap in (envelope.symbol_exposure_caps_usdt or {}).items()
+                    },
+                    max_required_margin_usdt=format(envelope.max_required_margin_usdt, "f"),
+                    daily_remaining_risk_usdt=format(envelope.daily_remaining_risk_usdt, "f"),
+                    weekly_remaining_risk_usdt=format(envelope.weekly_remaining_risk_usdt, "f"),
+                    open_position_count=envelope.open_position_count,
+                    pending_order_count=envelope.pending_order_count,
+                    reconciliation_required=envelope.reconciliation_required,
+                    exposure_slices=[item.canonical_record() for item in envelope.exposure_slices],
+                    envelope_fingerprint=envelope.fingerprint,
+                    fingerprint_effective_from=envelope.effective_from,
+                    effective_from=envelope.effective_from or datetime.now(UTC),
+                    superseded_by=envelope.superseded_by,
+                )
+            )
+            safety_state.envelope_version = envelope.version
+            safety_state.envelope_fingerprint = envelope.fingerprint
         existing = session.scalar(
             select(DurableAccountPortfolioEnvelope).where(
                 DurableAccountPortfolioEnvelope.account_scope == envelope.account_scope,
@@ -2207,14 +2976,17 @@ class DurableIntentLedger:
             )
         )
         if existing is not None:
-            if existing.envelope_fingerprint != envelope.fingerprint:
+            if (
+                existing.account_id != envelope.account_id
+                or existing.envelope_fingerprint != envelope.fingerprint
+            ):
                 raise DurableRiskPolicyError(
                     "account envelope version already has conflicting durable facts"
                 )
-            cls._envelope_from_row(existing)
             return
         session.add(
             DurableAccountPortfolioEnvelope(
+                account_id=envelope.account_id,
                 account_scope=envelope.account_scope,
                 version=envelope.version,
                 verified_account_equity_usdt=format(envelope.verified_account_equity_usdt, "f"),
@@ -2241,27 +3013,22 @@ class DurableIntentLedger:
         *,
         excluding_plan_id: str | None = None,
     ) -> None:
+        if envelope.account_id != V1_DEFAULT_ACCOUNT_ID:
+            raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
         if envelope.reconciliation_required:
             raise DurableRiskPolicyError("account portfolio envelope requires reconciliation")
-        latest_version = session.scalar(
-            select(DurableAccountPortfolioEnvelope.version)
-            .where(DurableAccountPortfolioEnvelope.account_scope == envelope.account_scope)
-            .order_by(DurableAccountPortfolioEnvelope.version.desc())
+        current_head = session.scalar(
+            select(DurablePortfolioEnvelopeHead)
+            .where(DurablePortfolioEnvelopeHead.account_id == envelope.account_id)
+            .order_by(DurablePortfolioEnvelopeHead.version.desc())
             .limit(1)
         )
-        if latest_version is not None and latest_version != envelope.version:
-            raise DurableRiskPolicyError("account portfolio envelope version is stale")
-        scoped_policies = select(DurableActualRiskPolicy).where(
-            DurableActualRiskPolicy.account_envelope_scope == envelope.account_scope
-        )
-        for row in session.scalars(scoped_policies):
-            if excluding_plan_id is not None and row.plan_id == excluding_plan_id:
-                continue
-            active_policy = cls._validated_policy_lineage(session, row)
-            if active_policy.portfolio_envelope.fingerprint != envelope.fingerprint:
-                raise DurableRiskPolicyError(
-                    "active plans reference conflicting account portfolio envelopes"
-                )
+        if (
+            current_head is None
+            or current_head.version != envelope.version
+            or current_head.envelope_fingerprint != envelope.fingerprint
+        ):
+            raise DurableRiskPolicyError("ACCOUNT_ENVELOPE_STALE")
 
     @classmethod
     def _projected_portfolio_risk(
@@ -2272,7 +3039,21 @@ class DurableIntentLedger:
         proposed_intent: SimulatedOrderIntent | None,
         current_plan_result: PositionRiskAssessment | None = None,
     ) -> PortfolioRiskAssessment:
-        envelope = policy.portfolio_envelope
+        policy_envelope = policy.portfolio_envelope
+        current_head = session.scalar(
+            select(DurablePortfolioEnvelopeHead)
+            .where(DurablePortfolioEnvelopeHead.account_id == policy_envelope.account_id)
+            .order_by(DurablePortfolioEnvelopeHead.version.desc())
+            .limit(1)
+        )
+        if current_head is None:
+            raise DurableRiskPolicyError("ACCOUNT_ENVELOPE_HEAD_MISSING")
+        envelope = cls._envelope_head_from_row(current_head)
+        if (
+            policy_envelope.version != envelope.version
+            or policy_envelope.fingerprint != envelope.fingerprint
+        ):
+            raise DurableRiskPolicyError("ACCOUNT_ENVELOPE_STALE")
         cls._assert_account_envelope_consistency(session, envelope)
         slices_by_id = {item.slice_id: item for item in envelope.exposure_slices}
 
@@ -2285,12 +3066,14 @@ class DurableIntentLedger:
         position_exposure = ZERO
         projected_plan_stop_risk = ZERO
         aggregate_stop_risk = ZERO
-        for state in session.scalars(select(DurableActualRiskState)):
+        for state in session.scalars(
+            select(DurableActualRiskState).where(
+                DurableActualRiskState.account_id == envelope.account_id
+            )
+        ):
             state_policy = cls._latest_policy_from_session(session, state.plan_id)
-            if state_policy.portfolio_envelope.fingerprint != envelope.fingerprint:
-                raise DurableRiskPolicyError(
-                    "active risk state references a conflicting account envelope"
-                )
+            if state_policy.portfolio_envelope.account_id != envelope.account_id:
+                raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
             notional = Decimal(state.actual_notional_usdt)
             stop_risk = Decimal(state.actual_stop_risk)
             if current_plan_result is not None and state.plan_id == policy.plan_id:
@@ -2301,6 +3084,7 @@ class DurableIntentLedger:
             if notional > ZERO:
                 add_slice(
                     PortfolioExposureSlice(
+                        account_id=envelope.account_id,
                         slice_id=f"position:{state.plan_id}",
                         plan_id=state.plan_id,
                         symbol=state_policy.symbol,
@@ -2322,20 +3106,21 @@ class DurableIntentLedger:
             DurableIntentStatus.PARTIALLY_FILLED.value,
         }
         pending_exposure = ZERO
-        for row in session.scalars(select(DurableOrderIntent)):
+        for row in session.scalars(
+            select(DurableOrderIntent).where(DurableOrderIntent.account_id == envelope.account_id)
+        ):
             if row.role != OrderRole.ENTRY.value or row.status not in active_statuses:
                 continue
             remaining_quantity = max(Decimal(row.quantity) - Decimal(row.filled_quantity), ZERO)
             pending_notional = remaining_quantity * Decimal(row.price)
             row_policy = cls._latest_policy_from_session(session, row.plan_id)
-            if row_policy.portfolio_envelope.fingerprint != envelope.fingerprint:
-                raise DurableRiskPolicyError(
-                    "pending intent references a conflicting account envelope"
-                )
+            if row_policy.portfolio_envelope.account_id != envelope.account_id:
+                raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
             pending_exposure += pending_notional
             if pending_notional > ZERO:
                 add_slice(
                     PortfolioExposureSlice(
+                        account_id=envelope.account_id,
                         slice_id=f"pending:{row.client_order_id}",
                         plan_id=row.plan_id,
                         symbol=row.symbol,
@@ -2362,10 +3147,13 @@ class DurableIntentLedger:
                 projected_plan_stop_risk += pending_stop_risk
 
         if proposed_intent is not None:
+            if proposed_intent.account_id != envelope.account_id:
+                raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
             proposed_notional = proposed_intent.quantity * proposed_intent.price
             pending_exposure += proposed_notional
             add_slice(
                 PortfolioExposureSlice(
+                    account_id=envelope.account_id,
                     slice_id=f"proposed:{proposed_intent.client_order_id}",
                     plan_id=policy.plan_id,
                     symbol=proposed_intent.symbol,
@@ -2385,18 +3173,26 @@ class DurableIntentLedger:
             aggregate_stop_risk += proposed_stop_risk
 
         exposure_slices = tuple(sorted(slices_by_id.values(), key=lambda item: item.slice_id))
-        aggregate_symbol = sum(
-            (item.notional_usdt for item in exposure_slices if item.symbol == policy.symbol),
-            ZERO,
-        )
+        exposures_by_symbol: dict[str, Decimal] = defaultdict(lambda: ZERO)
+        for item in exposure_slices:
+            exposures_by_symbol[item.symbol] += item.notional_usdt
+        aggregate_symbol = exposures_by_symbol.get(policy.symbol, ZERO)
         aggregate_total = sum((item.notional_usdt for item in exposure_slices), ZERO)
         aggregate_reserve = envelope.required_reserve_usdt
         required_margin = (
             sum((item.required_margin_usdt for item in exposure_slices), ZERO) + aggregate_reserve
         )
         reason: str | None = None
-        if aggregate_symbol > envelope.max_symbol_exposure_usdt:
-            reason = "PROJECTED_SYMBOL_EXPOSURE_LIMIT_BREACH"
+        for symbol, exposure in sorted(exposures_by_symbol.items()):
+            try:
+                symbol_cap = envelope.symbol_exposure_cap_usdt(symbol)
+            except FillLedgerError as error:
+                raise DurableRiskPolicyError("ACCOUNT_SYMBOL_CAP_MISSING") from error
+            if exposure > symbol_cap:
+                reason = f"ACCOUNT_SYMBOL_EXPOSURE_LIMIT_BREACH:{symbol}"
+                break
+        if reason is not None:
+            pass
         elif aggregate_total > envelope.max_total_exposure_usdt:
             reason = "PROJECTED_TOTAL_EXPOSURE_LIMIT_BREACH"
         elif required_margin > min(
@@ -2498,13 +3294,17 @@ class DurableIntentLedger:
             "SIMULATED_PROTECTION_MISSING",
             "SIMULATED_PROTECTION_QUANTITY_MISMATCH",
         }
-        if result.reason not in reduction_reasons:
+        if result.reason not in reduction_reasons and not (
+            result.reason is not None
+            and result.reason.startswith("ACCOUNT_SYMBOL_EXPOSURE_LIMIT_BREACH:")
+        ):
             return
         requirement = session.get(DurableRiskReductionRequirement, policy.plan_id)
         if requirement is None:
             session.add(
                 DurableRiskReductionRequirement(
                     plan_id=policy.plan_id,
+                    account_id=policy.portfolio_envelope.account_id,
                     symbol=policy.symbol,
                     direction=policy.direction.value,
                     reason=result.reason,
@@ -2525,6 +3325,7 @@ class DurableIntentLedger:
     ) -> None:
         later_attempts = session.scalars(
             select(DurableOrderIntent).where(
+                DurableOrderIntent.account_id == authoritative_intent.account_id,
                 DurableOrderIntent.economic_key == authoritative_intent.economic_key,
                 DurableOrderIntent.attempt_number > authoritative_intent.attempt_number,
             )
@@ -2538,7 +3339,7 @@ class DurableIntentLedger:
             later.updated_at = datetime.now(UTC)
 
     @staticmethod
-    def _cancel_known_active_entry_intents(session: Session) -> None:
+    def _cancel_known_active_entry_intents(session: Session, account_id: str) -> None:
         active_statuses = {
             DurableIntentStatus.PREPARED.value,
             DurableIntentStatus.SUBMITTING.value,
@@ -2548,6 +3349,7 @@ class DurableIntentLedger:
         }
         for row in session.scalars(
             select(DurableOrderIntent).where(
+                DurableOrderIntent.account_id == account_id,
                 DurableOrderIntent.role == OrderRole.ENTRY.value,
                 DurableOrderIntent.status.in_(active_statuses),
             )
@@ -2665,6 +3467,8 @@ class DurableIntentLedger:
                 )
                 .where(
                     DurableOrderIntent.plan_id == plan_id,
+                    DurableOrderIntent.account_id == V1_DEFAULT_ACCOUNT_ID,
+                    DurableIntentFill.account_id == V1_DEFAULT_ACCOUNT_ID,
                     DurableOrderIntent.role == OrderRole.ENTRY.value,
                 )
                 .order_by(DurableIntentFill.id.asc())
@@ -2675,7 +3479,8 @@ class DurableIntentLedger:
     @staticmethod
     def _record_for_update(session: Session, client_order_id: str) -> DurableOrderIntent:
         statement = select(DurableOrderIntent).where(
-            DurableOrderIntent.client_order_id == client_order_id
+            DurableOrderIntent.client_order_id == client_order_id,
+            DurableOrderIntent.account_id == V1_DEFAULT_ACCOUNT_ID,
         )
         if session.get_bind().dialect.name == "postgresql":
             statement = statement.with_for_update()
@@ -2688,7 +3493,10 @@ class DurableIntentLedger:
     def _latest_for_economic_key(session: Session, economic_key: str) -> DurableOrderIntent | None:
         statement = (
             select(DurableOrderIntent)
-            .where(DurableOrderIntent.economic_key == economic_key)
+            .where(
+                DurableOrderIntent.economic_key == economic_key,
+                DurableOrderIntent.account_id == V1_DEFAULT_ACCOUNT_ID,
+            )
             .order_by(DurableOrderIntent.attempt_number.desc())
             .limit(1)
         )
@@ -2701,7 +3509,10 @@ class DurableIntentLedger:
         rows = tuple(
             session.scalars(
                 select(DurableIntentFill)
-                .where(DurableIntentFill.client_order_id == client_order_id)
+                .where(
+                    DurableIntentFill.client_order_id == client_order_id,
+                    DurableIntentFill.account_id == V1_DEFAULT_ACCOUNT_ID,
+                )
                 .order_by(DurableIntentFill.id.asc())
             )
         )
@@ -2720,7 +3531,10 @@ class DurableIntentLedger:
         rows = tuple(
             session.scalars(
                 select(DurableIntentAbsenceObservation)
-                .where(DurableIntentAbsenceObservation.client_order_id == record.client_order_id)
+                .where(
+                    DurableIntentAbsenceObservation.client_order_id == record.client_order_id,
+                    DurableIntentAbsenceObservation.account_id == record.account_id,
+                )
                 .order_by(DurableIntentAbsenceObservation.observed_at_ms.asc())
             )
         )
@@ -2756,6 +3570,10 @@ class DurableIntentLedger:
             AbsenceEvidenceSource, list[DurableIntentAbsenceObservation]
         ] = defaultdict(list)
         for row in rows:
+            if row.query_reference is None:
+                raise BoundedAbsenceEvidenceError(
+                    "durable absence observation has no query provenance"
+                )
             try:
                 source = AbsenceEvidenceSource(row.source)
             except ValueError as error:

@@ -94,6 +94,7 @@ class DurableOrderIntent(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     economic_key: Mapped[str] = mapped_column(String(256), index=True)
     attempt_number: Mapped[int] = mapped_column(Integer)
     client_order_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
@@ -123,6 +124,7 @@ class DurableIntentFill(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     client_order_id: Mapped[str] = mapped_column(
         ForeignKey("durable_order_intents.client_order_id"), index=True
     )
@@ -151,12 +153,15 @@ class DurableIntentAbsenceObservation(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     client_order_id: Mapped[str] = mapped_column(
         ForeignKey("durable_order_intents.client_order_id"), index=True
     )
     economic_key: Mapped[str] = mapped_column(String(256))
     source: Mapped[str] = mapped_column(String(48))
-    query_reference: Mapped[str] = mapped_column(String(128))
+    # A legacy quarantine must preserve a missing original reference as NULL; a
+    # synthetic replacement would falsely imply a query that never happened.
+    query_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
     query_client_order_id: Mapped[str] = mapped_column(String(128))
     query_economic_key: Mapped[str] = mapped_column(String(256))
     query_started_at_ms: Mapped[int] = mapped_column(Integer)
@@ -175,6 +180,7 @@ class DurableActualRiskPolicy(Base):
     __tablename__ = "durable_actual_risk_policies"
 
     plan_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     symbol: Mapped[str] = mapped_column(String(32))
     direction: Mapped[str] = mapped_column(String(16))
     worst_stop_exit_price: Mapped[str] = mapped_column(String(64))
@@ -205,6 +211,7 @@ class DurableActualRiskPolicyVersion(Base):
     __table_args__ = (UniqueConstraint("plan_id", "version", name="uq_actual_risk_policy_version"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     plan_id: Mapped[str] = mapped_column(String(128), index=True)
     version: Mapped[int] = mapped_column(Integer)
     symbol: Mapped[str] = mapped_column(String(32))
@@ -243,6 +250,7 @@ class DurableAccountPortfolioEnvelope(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     account_scope: Mapped[str] = mapped_column(String(128), index=True)
     version: Mapped[int] = mapped_column(Integer)
     verified_account_equity_usdt: Mapped[str] = mapped_column(String(64))
@@ -291,6 +299,11 @@ class DurableEntryAuthorizationGrant(Base):
     __tablename__ = "durable_entry_authorization_grants"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
+    failure_epoch: Mapped[int] = mapped_column(Integer, default=0)
+    recovery_epoch: Mapped[int] = mapped_column(Integer, default=0)
+    envelope_version: Mapped[int] = mapped_column(Integer, default=0)
+    grant_generation: Mapped[int] = mapped_column(Integer, default=0)
     grant_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     recovery_probe_event_id: Mapped[str] = mapped_column(String(128))
     recovery_status: Mapped[str] = mapped_column(String(32))
@@ -318,6 +331,7 @@ class DurableEntryAuthorizationRevocation(Base):
     __tablename__ = "durable_entry_authorization_revocations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     revocation_id: Mapped[str] = mapped_column(String(128), unique=True)
     grant_id: Mapped[str] = mapped_column(
         ForeignKey("durable_entry_authorization_grants.grant_id"), unique=True, index=True
@@ -334,6 +348,7 @@ class DurableSimulatedProtection(Base):
     plan_id: Mapped[str] = mapped_column(
         ForeignKey("durable_actual_risk_policies.plan_id"), primary_key=True
     )
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     stop_intent_reference: Mapped[str] = mapped_column(String(128))
     reduce_only_exit_intent_reference: Mapped[str] = mapped_column(String(128))
     protected_position_quantity: Mapped[str] = mapped_column(String(64), default="0")
@@ -352,6 +367,7 @@ class DurableActualRiskState(Base):
     plan_id: Mapped[str] = mapped_column(
         ForeignKey("durable_actual_risk_policies.plan_id"), primary_key=True
     )
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     position_quantity: Mapped[str] = mapped_column(String(64), default="0")
     average_entry_price: Mapped[str | None] = mapped_column(String(64), nullable=True)
     actual_notional_usdt: Mapped[str] = mapped_column(String(64), default="0")
@@ -373,6 +389,7 @@ class DurableRiskReductionRequirement(Base):
     plan_id: Mapped[str] = mapped_column(
         ForeignKey("durable_actual_risk_policies.plan_id"), primary_key=True
     )
+    account_id: Mapped[str] = mapped_column(String(128), default="v1-primary", index=True)
     symbol: Mapped[str] = mapped_column(String(32))
     direction: Mapped[str] = mapped_column(String(16))
     reason: Mapped[str] = mapped_column(String(96))
@@ -382,6 +399,144 @@ class DurableRiskReductionRequirement(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
+
+
+class DurablePortfolioEnvelopeHead(Base):
+    """Versioned account-wide risk authority; history is never overwritten."""
+
+    __tablename__ = "durable_portfolio_envelope_heads"
+    __table_args__ = (
+        UniqueConstraint("account_id", "version", name="uq_portfolio_envelope_head_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    account_scope: Mapped[str] = mapped_column(String(128))
+    version: Mapped[int] = mapped_column(Integer)
+    verified_account_equity_usdt: Mapped[str] = mapped_column(String(64))
+    bot_equity_cap_usdt: Mapped[str] = mapped_column(String(64))
+    required_reserve_usdt: Mapped[str] = mapped_column(String(64))
+    max_total_exposure_usdt: Mapped[str] = mapped_column(String(64))
+    symbol_exposure_caps_usdt: Mapped[dict[str, object]] = mapped_column(JSON)
+    max_required_margin_usdt: Mapped[str] = mapped_column(String(64))
+    daily_remaining_risk_usdt: Mapped[str] = mapped_column(String(64))
+    weekly_remaining_risk_usdt: Mapped[str] = mapped_column(String(64))
+    open_position_count: Mapped[int] = mapped_column(Integer)
+    pending_order_count: Mapped[int] = mapped_column(Integer)
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean)
+    exposure_slices: Mapped[list[dict[str, object]]] = mapped_column(JSON)
+    envelope_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    # Separates the operator-supplied decision timestamp from the durable row
+    # creation timestamp so an explicit envelope fingerprint can be replayed.
+    fingerprint_effective_from: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurablePortfolioEnvelopeSupersession(Base):
+    """Append-only link proving which later head supersedes an earlier version."""
+
+    __tablename__ = "durable_portfolio_envelope_supersessions"
+    __table_args__ = (
+        UniqueConstraint("account_id", "superseded_version", name="uq_envelope_supersession"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    superseded_version: Mapped[int] = mapped_column(Integer)
+    superseded_by: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableAccountSafetyState(Base):
+    """Mutable fencing state for the sole V1 account; all entry grants bind to it."""
+
+    __tablename__ = "durable_account_safety_states"
+
+    account_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    failure_epoch: Mapped[int] = mapped_column(Integer, default=0)
+    recovery_epoch: Mapped[int] = mapped_column(Integer, default=0)
+    envelope_version: Mapped[int] = mapped_column(Integer, default=0)
+    envelope_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    grant_generation: Mapped[int] = mapped_column(Integer, default=0)
+    recovery_required: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class DurableAccountScopeLock(Base):
+    """One durable row per account used for PostgreSQL row/advisory locks."""
+
+    __tablename__ = "durable_account_scope_locks"
+
+    account_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    lock_generation: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class DurableEvidenceQuarantine(Base):
+    """Immutable deny evidence; it cannot be silently converted into ABSENT."""
+
+    __tablename__ = "durable_evidence_quarantines"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "economic_key",
+            "provenance_fingerprint",
+            name="uq_evidence_quarantine_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    quarantine_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    economic_key: Mapped[str] = mapped_column(String(256), index=True)
+    client_order_id: Mapped[str] = mapped_column(String(128), index=True)
+    query_reference: Mapped[str] = mapped_column(String(128))
+    provenance_fingerprint: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(String(128))
+    evidence: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableEvidenceQuarantineResolution(Base):
+    """Append-only operator resolution that requires fresh verified evidence."""
+
+    __tablename__ = "durable_evidence_quarantine_resolutions"
+    __table_args__ = (UniqueConstraint("quarantine_id", name="uq_evidence_quarantine_resolution"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    resolution_id: Mapped[str] = mapped_column(String(128), unique=True)
+    quarantine_id: Mapped[str] = mapped_column(
+        ForeignKey("durable_evidence_quarantines.quarantine_id"), index=True
+    )
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    operator_id: Mapped[str] = mapped_column(String(128))
+    verified_evidence_source: Mapped[str] = mapped_column(String(64))
+    verified_query_reference: Mapped[str] = mapped_column(String(128))
+    verified_evidence_fingerprint: Mapped[str] = mapped_column(String(64))
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class MigrationExecutionMarker(Base):
+    """Resumable forward-migration checkpoint for SQLite's partial DDL behavior."""
+
+    __tablename__ = "migration_execution_markers"
+    __table_args__ = (
+        UniqueConstraint("migration_revision", "checkpoint", name="uq_migration_checkpoint"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    migration_revision: Mapped[str] = mapped_column(String(64))
+    checkpoint: Mapped[str] = mapped_column(String(64))
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 @event.listens_for(AuditEvent, "before_update")
@@ -420,5 +575,13 @@ def _reject_durable_evidence_mutation(*_: object) -> None:
 @event.listens_for(DurableEntryAuthorizationGrant, "before_delete")
 @event.listens_for(DurableEntryAuthorizationRevocation, "before_update")
 @event.listens_for(DurableEntryAuthorizationRevocation, "before_delete")
+@event.listens_for(DurablePortfolioEnvelopeHead, "before_update")
+@event.listens_for(DurablePortfolioEnvelopeHead, "before_delete")
+@event.listens_for(DurablePortfolioEnvelopeSupersession, "before_update")
+@event.listens_for(DurablePortfolioEnvelopeSupersession, "before_delete")
+@event.listens_for(DurableEvidenceQuarantine, "before_update")
+@event.listens_for(DurableEvidenceQuarantine, "before_delete")
+@event.listens_for(DurableEvidenceQuarantineResolution, "before_update")
+@event.listens_for(DurableEvidenceQuarantineResolution, "before_delete")
 def _reject_durable_policy_mutation(*_: object) -> None:
     raise AppendOnlyViolation("durable policy and authorization evidence is append-only")

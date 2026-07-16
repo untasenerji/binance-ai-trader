@@ -7,6 +7,8 @@ from enum import StrEnum
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
 
+V1_DEFAULT_ACCOUNT_ID = "v1-primary"
+
 
 class OrderRole(StrEnum):
     ENTRY = "ENTRY"
@@ -81,10 +83,11 @@ class SimulatedOrderIntent:
     stage_index: int
     quantity: Decimal
     price: Decimal
+    account_id: str = V1_DEFAULT_ACCOUNT_ID
 
     def __post_init__(self) -> None:
-        if not self.client_order_id or not self.plan_id or not self.symbol:
-            raise ValueError("client_order_id, plan_id, and symbol are required")
+        if not self.client_order_id or not self.plan_id or not self.symbol or not self.account_id:
+            raise ValueError("account_id, client_order_id, plan_id, and symbol are required")
         if self.stage_index < 1:
             raise ValueError("stage_index must be positive")
         if (

@@ -222,6 +222,20 @@ class StrategySpecification:
         )
         return hashlib.sha256(canonical.encode()).hexdigest()
 
+    def verify_fingerprint(self) -> None:
+        """Recheck a frozen object before each factory or execution boundary."""
+        if self.fingerprint != self.expected_fingerprint():
+            raise ValueError("strategy specification fingerprint is invalid")
+
+    @property
+    def serialized_specification(self) -> str:
+        return json.dumps(
+            self.canonical_record(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class StrategyFitResult:
@@ -232,12 +246,17 @@ class StrategyFitResult:
     training_candle_count: int
     training_end_ms: int
     timeframe: str
+    trainer_version: str = "builtin-registry-v1"
     fingerprint: str = ""
 
     def __post_init__(self) -> None:
         if type(self.specification) is not StrategySpecification:
             raise TypeError("fit result requires an exact strategy specification")
-        if len(self.training_data_fingerprint) != 64 or not self.timeframe:
+        if (
+            len(self.training_data_fingerprint) != 64
+            or not self.timeframe
+            or self.trainer_version != "builtin-registry-v1"
+        ):
             raise ValueError("fit result provenance is invalid")
         if (
             not isinstance(self.training_candle_count, int)
@@ -254,16 +273,24 @@ class StrategyFitResult:
         object.__setattr__(self, "fingerprint", expected)
 
     def expected_fingerprint(self) -> str:
+        self.specification.verify_fingerprint()
         canonical = json.dumps(
             {
+                "serialized_specification": self.specification.serialized_specification,
                 "specification_fingerprint": self.specification.fingerprint,
                 "timeframe": self.timeframe,
                 "training_candle_count": self.training_candle_count,
                 "training_data_fingerprint": self.training_data_fingerprint,
                 "training_end_ms": self.training_end_ms,
+                "trainer_version": self.trainer_version,
             },
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
         )
         return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def verify_fingerprint(self) -> None:
+        self.specification.verify_fingerprint()
+        if self.fingerprint != self.expected_fingerprint():
+            raise ValueError("strategy fit fingerprint is invalid")

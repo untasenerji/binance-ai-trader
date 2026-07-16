@@ -3,7 +3,7 @@
 import hashlib
 from collections.abc import Iterator
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -19,10 +19,9 @@ from sqlalchemy.exc import DBAPIError
 from alembic import command
 from app.domain.types import Direction
 from app.exchange.contracts import (
-    AlgoOrderIntent,
-    AlgoOrderObservation,
     AlgoOrderStatus,
     AlgoOrderType,
+    ExchangeAlgoOrderObservation,
     ExpectedStopContract,
     LocalReconciliationState,
     ReconciliationSnapshot,
@@ -367,12 +366,32 @@ def test_mixed_portfolio_margin_and_exposure_are_order_independent(
         ),
     }
     quantities = {"mixed-long": Decimal("0.10"), "mixed-short": Decimal("0.20")}
+    simulators: dict[str, ExchangeSimulator] = {}
     for plan_id in registration_order:
-        simulator = ExchangeSimulator(
+        simulators[plan_id] = ExchangeSimulator(
             intent_ledger=durable_intent_ledger,
             actual_risk_policy=policies[plan_id],
         )
-        simulator.submit(
+
+    # Publishing the account envelope invalidates the fixture's earlier recovery
+    # grant. A fresh, durable reconciliation must precede either entry.
+    breaker = durable_intent_ledger._persistence_breaker  # noqa: SLF001
+    repository = AuditRepository(
+        durable_intent_ledger._session_factory,  # noqa: SLF001
+        persistence_breaker=breaker,
+    )
+    breaker.reset_after_verified_reconciliation(
+        audit_repository=repository,
+        intent_ledger=durable_intent_ledger,
+        reconciliation_snapshot=ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        ),
+    )
+
+    for plan_id in registration_order:
+        simulators[plan_id].submit(
             _entry(
                 f"{plan_id}-entry",
                 plan_id,
@@ -481,20 +500,21 @@ def test_conflicting_account_envelope_facts_fail_closed(
         )
 
 
-def test_independent_account_scopes_do_not_conflict(
+def test_v1_rejects_a_second_account_before_it_can_share_risk_state(
     durable_intent_ledger: DurableIntentLedger,
 ) -> None:
     first = _policy("independent-account-one")
     second_envelope = replace(
         first.portfolio_envelope,
-        account_scope="independent-account-scope-two",
+        account_id="second-account",
         fingerprint="",
     )
 
     durable_intent_ledger.register_actual_risk_policy(first)
-    durable_intent_ledger.register_actual_risk_policy(
-        _policy("independent-account-two", portfolio_envelope=second_envelope)
-    )
+    with pytest.raises(DurableRiskPolicyError, match="V1_SECOND_ACCOUNT_UNSUPPORTED"):
+        durable_intent_ledger.register_actual_risk_policy(
+            _policy("independent-account-two", portfolio_envelope=second_envelope)
+        )
 
 
 def _prepare_two_active_stages(ledger: DurableIntentLedger, plan_id: str) -> None:
@@ -720,7 +740,7 @@ def _assert_published_0009_upgrade(database_url: str) -> None:
                 )
             )
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0011_forward_invariants"
+                "0012_account_scope_safety"
             )
         assert reasons == (
             "LEGACY_DUPLICATE_QUERY_EVIDENCE",
@@ -748,15 +768,16 @@ def _assert_published_0009_upgrade(database_url: str) -> None:
             session_factory,
             persistence_breaker=breaker,
         )
-        assert breaker.reset_after_verified_reconciliation(
-            audit_repository=authorized_repository,
-            intent_ledger=authorized_ledger,
-            reconciliation_snapshot=ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-            ),
-        ).is_complete
+        with pytest.raises(PersistenceUnavailable, match="UNRESOLVED_QUARANTINE"):
+            breaker.reset_after_verified_reconciliation(
+                audit_repository=authorized_repository,
+                intent_ledger=authorized_ledger,
+                reconciliation_snapshot=ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                ),
+            )
     finally:
         engine.dispose()
 
@@ -787,7 +808,7 @@ def _head_schema_signature(database_url: str) -> dict[str, object]:
         engine.dispose()
 
 
-def test_forward_migration_0011_is_the_only_current_head(tmp_path: Path) -> None:
+def test_forward_migration_0012_is_the_only_current_head(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'sixth-head.sqlite'}"
     config = _migration_config(database_url)
     command.upgrade(config, "head")
@@ -795,7 +816,7 @@ def test_forward_migration_0011_is_the_only_current_head(tmp_path: Path) -> None
     try:
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0011_forward_invariants"
+                "0012_account_scope_safety"
             )
     finally:
         engine.dispose()
@@ -1006,7 +1027,13 @@ def test_breaker_reset_rejects_correct_stop_id_with_wrong_trigger(tmp_path: Path
                 normal_order_client_ids=frozenset(),
                 algo_order_client_ids=frozenset({f"{plan_id}-expected-stop"}),
                 algo_orders=(
-                    AlgoOrderIntent(
+                    ExchangeAlgoOrderObservation(
+                        source="authenticated_exchange_adapter",
+                        account_id="v1-primary",
+                        fetched_at=datetime.now(UTC),
+                        server_time=datetime.now(UTC),
+                        freshness_window=timedelta(seconds=30),
+                        correlation_id="wrong-stop-trigger-observation",
                         client_algo_id=f"{plan_id}-expected-stop",
                         symbol="BTCUSDT",
                         direction=Direction.LONG,
@@ -1023,8 +1050,15 @@ def test_breaker_reset_rejects_correct_stop_id_with_wrong_trigger(tmp_path: Path
 def _observed_stop(
     contract: ExpectedStopContract,
     **overrides: object,
-) -> AlgoOrderObservation:
+) -> ExchangeAlgoOrderObservation:
+    observed_at = datetime.now(UTC)
     values: dict[str, object] = {
+        "source": "authenticated_exchange_adapter",
+        "account_id": contract.account_id,
+        "fetched_at": observed_at,
+        "server_time": observed_at,
+        "freshness_window": timedelta(seconds=30),
+        "correlation_id": f"sixth-audit-{contract.client_algo_id}",
         "client_algo_id": contract.client_algo_id,
         "symbol": contract.symbol,
         "direction": contract.position_side,
@@ -1042,7 +1076,7 @@ def _observed_stop(
         "stop_contract_fingerprint": contract.fingerprint,
     }
     values.update(overrides)
-    return AlgoOrderObservation(**values)  # type: ignore[arg-type]
+    return ExchangeAlgoOrderObservation(**values)  # type: ignore[arg-type]
 
 
 def _fill_plan_for_stop_contract(

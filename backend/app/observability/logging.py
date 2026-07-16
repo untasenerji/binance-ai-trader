@@ -149,14 +149,18 @@ def _redact_for_log(
         redacted: dict[str, object] = {}
         for key, nested_value in value.items():
             normalized_key = str(key)
-            redacted[normalized_key] = (
-                "[REDACTED]"
-                if _is_sensitive_field(normalized_key)
-                else _redact_for_log(
-                    nested_value,
-                    depth=depth + 1,
-                    remaining_nodes=remaining_nodes,
-                )
+            if _is_sensitive_field(normalized_key):
+                # A secret-bearing key is itself sensitive: retaining its encoded
+                # spelling can leak the alias or encourage downstream recovery.
+                redacted_key = "[REDACTED]"
+                while redacted_key in redacted:
+                    redacted_key = f"{redacted_key}_"
+                redacted[redacted_key] = "[REDACTED]"
+                continue
+            redacted[normalized_key] = _redact_for_log(
+                nested_value,
+                depth=depth + 1,
+                remaining_nodes=remaining_nodes,
             )
         return redacted
     if isinstance(value, (list, tuple, set, frozenset)):

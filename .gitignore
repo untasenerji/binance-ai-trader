@@ -29,6 +29,7 @@ frontend/dist/
 frontend/coverage/
 frontend/playwright-report/
 frontend/test-results/
+.vite/
 
 # Editor and operating-system files
 .idea/

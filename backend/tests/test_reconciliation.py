@@ -1,12 +1,13 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from app.domain.types import Direction
 from app.exchange.contracts import (
-    AlgoOrderIntent,
     AlgoOrderStatus,
     AlgoOrderType,
+    ExchangeAlgoOrderObservation,
     ExpectedStopContract,
     LocalReconciliationState,
     OrderSide,
@@ -49,7 +50,7 @@ def _snapshot(
     *,
     positions_by_symbol: dict[str, Decimal] | None = None,
     normal_order_client_ids: frozenset[str] = frozenset(),
-    algo_orders: tuple[AlgoOrderIntent, ...] = (),
+    algo_orders: tuple[ExchangeAlgoOrderObservation, ...] = (),
     stop_protected_symbols: frozenset[str] = frozenset(),
 ) -> ReconciliationSnapshot:
     return ReconciliationSnapshot(
@@ -90,9 +91,16 @@ def _algo_order(
     *,
     symbol: str = "BTCUSDT",
     contract: ExpectedStopContract | None = None,
-) -> AlgoOrderIntent:
+) -> ExchangeAlgoOrderObservation:
     contract = contract or _stop_contract(client_algo_id, symbol=symbol)
-    return AlgoOrderIntent(
+    observed_at = datetime.now(UTC)
+    return ExchangeAlgoOrderObservation(
+        source="authenticated_exchange_adapter",
+        account_id=contract.account_id,
+        fetched_at=observed_at,
+        server_time=observed_at,
+        freshness_window=timedelta(seconds=30),
+        correlation_id=f"reconciliation-{client_algo_id}",
         client_algo_id=client_algo_id,
         symbol=symbol,
         direction=Direction.LONG,

@@ -522,6 +522,12 @@ class WalkForwardRunner:
                 "custom walk-forward factories cannot isolate held-out state; "
                 "an exact frozen StrategySpecification is required"
             )
+        try:
+            strategy_specification.verify_fingerprint()
+        except ValueError as error:
+            raise WalkForwardTrainingError(
+                "strategy specification fingerprint is invalid"
+            ) from error
         series = tuple(candles)
         settlements = tuple(funding_settlements)
         windows: list[WalkForwardWindow] = []
@@ -579,6 +585,12 @@ class WalkForwardRunner:
             raise WalkForwardTrainingError(
                 "walk-forward fit requires an exact frozen StrategySpecification"
             )
+        try:
+            strategy_specification.verify_fingerprint()
+        except ValueError as error:
+            raise WalkForwardTrainingError(
+                "strategy specification fingerprint is invalid"
+            ) from error
         if not training_candles:
             raise WalkForwardTrainingError("walk-forward training slice cannot be empty")
         if any(candle.timeframe != timeframe for candle in training_candles):
@@ -593,6 +605,10 @@ class WalkForwardRunner:
             training_end_ms=training_candles[-1].close_time_ms,
             timeframe=timeframe,
         )
+        try:
+            fit_result.verify_fingerprint()
+        except ValueError as error:
+            raise WalkForwardTrainingError("train-only fit provenance is invalid") from error
         frozen_strategy = frozen_strategy_from_fit(fit_result)
         if (
             frozen_strategy.training_candle_count != len(training_candles)

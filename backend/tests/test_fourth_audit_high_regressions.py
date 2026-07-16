@@ -1,7 +1,7 @@
 """Red-first counterexamples from the fourth independent audit."""
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from importlib import import_module
 from inspect import signature
@@ -19,6 +19,7 @@ from app.domain.types import Direction
 from app.exchange.contracts import (
     AlgoOrderIntent,
     AlgoOrderType,
+    ExchangeAlgoOrderObservation,
     LocalReconciliationState,
     ReconciliationOutcome,
     ReconciliationSnapshot,
@@ -496,7 +497,14 @@ def test_breaker_rejects_an_audit_repository_subclass_override(
 
 
 def test_reconciliation_rejects_wrong_side_stop_for_long_position() -> None:
-    wrong_side = AlgoOrderIntent(
+    observed_at = datetime.now(UTC)
+    wrong_side = ExchangeAlgoOrderObservation(
+        source="authenticated_exchange_adapter",
+        account_id="v1-primary",
+        fetched_at=observed_at,
+        server_time=observed_at,
+        freshness_window=timedelta(seconds=30),
+        correlation_id="wrong-side-stop-observation",
         client_algo_id="wrong-side-stop",
         symbol="BTCUSDT",
         direction=Direction.SHORT,
@@ -834,13 +842,22 @@ def test_postgresql_adversarial_populated_0001_upgrades_and_replays() -> None:
 
 @pytest.mark.postgresql
 def test_postgresql_runtime_cannot_mutate_or_truncate_durable_risk_policy() -> None:
-    database_url = "postgresql+psycopg://postgres@127.0.0.1:5432/uta"
-    runtime_url = "postgresql+psycopg://uta_runtime@127.0.0.1:5432/uta"
-    command.upgrade(_migration_config(database_url), "head")
-    admin_engine = create_database_engine(database_url)
-    runtime_engine = create_database_engine(runtime_url)
+    database_name = f"uta_fourth_runtime_{uuid4().hex}"
+    database_url = f"postgresql+psycopg://postgres@127.0.0.1:5432/{database_name}"
+    runtime_url = f"postgresql+psycopg://uta_runtime@127.0.0.1:5432/{database_name}"
+    control_engine = create_engine(
+        "postgresql+psycopg://postgres@127.0.0.1:5432/postgres",
+        isolation_level="AUTOCOMMIT",
+    )
+    admin_engine = None
+    runtime_engine = None
     plan_id = f"runtime-policy-{uuid4().hex}"
     try:
+        with control_engine.connect() as connection:
+            connection.execute(text(f'CREATE DATABASE "{database_name}"'))
+        command.upgrade(_migration_config(database_url), "head")
+        admin_engine = create_database_engine(database_url)
+        runtime_engine = create_database_engine(runtime_url)
         base = _policy(plan_id)
         DurableIntentLedger(create_session_factory(admin_engine)).register_actual_risk_policy(base)
         runtime_ledger = DurableIntentLedger(create_session_factory(runtime_engine))
@@ -884,8 +901,13 @@ def test_postgresql_runtime_cannot_mutate_or_truncate_durable_risk_policy() -> N
                     connection.execute(text(statement), {"plan_id": plan_id})
                 connection.rollback()
     finally:
-        runtime_engine.dispose()
-        admin_engine.dispose()
+        if runtime_engine is not None:
+            runtime_engine.dispose()
+        if admin_engine is not None:
+            admin_engine.dispose()
+        with control_engine.connect() as connection:
+            connection.execute(text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)'))
+        control_engine.dispose()
 
 
 @pytest.mark.postgresql
