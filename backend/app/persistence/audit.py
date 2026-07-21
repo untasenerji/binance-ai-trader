@@ -36,7 +36,10 @@ from app.persistence.reducer import (
 )
 
 if TYPE_CHECKING:
-    from app.exchange.contracts import ReconciliationOutcome, ReconciliationSnapshot
+    from app.exchange.contracts import (
+        ExchangeReconciliationObservationBatch,
+        ReconciliationOutcome,
+    )
     from app.simulation.intent_ledger import DurableIntentLedger
 
 type AuditJSONValue = None | bool | int | str | list["AuditJSONValue"] | dict[str, "AuditJSONValue"]
@@ -330,13 +333,13 @@ class AuditRepository:
         self,
         *,
         intent_ledger: "DurableIntentLedger",
-        reconciliation_snapshot: "ReconciliationSnapshot",
+        reconciliation_snapshot: "ExchangeReconciliationObservationBatch",
     ) -> "ReconciliationOutcome":
         """Build reconciliation from durable facts, not caller-provided health booleans."""
         from app.exchange.contracts import (
+            ExchangeReconciliationObservationBatch,
             LocalReconciliationState,
             ReconciliationOutcome,
-            ReconciliationSnapshot,
             reconcile_local_state,
         )
         from app.persistence.replay import ReplayRunner
@@ -344,8 +347,9 @@ class AuditRepository:
 
         if not isinstance(intent_ledger, DurableIntentLedger):
             raise TypeError("intent_ledger must be a durable intent ledger")
-        if not isinstance(reconciliation_snapshot, ReconciliationSnapshot):
-            raise TypeError("reconciliation_snapshot must be a typed exchange observation")
+        if type(reconciliation_snapshot) is not ExchangeReconciliationObservationBatch:
+            raise TypeError("reconciliation_snapshot must be an exchange observation batch")
+        reconciliation_snapshot.require_fresh()
         events = self.list_audit_events()
         head = self.audit_chain_head()
         replay = ReplayRunner().replay(events, head)
@@ -367,7 +371,7 @@ class AuditRepository:
                 replay_valid=replay.is_valid,
                 expected_stop_contracts=reconciliation_facts.expected_stop_contracts,
             ),
-            snapshot=reconciliation_snapshot,
+            snapshot=reconciliation_snapshot.snapshot,
         )
         if not isinstance(outcome, ReconciliationOutcome):
             raise RuntimeError("reconciliation derivation did not return a typed outcome")
@@ -377,12 +381,12 @@ class AuditRepository:
         self,
         *,
         intent_ledger: "DurableIntentLedger",
-        reconciliation_snapshot: "ReconciliationSnapshot",
+        reconciliation_snapshot: "ExchangeReconciliationObservationBatch",
     ) -> PersistenceRecoveryEvidence:
         """Derive reset evidence from committed storage and typed observed records."""
         from app.exchange.contracts import (
+            ExchangeReconciliationObservationBatch,
             LocalReconciliationState,
-            ReconciliationSnapshot,
             reconcile_local_state,
         )
         from app.persistence.replay import ReplayRunner
@@ -390,8 +394,9 @@ class AuditRepository:
 
         if not isinstance(intent_ledger, DurableIntentLedger):
             raise TypeError("intent_ledger must be a durable intent ledger")
-        if not isinstance(reconciliation_snapshot, ReconciliationSnapshot):
-            raise TypeError("reconciliation_snapshot must be a typed exchange observation")
+        if type(reconciliation_snapshot) is not ExchangeReconciliationObservationBatch:
+            raise TypeError("reconciliation_snapshot must be an exchange observation batch")
+        reconciliation_snapshot.require_fresh()
 
         probe_event_id = f"persistence-recovery-probe-{uuid4().hex}"
         self.record_delivery(
@@ -423,7 +428,7 @@ class AuditRepository:
                 replay_valid=replay.is_valid,
                 expected_stop_contracts=reconciliation_facts.expected_stop_contracts,
             ),
-            snapshot=reconciliation_snapshot,
+            snapshot=reconciliation_snapshot.snapshot,
         )
         return PersistenceRecoveryEvidence(
             write_probe_event_id=probe_event_id,

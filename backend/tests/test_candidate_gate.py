@@ -3,11 +3,12 @@ from decimal import Decimal
 from app.domain.types import Direction
 from app.strategy.gate import CandidateGate, CandidateGateContext
 from app.strategy.models import SignalCandidate
+from tests.strategy_factory import make_strategy_lineage
 
 
 def _signal() -> SignalCandidate:
-    return SignalCandidate(
-        strategy_id="fixture_strategy",
+    return SignalCandidate.from_lineage(
+        make_strategy_lineage("fixture_strategy"),
         symbol="BTCUSDT",
         direction=Direction.LONG,
         reference_price=Decimal("100"),
@@ -28,6 +29,7 @@ def _context(
     evaluated_at_ms: int = 1_000,
 ) -> CandidateGateContext:
     return CandidateGateContext(
+        expected_lineage=make_strategy_lineage("fixture_strategy"),
         risk_allows=risk_allows,
         data_is_fresh=data_is_fresh,
         estimated_cost=estimated_cost,

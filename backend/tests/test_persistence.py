@@ -15,6 +15,7 @@ from app.persistence.database import create_database_engine, create_schema, crea
 from app.persistence.models import AppendOnlyViolation, AuditEvent
 from app.persistence.replay import ReplayRunner, reconcile_projection
 from app.simulation.intent_ledger import DurableIntentLedger
+from tests.reconciliation_factory import exchange_reconciliation_batch
 
 
 @pytest.fixture
@@ -119,10 +120,12 @@ def test_database_failure_blocks_new_entries_until_reconciliation(
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
     )
     breaker.require_new_entries_allowed()

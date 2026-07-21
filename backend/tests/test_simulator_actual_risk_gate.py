@@ -3,7 +3,6 @@
 from decimal import Decimal
 
 import pytest
-from conftest import actual_risk_policy_for
 
 from app.domain.types import Direction
 from app.simulation.intent_ledger import DurableIntentLedger
@@ -14,6 +13,7 @@ from app.simulation.models import (
     SimulatedOrderStatus,
 )
 from app.simulation.simulator import EntryRiskBlocked, ExchangeSimulator, FillSequencePlan
+from tests.conftest import actual_risk_policy_for
 
 
 def _intent(*, client_order_id: str, stage_index: int) -> SimulatedOrderIntent:

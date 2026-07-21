@@ -27,20 +27,49 @@ class FillSemanticConflict(FillLedgerError):
     pass
 
 
+class FillSide(StrEnum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class FillObservationSource(StrEnum):
+    SIMULATED_EXCHANGE = "simulated_exchange"
+    AUTHENTICATED_EXCHANGE_ADAPTER = "authenticated_exchange_adapter"
+    LEGACY_MIGRATION = "legacy_migration"
+
+
 @dataclass(frozen=True, slots=True)
 class FillEvent:
+    account_id: str
     trade_id: str
     client_order_id: str
+    symbol: str
+    side: FillSide
     last_quantity: Decimal
     cumulative_quantity: Decimal
     fill_price: Decimal
     fee: Decimal
     fee_asset: str
     occurred_at: datetime
+    observation_source: FillObservationSource
+    observation_reference: str
 
     def __post_init__(self) -> None:
-        if not self.trade_id or not self.client_order_id or not self.fee_asset:
-            raise FillLedgerError("fill events need trade, client order, and fee asset identifiers")
+        if not all(
+            (
+                self.account_id,
+                self.trade_id,
+                self.client_order_id,
+                self.symbol,
+                self.fee_asset,
+                self.observation_reference,
+            )
+        ):
+            raise FillLedgerError("fill events require complete exchange identity fields")
+        if type(self.side) is not FillSide:
+            raise FillLedgerError("fill side must be a typed exchange side")
+        if type(self.observation_source) is not FillObservationSource:
+            raise FillLedgerError("fill observation source must be typed")
         decimal_values = (
             self.last_quantity,
             self.cumulative_quantity,

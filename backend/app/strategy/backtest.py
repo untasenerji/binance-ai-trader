@@ -1,7 +1,5 @@
 """Deterministic, close-only strategy research with explicit cost accounting."""
 
-import hashlib
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
@@ -16,6 +14,7 @@ from app.strategy.models import (
     Strategy,
     StrategyFitResult,
     StrategySpecification,
+    candle_dataset_fingerprint,
 )
 
 _BPS_DENOMINATOR = Decimal("10000")
@@ -491,8 +490,13 @@ class WalkForwardWindow:
     train_end: int
     test_start: int
     test_end: int
+    strategy_id: str
+    strategy_version: str
+    strategy_specification_fingerprint: str
+    fit_result_fingerprint: str
     configuration_fingerprint: str
     training_data_fingerprint: str
+    trainer_version: str
     result: BacktestResult
 
 
@@ -563,8 +567,15 @@ class WalkForwardRunner:
                     train_end=train_end,
                     test_start=train_end,
                     test_end=test_end,
+                    strategy_id=frozen_strategy.strategy_id,
+                    strategy_version=frozen_strategy.strategy_version,
+                    strategy_specification_fingerprint=(
+                        frozen_strategy.strategy_specification_fingerprint
+                    ),
+                    fit_result_fingerprint=frozen_strategy.fit_result_fingerprint,
                     configuration_fingerprint=frozen_strategy.configuration_fingerprint,
                     training_data_fingerprint=training_data_fingerprint,
+                    trainer_version=frozen_strategy.trainer_version,
                     result=BacktestResult(trades=test_trades),
                 )
             )
@@ -623,24 +634,4 @@ class WalkForwardRunner:
 
     @staticmethod
     def _training_data_fingerprint(training_candles: tuple[Candle, ...]) -> str:
-        canonical = json.dumps(
-            [
-                {
-                    "close_price": format(candle.close_price, "f"),
-                    "close_time_ms": candle.close_time_ms,
-                    "funding_rate": format(candle.funding_rate, "f"),
-                    "high_price": format(candle.high_price, "f"),
-                    "low_price": format(candle.low_price, "f"),
-                    "open_price": format(candle.open_price, "f"),
-                    "open_time_ms": candle.open_time_ms,
-                    "symbol": candle.symbol,
-                    "timeframe": candle.timeframe,
-                    "volume": format(candle.volume, "f"),
-                }
-                for candle in training_candles
-            ],
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        return hashlib.sha256(canonical.encode()).hexdigest()
+        return candle_dataset_fingerprint(training_candles)

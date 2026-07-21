@@ -19,7 +19,13 @@ from app.persistence.circuit_breaker import (
 )
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.replay import ReplayRunner
-from app.planning.fills import FillEvent, FillLedger, FillLedgerError
+from app.planning.fills import (
+    FillEvent,
+    FillLedger,
+    FillLedgerError,
+    FillObservationSource,
+    FillSide,
+)
 from app.planning.ladder import StageBlueprint
 from app.planning.risk import CostAssumptions, PlanningContext, solve_ladder
 from app.simulation.intent_ledger import (
@@ -35,6 +41,7 @@ from app.simulation.simulator import (
     SimulatedUnknownQueryPlan,
     SimulatedUnknownRemoteState,
 )
+from tests.strategy_factory import make_strategy_lineage
 
 
 @pytest.fixture
@@ -110,6 +117,7 @@ def _short_costs() -> CostAssumptions:
 
 def test_short_plan_uses_order_limit_not_adverse_loss_fill_for_exposure_and_margin() -> None:
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("second-audit-short"),
         direction=Direction.SHORT,
         blueprints=(StageBlueprint(index=1, entry_price=Decimal("100"), weight=Decimal("1")),),
         stop_price=Decimal("100.1"),
@@ -128,6 +136,7 @@ def test_short_plan_uses_order_limit_not_adverse_loss_fill_for_exposure_and_marg
 
 def test_short_limit_exposure_cannot_pass_using_a_lower_adverse_loss_fill_price() -> None:
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("second-audit-short"),
         direction=Direction.SHORT,
         blueprints=(StageBlueprint(index=1, entry_price=Decimal("100"), weight=Decimal("1")),),
         stop_price=Decimal("100.1"),
@@ -242,14 +251,19 @@ def _fill(
     price: Decimal,
 ) -> FillEvent:
     return FillEvent(
+        account_id="v1-primary",
         trade_id=trade_id,
         client_order_id=client_order_id,
+        symbol="BTCUSDT",
+        side=FillSide.BUY,
         last_quantity=last_quantity,
         cumulative_quantity=cumulative_quantity,
         fill_price=price,
         fee=Decimal("0.001"),
         fee_asset="USDT",
         occurred_at=datetime(2026, 7, 13, tzinfo=UTC),
+        observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+        observation_reference=f"test:{trade_id}",
     )
 
 

@@ -38,6 +38,8 @@ from app.planning.fills import (
     ExposureSourceState,
     FillEvent,
     FillLedgerError,
+    FillObservationSource,
+    FillSide,
     PortfolioExposureSlice,
 )
 from app.simulation.intent_ledger import (
@@ -52,6 +54,7 @@ from app.simulation.simulator import (
     FillSequencePlan,
     SimulatorError,
 )
+from tests.reconciliation_factory import exchange_reconciliation_batch
 
 
 def _policy(
@@ -142,14 +145,19 @@ def _fill(
     price: Decimal = Decimal("100"),
 ) -> FillEvent:
     return FillEvent(
+        account_id="v1-primary",
         trade_id=trade_id,
         client_order_id=client_order_id,
+        symbol="BTCUSDT",
+        side=FillSide.BUY,
         last_quantity=quantity,
         cumulative_quantity=quantity,
         fill_price=price,
         fee=Decimal("0"),
         fee_asset="USDT",
         occurred_at=datetime(2026, 7, 15, tzinfo=UTC),
+        observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+        observation_reference=f"test:{trade_id}",
     )
 
 
@@ -383,10 +391,12 @@ def test_mixed_portfolio_margin_and_exposure_are_order_independent(
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=durable_intent_ledger,
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
     )
 
@@ -740,7 +750,7 @@ def _assert_published_0009_upgrade(database_url: str) -> None:
                 )
             )
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0012_account_scope_safety"
+                "0013_execution_safety_core"
             )
         assert reasons == (
             "LEGACY_DUPLICATE_QUERY_EVIDENCE",
@@ -772,10 +782,12 @@ def _assert_published_0009_upgrade(database_url: str) -> None:
             breaker.reset_after_verified_reconciliation(
                 audit_repository=authorized_repository,
                 intent_ledger=authorized_ledger,
-                reconciliation_snapshot=ReconciliationSnapshot(
-                    positions_by_symbol={},
-                    normal_order_client_ids=frozenset(),
-                    algo_order_client_ids=frozenset(),
+                reconciliation_snapshot=exchange_reconciliation_batch(
+                    ReconciliationSnapshot(
+                        positions_by_symbol={},
+                        normal_order_client_ids=frozenset(),
+                        algo_order_client_ids=frozenset(),
+                    )
                 ),
             )
     finally:
@@ -808,7 +820,7 @@ def _head_schema_signature(database_url: str) -> dict[str, object]:
         engine.dispose()
 
 
-def test_forward_migration_0012_is_the_only_current_head(tmp_path: Path) -> None:
+def test_forward_migration_0013_is_the_only_current_head(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'sixth-head.sqlite'}"
     config = _migration_config(database_url)
     command.upgrade(config, "head")
@@ -816,7 +828,7 @@ def test_forward_migration_0012_is_the_only_current_head(tmp_path: Path) -> None
     try:
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0012_account_scope_safety"
+                "0013_execution_safety_core"
             )
     finally:
         engine.dispose()
@@ -990,10 +1002,12 @@ def test_breaker_reset_rejects_correct_stop_id_with_wrong_trigger(tmp_path: Path
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
     )
     plan_id = "wrong-stop-trigger"
@@ -1022,26 +1036,29 @@ def test_breaker_reset_rejects_correct_stop_id_with_wrong_trigger(tmp_path: Path
         breaker.reset_after_verified_reconciliation(
             audit_repository=repository,
             intent_ledger=ledger,
-            reconciliation_snapshot=ReconciliationSnapshot(
-                positions_by_symbol={"BTCUSDT": Decimal("0.01")},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset({f"{plan_id}-expected-stop"}),
-                algo_orders=(
-                    ExchangeAlgoOrderObservation(
-                        source="authenticated_exchange_adapter",
-                        account_id="v1-primary",
-                        fetched_at=datetime.now(UTC),
-                        server_time=datetime.now(UTC),
-                        freshness_window=timedelta(seconds=30),
-                        correlation_id="wrong-stop-trigger-observation",
-                        client_algo_id=f"{plan_id}-expected-stop",
-                        symbol="BTCUSDT",
-                        direction=Direction.LONG,
-                        algo_type=AlgoOrderType.STOP_MARKET,
-                        trigger_price=Decimal("50"),
-                        close_position=True,
+            reconciliation_snapshot=exchange_reconciliation_batch(
+                ReconciliationSnapshot(
+                    positions_by_symbol={"BTCUSDT": Decimal("0.01")},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset({f"{plan_id}-expected-stop"}),
+                    algo_orders=(
+                        ExchangeAlgoOrderObservation(
+                            source="authenticated_exchange_adapter",
+                            account_id="v1-primary",
+                            fetched_at=datetime.now(UTC),
+                            server_time=datetime.now(UTC),
+                            freshness_window=timedelta(seconds=30),
+                            correlation_id="wrong-stop-trigger-observation",
+                            query_epoch=1,
+                            client_algo_id=f"{plan_id}-expected-stop",
+                            symbol="BTCUSDT",
+                            direction=Direction.LONG,
+                            algo_type=AlgoOrderType.STOP_MARKET,
+                            trigger_price=Decimal("50"),
+                            close_position=True,
+                        ),
                     ),
-                ),
+                )
             ),
         )
     engine.dispose()
@@ -1059,6 +1076,7 @@ def _observed_stop(
         "server_time": observed_at,
         "freshness_window": timedelta(seconds=30),
         "correlation_id": f"sixth-audit-{contract.client_algo_id}",
+        "query_epoch": 1,
         "client_algo_id": contract.client_algo_id,
         "symbol": contract.symbol,
         "direction": contract.position_side,
@@ -1213,7 +1231,10 @@ def test_same_symbol_multi_plan_stops_bind_to_plan_and_policy_fingerprint(
         direction=Direction.LONG,
     )
     local = _local_reconciliation_state(durable_intent_ledger)
-    exact_orders = (_observed_stop(first), _observed_stop(second))
+    exact_orders = (
+        _observed_stop(first, correlation_id="same-symbol-query"),
+        _observed_stop(second, correlation_id="same-symbol-query"),
+    )
     exact = reconcile_local_state(
         local=local,
         snapshot=ReconciliationSnapshot(
@@ -1226,11 +1247,13 @@ def test_same_symbol_multi_plan_stops_bind_to_plan_and_policy_fingerprint(
     swapped_orders = (
         _observed_stop(
             first,
+            correlation_id="same-symbol-swapped-query",
             plan_id=second.plan_id,
             policy_fingerprint=second.policy_fingerprint,
         ),
         _observed_stop(
             second,
+            correlation_id="same-symbol-swapped-query",
             plan_id=first.plan_id,
             policy_fingerprint=first.policy_fingerprint,
         ),

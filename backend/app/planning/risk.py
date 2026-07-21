@@ -9,6 +9,7 @@ from app.domain.filters import FilterViolation, SymbolFilters
 from app.domain.risk import DEFAULT_HARD_CAPS, PilotHardCaps, RiskSettings, apply_hard_caps
 from app.domain.types import Direction
 from app.planning.ladder import StageBlueprint
+from app.strategy.models import SignalCandidate, StrategyLineage
 
 _BPS_DENOMINATOR = Decimal("10000")
 
@@ -159,6 +160,7 @@ class PlannedStage:
 
 @dataclass(frozen=True, slots=True)
 class LadderPlan:
+    strategy_lineage: StrategyLineage
     direction: Direction
     stop_price: Decimal
     risk_budget: Decimal
@@ -169,9 +171,19 @@ class LadderPlan:
     stages: tuple[PlannedStage, ...]
     skip_reason: str | None = None
 
+    def __post_init__(self) -> None:
+        if type(self.strategy_lineage) is not StrategyLineage:
+            raise TypeError("ladder plan requires exact strategy lineage")
+
     @property
     def is_skipped(self) -> bool:
         return self.skip_reason is not None
+
+    def verify_candidate_lineage(self, candidate: SignalCandidate) -> None:
+        if type(candidate) is not SignalCandidate:
+            raise TypeError("ladder plan lineage check requires an exact candidate")
+        if candidate.lineage != self.strategy_lineage:
+            raise RiskPlanningError("candidate and ladder plan lineage do not match")
 
 
 def build_risk_envelope(
@@ -351,6 +363,7 @@ def risk_per_unit(
 
 def solve_ladder(
     *,
+    strategy_lineage: StrategyLineage,
     direction: Direction,
     blueprints: tuple[StageBlueprint, ...],
     stop_price: Decimal,
@@ -358,9 +371,12 @@ def solve_ladder(
     costs: CostAssumptions,
     planning_context: PlanningContext,
 ) -> LadderPlan:
+    if type(strategy_lineage) is not StrategyLineage:
+        raise TypeError("ladder planning requires exact strategy lineage")
     envelope = build_risk_envelope(planning_context)
     if not envelope.is_ready:
         return _skip_plan(
+            strategy_lineage,
             direction,
             stop_price,
             envelope,
@@ -368,11 +384,19 @@ def solve_ladder(
         )
     assert planning_context.existing_total_exposure_usdt is not None
     if planning_context.symbol != filters.symbol:
-        return _skip_plan(direction, stop_price, envelope, "SYMBOL_CONTEXT_MISMATCH")
+        return _skip_plan(
+            strategy_lineage, direction, stop_price, envelope, "SYMBOL_CONTEXT_MISMATCH"
+        )
     if not blueprints:
-        return _skip_plan(direction, stop_price, envelope, "NO_STAGES")
+        return _skip_plan(strategy_lineage, direction, stop_price, envelope, "NO_STAGES")
     if len(blueprints) > envelope.settings.max_stages:
-        return _skip_plan(direction, stop_price, envelope, "HARD_STAGE_LIMIT_EXCEEDED")
+        return _skip_plan(
+            strategy_lineage,
+            direction,
+            stop_price,
+            envelope,
+            "HARD_STAGE_LIMIT_EXCEEDED",
+        )
 
     rounded_stop_price = filters.round_stop_price(direction, stop_price)
     stages: list[PlannedStage] = []
@@ -380,7 +404,13 @@ def solve_ladder(
     rounded_stage_keys: set[tuple[Decimal, int | None]] = set()
     for blueprint in blueprints:
         if blueprint.index in stage_indexes:
-            return _skip_plan(direction, rounded_stop_price, envelope, "DUPLICATE_STAGE_INDEX")
+            return _skip_plan(
+                strategy_lineage,
+                direction,
+                rounded_stop_price,
+                envelope,
+                "DUPLICATE_STAGE_INDEX",
+            )
         stage_indexes.add(blueprint.index)
         try:
             projection = worst_case_price_projection(
@@ -391,10 +421,17 @@ def solve_ladder(
                 costs=costs,
             )
         except (FilterViolation, RiskPlanningError):
-            return _skip_plan(direction, rounded_stop_price, envelope, "INVALID_STOP_RELATION")
+            return _skip_plan(
+                strategy_lineage,
+                direction,
+                rounded_stop_price,
+                envelope,
+                "INVALID_STOP_RELATION",
+            )
         rounded_stage_key = (projection.entry_price, blueprint.scheduled_at_ms)
         if rounded_stage_key in rounded_stage_keys:
             return _skip_plan(
+                strategy_lineage,
                 direction,
                 rounded_stop_price,
                 envelope,
@@ -412,6 +449,7 @@ def solve_ladder(
             filters.validate_entry(price=projection.entry_price, quantity=quantity)
         except FilterViolation:
             return _skip_plan(
+                strategy_lineage,
                 direction,
                 rounded_stop_price,
                 envelope,
@@ -441,15 +479,34 @@ def solve_ladder(
         planning_context.existing_total_exposure_usdt + planned_notional
     ) / envelope.effective_leverage + envelope.required_reserve_usdt
     if projected_total_loss > envelope.risk_budget_usdt:
-        return _skip_plan(direction, rounded_stop_price, envelope, "ROUNDING_RISK_EXCEEDED")
+        return _skip_plan(
+            strategy_lineage,
+            direction,
+            rounded_stop_price,
+            envelope,
+            "ROUNDING_RISK_EXCEEDED",
+        )
     if (
         planned_notional > envelope.remaining_symbol_exposure_usdt
         or planned_notional > envelope.remaining_total_exposure_usdt
     ):
-        return _skip_plan(direction, rounded_stop_price, envelope, "EXPOSURE_LIMIT_EXCEEDED")
+        return _skip_plan(
+            strategy_lineage,
+            direction,
+            rounded_stop_price,
+            envelope,
+            "EXPOSURE_LIMIT_EXCEEDED",
+        )
     if required_margin > envelope.effective_equity_usdt:
-        return _skip_plan(direction, rounded_stop_price, envelope, "MARGIN_REQUIREMENT_EXCEEDED")
+        return _skip_plan(
+            strategy_lineage,
+            direction,
+            rounded_stop_price,
+            envelope,
+            "MARGIN_REQUIREMENT_EXCEEDED",
+        )
     return LadderPlan(
+        strategy_lineage=strategy_lineage,
         direction=direction,
         stop_price=rounded_stop_price,
         risk_budget=envelope.risk_budget_usdt,
@@ -514,12 +571,14 @@ def _blocked_envelope(
 
 
 def _skip_plan(
+    strategy_lineage: StrategyLineage,
     direction: Direction,
     stop_price: Decimal,
     envelope: RiskEnvelope,
     reason: str,
 ) -> LadderPlan:
     return LadderPlan(
+        strategy_lineage=strategy_lineage,
         direction=direction,
         stop_price=stop_price,
         risk_budget=envelope.risk_budget_usdt,

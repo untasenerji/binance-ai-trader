@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from app.domain.decimal_math import ZERO
-from app.exchange.contracts import ReconciliationSnapshot
+from app.exchange.contracts import ExchangeReconciliationObservationBatch
 from app.observability.recovery import RecoveryAction
 from app.persistence.audit import AuditRepository
 from app.persistence.replay import ReplayRunner
@@ -188,11 +188,12 @@ class LocalRecoveryCoordinator:
         checkpoint: RecoveryCheckpoint,
         *,
         audit_repository: AuditRepository,
-        reconciliation_snapshot: ReconciliationSnapshot,
+        reconciliation_snapshot: ExchangeReconciliationObservationBatch,
         intent_ledger: DurableIntentLedger,
     ) -> RecoveryResult:
-        if not isinstance(reconciliation_snapshot, ReconciliationSnapshot):
-            raise TypeError("reconciliation_snapshot must be ReconciliationSnapshot")
+        if type(reconciliation_snapshot) is not ExchangeReconciliationObservationBatch:
+            raise TypeError("reconciliation_snapshot must be an observation batch")
+        reconciliation_snapshot.require_fresh()
         if not isinstance(intent_ledger, DurableIntentLedger):
             raise TypeError("intent_ledger must be DurableIntentLedger")
         replay = ReplayRunner().replay(

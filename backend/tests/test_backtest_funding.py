@@ -11,6 +11,7 @@ from app.strategy.backtest import (
     FundingSettlement,
 )
 from app.strategy.models import Candle, SignalCandidate
+from tests.strategy_factory import make_strategy_lineage
 
 
 def _candle(index: int, *, open_price: Decimal, close_price: Decimal) -> Candle:
@@ -38,8 +39,8 @@ class FirstSignal:
             return None
         candle = candles[-1]
         invalidation = candle.low_price if self._direction is Direction.LONG else candle.high_price
-        return SignalCandidate(
-            strategy_id=self.strategy_id,
+        return SignalCandidate.from_lineage(
+            make_strategy_lineage(self.strategy_id),
             symbol=candle.symbol,
             direction=self._direction,
             reference_price=candle.close_price,

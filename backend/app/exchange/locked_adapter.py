@@ -1,6 +1,10 @@
 """A hard runtime lock around every authenticated Binance adapter operation."""
 
-from app.exchange.contracts import AlgoOrderIntent, NormalOrderIntent, ReconciliationSnapshot
+from app.exchange.contracts import (
+    AlgoOrderIntent,
+    ExchangeReconciliationObservationBatch,
+    NormalOrderIntent,
+)
 
 LIVE_TRADING_ENABLED = False
 
@@ -27,7 +31,7 @@ class LockedBinanceAdapter:
     async def start_user_data_stream(self) -> None:
         self._reject()
 
-    async def reconcile(self) -> ReconciliationSnapshot:
+    async def reconcile(self) -> ExchangeReconciliationObservationBatch:
         self._reject()
         raise AssertionError("unreachable")
 

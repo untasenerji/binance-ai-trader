@@ -15,6 +15,7 @@ from app.planning.ladder import (
     time_sliced_ladder,
 )
 from app.planning.risk import CostAssumptions, PlanningContext, risk_per_unit, solve_ladder
+from tests.strategy_factory import make_strategy_lineage
 
 
 @pytest.fixture
@@ -141,6 +142,7 @@ def test_total_all_fill_loss_never_exceeds_budget(
         weights=(Decimal("0.5"), Decimal("0.5")),
     )
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("planning"),
         direction=Direction.LONG,
         blueprints=blueprints,
         stop_price=Decimal("990"),
@@ -177,6 +179,7 @@ def test_min_notional_failure_skips_instead_of_increasing_risk(
     )
 
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("planning"),
         direction=Direction.LONG,
         blueprints=blueprints,
         stop_price=Decimal("990"),
@@ -253,6 +256,7 @@ def test_tick_collapsed_unscheduled_ladder_stages_fail_closed(
     )
 
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("planning"),
         direction=Direction.LONG,
         blueprints=blueprints,
         stop_price=Decimal("99"),

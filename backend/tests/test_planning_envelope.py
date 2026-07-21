@@ -14,6 +14,7 @@ from app.planning.risk import (
     build_risk_envelope,
     solve_ladder,
 )
+from tests.strategy_factory import make_strategy_lineage
 
 
 @pytest.fixture
@@ -133,6 +134,7 @@ def test_narrow_stop_cannot_create_a_low_risk_but_excessive_notional_plan(
     filters: SymbolFilters, costs: CostAssumptions
 ) -> None:
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("planning-envelope"),
         direction=Direction.LONG,
         blueprints=_blueprint(Decimal("1000")),
         stop_price=Decimal("999.9"),
@@ -157,6 +159,7 @@ def test_bracket_and_existing_exposure_are_proven_against_the_exact_plan(
     overrides: dict[str, object], filters: SymbolFilters, costs: CostAssumptions
 ) -> None:
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("planning-envelope"),
         direction=Direction.LONG,
         blueprints=_blueprint(),
         stop_price=Decimal("90"),
@@ -173,6 +176,7 @@ def test_successful_plan_carries_exact_notional_and_required_margin_proof(
     filters: SymbolFilters, costs: CostAssumptions
 ) -> None:
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("planning-envelope"),
         direction=Direction.LONG,
         blueprints=_blueprint(),
         stop_price=Decimal("90"),

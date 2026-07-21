@@ -3,11 +3,11 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from conftest import actual_risk_policy_for
 
 from app.domain.types import Direction
 from app.exchange.contracts import (
     ExchangeAlgoOrderObservation,
+    ExchangeReconciliationObservationBatch,
     ReconciliationSnapshot,
 )
 from app.observability.recovery import RecoveryAction
@@ -25,6 +25,8 @@ from app.security.recovery import (
 from app.simulation.intent_ledger import DurableIntentLedger
 from app.simulation.models import OrderRole, SimulatedFault, SimulatedOrderIntent
 from app.simulation.simulator import ExchangeSimulator, FaultPlan
+from tests.conftest import actual_risk_policy_for
+from tests.reconciliation_factory import exchange_reconciliation_batch
 
 
 def _confirmed_checkpoint() -> RecoveryCheckpoint:
@@ -48,36 +50,41 @@ def audit_repository(tmp_path: Path) -> AuditRepository:
     return AuditRepository(create_session_factory(engine))
 
 
-def _reconciliation_snapshot(ledger: DurableIntentLedger) -> ReconciliationSnapshot:
+def _reconciliation_snapshot(
+    ledger: DurableIntentLedger,
+) -> ExchangeReconciliationObservationBatch:
     contract = ledger.reconciliation_facts().expected_stop_contracts[0]
-    return ReconciliationSnapshot(
-        positions_by_symbol={"BTCUSDT": Decimal("0.005")},
-        normal_order_client_ids=frozenset({"UTA1-recovery-EN-1"}),
-        algo_order_client_ids=frozenset({"recovery-simulated-stop"}),
-        algo_orders=(
-            ExchangeAlgoOrderObservation(
-                source="authenticated_exchange_adapter",
-                account_id=contract.account_id,
-                fetched_at=datetime.now(UTC),
-                server_time=datetime.now(UTC),
-                freshness_window=timedelta(seconds=30),
-                correlation_id="security-recovery-reconciliation",
-                client_algo_id=contract.client_algo_id,
-                symbol=contract.symbol,
-                direction=contract.position_side,
-                algo_type=contract.algo_type,
-                trigger_price=contract.trigger_price,
-                close_position=contract.close_position,
-                working_type=contract.working_type,
-                status=contract.active_status,
-                plan_id=contract.plan_id,
-                policy_version=contract.policy_version,
-                account_envelope_version=contract.account_envelope_version,
-                policy_fingerprint=contract.policy_fingerprint,
-                account_envelope_fingerprint=contract.account_envelope_fingerprint,
-                stop_contract_fingerprint=contract.fingerprint,
+    return exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={"BTCUSDT": Decimal("0.005")},
+            normal_order_client_ids=frozenset({"UTA1-recovery-EN-1"}),
+            algo_order_client_ids=frozenset({"recovery-simulated-stop"}),
+            algo_orders=(
+                ExchangeAlgoOrderObservation(
+                    source="authenticated_exchange_adapter",
+                    account_id=contract.account_id,
+                    fetched_at=datetime.now(UTC),
+                    server_time=datetime.now(UTC),
+                    freshness_window=timedelta(seconds=30),
+                    correlation_id="security-recovery-reconciliation",
+                    query_epoch=1,
+                    client_algo_id=contract.client_algo_id,
+                    symbol=contract.symbol,
+                    direction=contract.position_side,
+                    algo_type=contract.algo_type,
+                    trigger_price=contract.trigger_price,
+                    close_position=contract.close_position,
+                    working_type=contract.working_type,
+                    status=contract.active_status,
+                    plan_id=contract.plan_id,
+                    policy_version=contract.policy_version,
+                    account_envelope_version=contract.account_envelope_version,
+                    policy_fingerprint=contract.policy_fingerprint,
+                    account_envelope_fingerprint=contract.account_envelope_fingerprint,
+                    stop_contract_fingerprint=contract.fingerprint,
+                ),
             ),
-        ),
+        )
     )
 
 
@@ -153,10 +160,12 @@ def test_missing_stop_hard_halts_recovery() -> None:
     result = LocalRecoveryCoordinator().recover_after_restart(
         missing_stop,
         audit_repository=AuditRepository(create_session_factory(engine)),
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
         intent_ledger=intent_ledger,
     )

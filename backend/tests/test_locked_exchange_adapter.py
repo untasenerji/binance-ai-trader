@@ -52,6 +52,7 @@ def _observed_stop_order() -> ExchangeAlgoOrderObservation:
         server_time=now,
         freshness_window=timedelta(seconds=30),
         correlation_id="locked-adapter-reconciliation",
+        query_epoch=1,
         client_algo_id="UTA1-plan-ST-1-1",
         symbol="BTCUSDT",
         direction=Direction.LONG,

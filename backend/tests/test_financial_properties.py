@@ -9,9 +9,16 @@ from hypothesis import strategies as st
 from app.domain.filters import SymbolFilters
 from app.domain.risk import RiskSettings
 from app.domain.types import Direction
-from app.planning.fills import FillEvent, FillLedger, evaluate_confirmed_position_risk
+from app.planning.fills import (
+    FillEvent,
+    FillLedger,
+    FillObservationSource,
+    FillSide,
+    evaluate_confirmed_position_risk,
+)
 from app.planning.ladder import StageBlueprint
 from app.planning.risk import CostAssumptions, PlanningContext, solve_ladder
+from tests.strategy_factory import make_strategy_lineage
 
 
 def _settings() -> RiskSettings:
@@ -87,6 +94,7 @@ def test_short_multistage_notional_and_margin_never_use_lower_adverse_fill(
     entry_price = Decimal(entry_ticks) * Decimal("0.05")
     lower_stage_price = entry_price - Decimal(spacing_ticks) * Decimal("0.05")
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("financial-property"),
         direction=Direction.SHORT,
         blueprints=(
             StageBlueprint(index=1, entry_price=entry_price, weight=Decimal("0.5")),
@@ -133,24 +141,34 @@ def test_short_multistage_vwap_fees_and_actual_stop_risk_match_decimal_oracle(
     ledger = FillLedger.from_events(
         (
             FillEvent(
+                account_id="v1-primary",
                 trade_id="short-stage-one",
                 client_order_id="short-entry-1",
+                symbol="BTCUSDT",
+                side=FillSide.SELL,
                 last_quantity=first_quantity,
                 cumulative_quantity=first_quantity,
                 fill_price=first_price,
                 fee=first_fee,
                 fee_asset="USDT",
                 occurred_at=datetime(2026, 7, 13, tzinfo=UTC),
+                observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+                observation_reference="test:short-stage-one",
             ),
             FillEvent(
+                account_id="v1-primary",
                 trade_id="short-stage-two",
                 client_order_id="short-entry-2",
+                symbol="BTCUSDT",
+                side=FillSide.SELL,
                 last_quantity=second_quantity,
                 cumulative_quantity=second_quantity,
                 fill_price=second_price,
                 fee=second_fee,
                 fee_asset="USDT",
                 occurred_at=datetime(2026, 7, 13, tzinfo=UTC),
+                observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+                observation_reference="test:short-stage-two",
             ),
         )
     )

@@ -3,11 +3,12 @@
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import Protocol
+from types import MappingProxyType
+from typing import Protocol, cast, final
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
@@ -217,6 +218,7 @@ class ExchangeAlgoOrderObservation:
     server_time: datetime
     freshness_window: timedelta
     correlation_id: str
+    query_epoch: int
     client_algo_id: str
     symbol: str
     direction: Direction
@@ -238,6 +240,12 @@ class ExchangeAlgoOrderObservation:
             raise ValueError("exchange observations require authenticated adapter provenance")
         if not self.account_id or not self.correlation_id:
             raise ValueError("exchange observations require account and query correlation IDs")
+        if (
+            not isinstance(self.query_epoch, int)
+            or isinstance(self.query_epoch, bool)
+            or self.query_epoch < 1
+        ):
+            raise ValueError("exchange observations require a positive query epoch")
         if self.fetched_at.tzinfo is None or self.server_time.tzinfo is None:
             raise ValueError("exchange observation timestamps must be timezone-aware")
         if (
@@ -248,8 +256,13 @@ class ExchangeAlgoOrderObservation:
             raise ValueError("exchange observation freshness window is invalid")
         fetched_at = self.fetched_at.astimezone(UTC)
         server_time = self.server_time.astimezone(UTC)
+        now = datetime.now(UTC)
+        if fetched_at > now:
+            raise ValueError("exchange observation fetch time cannot be in the future")
         if server_time > fetched_at + timedelta(seconds=5):
             raise ValueError("exchange observation server time cannot follow fetch time")
+        if server_time < fetched_at - timedelta(seconds=5):
+            raise ValueError("exchange observation server time is too old")
         if not self.is_fresh():
             raise ValueError("exchange observation is not fresh")
         if (
@@ -293,7 +306,8 @@ class ExchangeAlgoOrderObservation:
     def is_fresh(self, now: datetime | None = None) -> bool:
         """Recheck the bounded observation lifetime at every evidence boundary."""
         checked_at = (now or datetime.now(UTC)).astimezone(UTC)
-        return checked_at - self.fetched_at.astimezone(UTC) <= self.freshness_window
+        fetched_at = self.fetched_at.astimezone(UTC)
+        return fetched_at <= checked_at and checked_at - fetched_at <= self.freshness_window
 
     def canonical_record(self) -> dict[str, object]:
         return {
@@ -303,6 +317,7 @@ class ExchangeAlgoOrderObservation:
             "server_time": self.server_time,
             "freshness_window": self.freshness_window,
             "correlation_id": self.correlation_id,
+            "query_epoch": self.query_epoch,
             "client_algo_id": self.client_algo_id,
             "symbol": self.symbol,
             "direction": self.direction,
@@ -603,6 +618,12 @@ class ReconciliationSnapshot:
             raise TypeError("algo snapshot records must be ExchangeAlgoOrderObservation values")
         if any(order.account_id != self.account_id for order in self.algo_orders):
             raise ValueError("exchange observations must match the snapshot account")
+        correlations = {order.correlation_id for order in self.algo_orders}
+        if len(correlations) > 1:
+            raise ValueError("algo observations must share one query correlation")
+        query_epochs = {order.query_epoch for order in self.algo_orders}
+        if len(query_epochs) > 1:
+            raise ValueError("algo observations must share one query epoch")
         observed_algo_ids = frozenset(order.client_algo_id for order in self.algo_orders)
         if len(observed_algo_ids) != len(self.algo_orders):
             raise ValueError("algo snapshot records must not duplicate client IDs")
@@ -628,6 +649,187 @@ class ReconciliationSnapshot:
             "stop_protected_symbols",
             normalized_protected_symbols,
         )
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ExchangeReconciliationObservationBatch:
+    """One bounded, adapter-attested exchange reconciliation query result.
+
+    The type is deliberately data-only. Exact-type checks at authorization
+    boundaries prevent local snapshots and simulator objects from being used as
+    exchange evidence.
+    """
+
+    source: str
+    account_id: str
+    query_epoch: int
+    correlation_id: str
+    requested_at: datetime
+    fetched_at: datetime
+    server_time: datetime
+    max_age: timedelta
+    max_clock_skew: timedelta
+    positions_by_symbol: Mapping[str, Decimal]
+    normal_order_client_ids: frozenset[str]
+    algo_order_client_ids: frozenset[str]
+    algo_orders: tuple[ExchangeAlgoOrderObservation, ...] = ()
+    observation_fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.source != "authenticated_exchange_adapter":
+            raise ValueError("reconciliation batches require authenticated adapter provenance")
+        if not self.account_id or not self.correlation_id:
+            raise ValueError("reconciliation batches require account and correlation IDs")
+        if (
+            not isinstance(self.query_epoch, int)
+            or isinstance(self.query_epoch, bool)
+            or self.query_epoch < 1
+        ):
+            raise ValueError("reconciliation batches require a positive query epoch")
+        timestamps = (self.requested_at, self.fetched_at, self.server_time)
+        if any(value.tzinfo is None for value in timestamps):
+            raise ValueError("reconciliation batch timestamps must be timezone-aware")
+        if (
+            not isinstance(self.max_age, timedelta)
+            or self.max_age <= timedelta(0)
+            or self.max_age > timedelta(minutes=10)
+        ):
+            raise ValueError("reconciliation batch max age is invalid")
+        if (
+            not isinstance(self.max_clock_skew, timedelta)
+            or self.max_clock_skew <= timedelta(0)
+            or self.max_clock_skew > timedelta(minutes=1)
+        ):
+            raise ValueError("reconciliation batch clock skew is invalid")
+        requested_at = self.requested_at.astimezone(UTC)
+        fetched_at = self.fetched_at.astimezone(UTC)
+        server_time = self.server_time.astimezone(UTC)
+        if requested_at > fetched_at:
+            raise ValueError("reconciliation request time cannot follow fetch time")
+        if fetched_at - requested_at > self.max_age:
+            raise ValueError("reconciliation query duration exceeds its bounded age")
+        if abs(fetched_at - server_time) > self.max_clock_skew:
+            raise ValueError("reconciliation server time exceeds the allowed clock skew")
+
+        normalized_positions = MappingProxyType(_normalize_positions(self.positions_by_symbol))
+        normal_ids = _normalize_identifiers(
+            self.normal_order_client_ids,
+            field_name="normal order IDs",
+        )
+        supplied_algo_ids = _normalize_identifiers(
+            self.algo_order_client_ids,
+            field_name="algo order IDs",
+        )
+        if any(type(order) is not ExchangeAlgoOrderObservation for order in self.algo_orders):
+            raise TypeError("reconciliation Algo records require exact exchange observations")
+        orders = tuple(sorted(self.algo_orders, key=lambda item: item.client_algo_id))
+        observed_algo_ids = frozenset(order.client_algo_id for order in orders)
+        if len(observed_algo_ids) != len(orders):
+            raise ValueError("reconciliation Algo records must not duplicate client IDs")
+        if supplied_algo_ids != observed_algo_ids:
+            raise ValueError("algo order IDs must match concrete batch observations")
+        for order in orders:
+            if order.account_id != self.account_id:
+                raise ValueError("reconciliation observation account mismatch")
+            if order.source != self.source:
+                raise ValueError("reconciliation observation source mismatch")
+            if order.query_epoch != self.query_epoch:
+                raise ValueError("reconciliation observation query epoch mismatch")
+            if order.correlation_id != self.correlation_id:
+                raise ValueError("reconciliation observation correlation mismatch")
+            if order.fetched_at.astimezone(UTC) != fetched_at:
+                raise ValueError("reconciliation observation fetch time mismatch")
+            if order.server_time.astimezone(UTC) != server_time:
+                raise ValueError("reconciliation observation server time mismatch")
+            if order.freshness_window != self.max_age:
+                raise ValueError("reconciliation observation age bound mismatch")
+
+        object.__setattr__(self, "requested_at", requested_at)
+        object.__setattr__(self, "fetched_at", fetched_at)
+        object.__setattr__(self, "server_time", server_time)
+        object.__setattr__(self, "positions_by_symbol", normalized_positions)
+        object.__setattr__(self, "normal_order_client_ids", normal_ids)
+        object.__setattr__(self, "algo_order_client_ids", observed_algo_ids)
+        object.__setattr__(self, "algo_orders", orders)
+        self.require_fresh()
+        object.__setattr__(
+            self,
+            "observation_fingerprint",
+            hashlib.sha256(self._canonical_json().encode()).hexdigest(),
+        )
+
+    @property
+    def snapshot(self) -> ReconciliationSnapshot:
+        active_stop_symbols = frozenset(
+            order.symbol
+            for order in self.algo_orders
+            if order.algo_type is AlgoOrderType.STOP_MARKET
+            and order.close_position
+            and order.status is AlgoOrderStatus.NEW
+        )
+        return ReconciliationSnapshot(
+            account_id=self.account_id,
+            positions_by_symbol=self.positions_by_symbol,
+            normal_order_client_ids=self.normal_order_client_ids,
+            algo_order_client_ids=self.algo_order_client_ids,
+            algo_orders=self.algo_orders,
+            stop_protected_symbols=active_stop_symbols,
+        )
+
+    def require_fresh(self, now: datetime | None = None) -> None:
+        checked_at = (now or datetime.now(UTC)).astimezone(UTC)
+        if self.fetched_at > checked_at:
+            raise ValueError("reconciliation batch fetch time cannot be in the future")
+        if checked_at - self.fetched_at > self.max_age:
+            raise ValueError("reconciliation batch is stale")
+        if abs(self.fetched_at - self.server_time) > self.max_clock_skew:
+            raise ValueError("reconciliation server time exceeds the allowed clock skew")
+        if any(not order.is_fresh(checked_at) for order in self.algo_orders):
+            raise ValueError("reconciliation batch contains a stale Algo observation")
+
+    def canonical_record(self) -> dict[str, object]:
+        return cast(dict[str, object], json.loads(self._canonical_json()))
+
+    def _canonical_json(self) -> str:
+        payload = {
+            "account_id": self.account_id,
+            "algo_order_client_ids": sorted(self.algo_order_client_ids),
+            "algo_orders": [
+                {
+                    "account_envelope_fingerprint": order.account_envelope_fingerprint,
+                    "account_envelope_version": order.account_envelope_version,
+                    "algo_type": order.algo_type.value,
+                    "client_algo_id": order.client_algo_id,
+                    "close_position": order.close_position,
+                    "direction": order.direction.value,
+                    "plan_id": order.plan_id,
+                    "policy_fingerprint": order.policy_fingerprint,
+                    "policy_version": order.policy_version,
+                    "quantity": (None if order.quantity is None else format(order.quantity, "f")),
+                    "status": order.status.value,
+                    "stop_contract_fingerprint": order.stop_contract_fingerprint,
+                    "symbol": order.symbol,
+                    "trigger_price": format(order.trigger_price, "f"),
+                    "working_type": order.working_type.value,
+                }
+                for order in self.algo_orders
+            ],
+            "correlation_id": self.correlation_id,
+            "fetched_at": self.fetched_at.isoformat(),
+            "max_age_ms": int(self.max_age.total_seconds() * 1000),
+            "max_clock_skew_ms": int(self.max_clock_skew.total_seconds() * 1000),
+            "normal_order_client_ids": sorted(self.normal_order_client_ids),
+            "positions_by_symbol": {
+                symbol: format(quantity, "f")
+                for symbol, quantity in sorted(self.positions_by_symbol.items())
+            },
+            "query_epoch": self.query_epoch,
+            "requested_at": self.requested_at.isoformat(),
+            "server_time": self.server_time.isoformat(),
+            "source": self.source,
+        }
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
 
 
 @dataclass(frozen=True, slots=True)

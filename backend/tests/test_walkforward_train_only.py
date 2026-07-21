@@ -8,6 +8,7 @@ import pytest
 from app.domain.types import Direction
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner, WalkForwardTrainingError
 from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, StrategySpecification
+from tests.strategy_factory import make_frozen_strategy, make_strategy_lineage
 
 
 def _candle(index: int, close: Decimal) -> Candle:
@@ -51,8 +52,8 @@ class TrainOnlyThresholdStrategy:
             last = evaluation_candles[-1]
             if last.close_price <= threshold:
                 return None
-            return SignalCandidate(
-                strategy_id=self.strategy_id,
+            return SignalCandidate.from_lineage(
+                make_strategy_lineage(self.strategy_id),
                 symbol=last.symbol,
                 direction=Direction.LONG,
                 reference_price=last.close_price,
@@ -62,13 +63,7 @@ class TrainOnlyThresholdStrategy:
                 reason_codes=("TRAIN_ONLY_THRESHOLD",),
             )
 
-        return FrozenStrategy(
-            strategy_id=self.strategy_id,
-            training_candle_count=len(candles),
-            training_end_ms=candles[-1].close_time_ms,
-            configuration_fingerprint=f"threshold:{threshold}",
-            evaluator=evaluate,
-        )
+        return make_frozen_strategy(candles, evaluate)
 
 
 class UnfrozenTrainer:

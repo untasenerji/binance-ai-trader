@@ -4,7 +4,10 @@ from pathlib import Path
 import pytest
 from sqlalchemy import Engine, text
 
-from app.exchange.contracts import ReconciliationSnapshot
+from app.exchange.contracts import (
+    ExchangeReconciliationObservationBatch,
+    ReconciliationSnapshot,
+)
 from app.persistence.audit import AuditRepository
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.persistence.models import DurableOrderIntent
@@ -14,6 +17,7 @@ from app.security.recovery import (
     RecoveryDisposition,
 )
 from app.simulation.intent_ledger import DurableIntentLedger, DurableIntentStatus
+from tests.reconciliation_factory import exchange_reconciliation_batch
 
 
 @pytest.fixture
@@ -23,11 +27,13 @@ def audit_repository(tmp_path: Path) -> tuple[AuditRepository, Engine]:
     return AuditRepository(create_session_factory(engine)), engine
 
 
-def _clean_reconciliation_snapshot() -> ReconciliationSnapshot:
-    return ReconciliationSnapshot(
-        positions_by_symbol={},
-        normal_order_client_ids=frozenset(),
-        algo_order_client_ids=frozenset(),
+def _clean_reconciliation_snapshot() -> ExchangeReconciliationObservationBatch:
+    return exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        )
     )
 
 

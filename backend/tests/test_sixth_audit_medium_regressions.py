@@ -18,6 +18,7 @@ from app.simulation.intent_ledger import DurableIntentLedger
 from app.simulation.models import OrderRole, SimulatedOrderIntent
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner
 from app.strategy.models import Candle, StrategySpecification
+from tests.reconciliation_factory import exchange_reconciliation_batch
 
 
 def _entry(client_order_id: str, plan_id: str) -> SimulatedOrderIntent:
@@ -131,10 +132,12 @@ def test_verified_durable_capability_survives_process_object_restart(tmp_path: P
     initial_breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=initial_ledger,
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
     )
 
@@ -154,10 +157,12 @@ def test_persistence_failure_durably_revokes_existing_capability(tmp_path: Path)
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
-    snapshot = ReconciliationSnapshot(
-        positions_by_symbol={},
-        normal_order_client_ids=frozenset(),
-        algo_order_client_ids=frozenset(),
+    snapshot = exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        )
     )
     evidence = breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
@@ -185,10 +190,12 @@ def test_durable_authorization_rejects_audit_head_change_after_grant(tmp_path: P
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
-    snapshot = ReconciliationSnapshot(
-        positions_by_symbol={},
-        normal_order_client_ids=frozenset(),
-        algo_order_client_ids=frozenset(),
+    snapshot = exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        )
     )
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
@@ -218,10 +225,12 @@ def test_durable_authorization_rejects_new_unresolved_intent(tmp_path: Path) -> 
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
     )
     ledger.prepare(_entry("first-unresolved-entry", "first-unresolved-plan"))

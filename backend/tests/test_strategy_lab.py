@@ -10,6 +10,7 @@ from app.strategy.strategies import (
     TrendPullbackStrategy,
     VolatilityBreakoutStrategy,
 )
+from tests.strategy_factory import make_frozen_strategy, make_strategy_lineage
 
 
 def _candle(index: int, *, open_price: str, high: str, low: str, close: str) -> Candle:
@@ -26,8 +27,8 @@ def _candle(index: int, *, open_price: str, high: str, low: str, close: str) -> 
 
 
 def _signal(candle: Candle, *, direction: Direction = Direction.LONG) -> SignalCandidate:
-    return SignalCandidate(
-        strategy_id="test_strategy",
+    return SignalCandidate.from_lineage(
+        make_strategy_lineage("test_strategy"),
         symbol=candle.symbol,
         direction=direction,
         reference_price=candle.close_price,
@@ -86,13 +87,7 @@ class AlwaysSignalStrategy:
 
     def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
         del timeframe
-        return FrozenStrategy(
-            strategy_id=self.strategy_id,
-            training_candle_count=len(candles),
-            training_end_ms=candles[-1].close_time_ms,
-            configuration_fingerprint="always-signal-v1",
-            evaluator=self.evaluate,
-        )
+        return make_frozen_strategy(candles, self.evaluate)
 
 
 def test_backtest_uses_next_bar_and_accounts_for_costs_without_look_ahead() -> None:

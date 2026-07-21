@@ -129,6 +129,10 @@ class DurableIntentFill(Base):
         ForeignKey("durable_order_intents.client_order_id"), index=True
     )
     trade_id: Mapped[str] = mapped_column(String(128))
+    symbol: Mapped[str] = mapped_column(String(32))
+    side: Mapped[str] = mapped_column(String(8))
+    observation_source: Mapped[str] = mapped_column(String(64))
+    observation_reference: Mapped[str] = mapped_column(String(128))
     semantic_fingerprint: Mapped[str] = mapped_column(String(64))
     last_quantity: Mapped[str] = mapped_column(String(64))
     cumulative_quantity: Mapped[str] = mapped_column(String(64))
@@ -498,9 +502,38 @@ class DurableEvidenceQuarantine(Base):
     account_id: Mapped[str] = mapped_column(String(128), index=True)
     economic_key: Mapped[str] = mapped_column(String(256), index=True)
     client_order_id: Mapped[str] = mapped_column(String(128), index=True)
-    query_reference: Mapped[str] = mapped_column(String(128))
+    query_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
     provenance_fingerprint: Mapped[str] = mapped_column(String(64))
     reason: Mapped[str] = mapped_column(String(128))
+    evidence: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableEvidenceQuarantineSource(Base):
+    """Append-only source rows retained behind one canonical quarantine case."""
+
+    __tablename__ = "durable_evidence_quarantine_sources"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_kind",
+            "source_table",
+            "source_row_id",
+            name="uq_evidence_quarantine_source_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    quarantine_id: Mapped[str] = mapped_column(
+        ForeignKey("durable_evidence_quarantines.quarantine_id"), index=True
+    )
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    source_kind: Mapped[str] = mapped_column(String(64))
+    source_table: Mapped[str] = mapped_column(String(128))
+    source_row_id: Mapped[str] = mapped_column(String(128))
+    source_identity: Mapped[str] = mapped_column(String(256))
+    client_order_id: Mapped[str] = mapped_column(String(128))
+    query_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    provenance_fingerprint: Mapped[str] = mapped_column(String(64))
     evidence: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -581,6 +614,8 @@ def _reject_durable_evidence_mutation(*_: object) -> None:
 @event.listens_for(DurablePortfolioEnvelopeSupersession, "before_delete")
 @event.listens_for(DurableEvidenceQuarantine, "before_update")
 @event.listens_for(DurableEvidenceQuarantine, "before_delete")
+@event.listens_for(DurableEvidenceQuarantineSource, "before_update")
+@event.listens_for(DurableEvidenceQuarantineSource, "before_delete")
 @event.listens_for(DurableEvidenceQuarantineResolution, "before_update")
 @event.listens_for(DurableEvidenceQuarantineResolution, "before_delete")
 def _reject_durable_policy_mutation(*_: object) -> None:

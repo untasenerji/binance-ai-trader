@@ -11,6 +11,7 @@ from app.strategy.backtest import (
     BacktestSignalError,
 )
 from app.strategy.models import Candle, SignalCandidate
+from tests.strategy_factory import make_strategy_lineage
 
 
 def _candle(
@@ -51,8 +52,8 @@ def _signal(
     timeframe: str | None = None,
     valid_until_ms: int | None = None,
 ) -> SignalCandidate:
-    return SignalCandidate(
-        strategy_id="temporal",
+    return SignalCandidate.from_lineage(
+        make_strategy_lineage("temporal"),
         symbol=candle.symbol if symbol is None else symbol,
         direction=Direction.LONG,
         reference_price=candle.close_price,

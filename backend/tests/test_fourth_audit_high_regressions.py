@@ -20,6 +20,7 @@ from app.exchange.contracts import (
     AlgoOrderIntent,
     AlgoOrderType,
     ExchangeAlgoOrderObservation,
+    ExchangeReconciliationObservationBatch,
     LocalReconciliationState,
     ReconciliationOutcome,
     ReconciliationSnapshot,
@@ -38,6 +39,8 @@ from app.planning.fills import (
     ActualRiskPolicy,
     FillEvent,
     FillLedgerError,
+    FillObservationSource,
+    FillSide,
 )
 from app.simulation.intent_ledger import (
     AbsenceEvidenceSource,
@@ -71,6 +74,7 @@ from app.strategy.backtest import (
 )
 from app.strategy.models import Candle, StrategySpecification
 from app.strategy.strategies import VolatilityBreakoutStrategy
+from tests.reconciliation_factory import exchange_reconciliation_batch
 
 
 def _policy(
@@ -143,14 +147,19 @@ def _fill(
     fee: Decimal = Decimal("0"),
 ) -> FillEvent:
     return FillEvent(
+        account_id="v1-primary",
         trade_id=trade_id,
         client_order_id=client_order_id,
+        symbol="BTCUSDT",
+        side=FillSide.BUY,
         last_quantity=last_quantity,
         cumulative_quantity=cumulative_quantity,
         fill_price=fill_price,
         fee=fee,
         fee_asset="USDT",
         occurred_at=datetime(2026, 7, 15, tzinfo=UTC),
+        observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+        observation_reference=f"test:{trade_id}",
     )
 
 
@@ -469,7 +478,7 @@ def test_breaker_rejects_an_audit_repository_subclass_override(
             self,
             *,
             intent_ledger: DurableIntentLedger,
-            reconciliation_snapshot: ReconciliationSnapshot,
+            reconciliation_snapshot: ExchangeReconciliationObservationBatch,
         ) -> PersistenceRecoveryEvidence:
             del intent_ledger, reconciliation_snapshot
             return PersistenceRecoveryEvidence(
@@ -488,10 +497,12 @@ def test_breaker_rejects_an_audit_repository_subclass_override(
         breaker.reset_after_verified_reconciliation(
             audit_repository=forged,
             intent_ledger=ledger,
-            reconciliation_snapshot=ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
+            reconciliation_snapshot=exchange_reconciliation_batch(
+                ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                )
             ),
         )
 
@@ -505,6 +516,7 @@ def test_reconciliation_rejects_wrong_side_stop_for_long_position() -> None:
         server_time=observed_at,
         freshness_window=timedelta(seconds=30),
         correlation_id="wrong-side-stop-observation",
+        query_epoch=1,
         client_algo_id="wrong-side-stop",
         symbol="BTCUSDT",
         direction=Direction.SHORT,
@@ -921,10 +933,12 @@ def test_postgresql_risk_reduction_requirement_survives_restart(
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
     )
     ledger.register_actual_risk_policy(

@@ -12,6 +12,8 @@ from app.domain.types import Direction
 from app.planning.fills import (
     ActualRiskPolicy,
     FillEvent,
+    FillObservationSource,
+    FillSide,
     PositionRiskAssessment,
 )
 from app.simulation.intent_ledger import (
@@ -496,8 +498,22 @@ class ExchangeSimulator:
             raise DurableIntentLedgerRequired("simulated fills require a durable intent ledger")
         self.intent_ledger.record_fill(
             FillEvent(
+                account_id=order.intent.account_id,
                 trade_id=fill.trade_id,
                 client_order_id=order.intent.client_order_id,
+                symbol=order.intent.symbol,
+                side=(
+                    FillSide.BUY
+                    if (
+                        order.intent.role is OrderRole.ENTRY
+                        and order.intent.direction is Direction.LONG
+                    )
+                    or (
+                        order.intent.role is not OrderRole.ENTRY
+                        and order.intent.direction is Direction.SHORT
+                    )
+                    else FillSide.SELL
+                ),
                 last_quantity=fill.last_quantity,
                 cumulative_quantity=fill.cumulative_quantity,
                 fill_price=fill.fill_price,
@@ -507,6 +523,8 @@ class ExchangeSimulator:
                     (self.now_ms + fill.occurred_at_offset_ms) / 1_000,
                     tz=UTC,
                 ),
+                observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+                observation_reference=f"simulator:{fill.trade_id}",
             ),
             materialize_simulated_protection=order.intent.role is OrderRole.ENTRY,
         )

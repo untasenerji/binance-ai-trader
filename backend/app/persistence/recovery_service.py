@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from app.exchange.contracts import ReconciliationSnapshot
+from app.exchange.contracts import ExchangeReconciliationObservationBatch
 from app.persistence.audit import AuditRepository
 from app.persistence.circuit_breaker import PersistenceRecoveryEvidence
 from app.simulation.intent_ledger import DurableIntentLedger
@@ -19,9 +19,13 @@ class PersistenceRecoveryService:
         if type(self.intent_ledger) is not DurableIntentLedger:
             raise TypeError("recovery service requires the concrete durable intent ledger")
 
-    def collect(self, snapshot: ReconciliationSnapshot) -> PersistenceRecoveryEvidence:
-        if type(snapshot) is not ReconciliationSnapshot:
-            raise TypeError("recovery service requires a concrete reconciliation snapshot")
+    def collect(
+        self,
+        snapshot: ExchangeReconciliationObservationBatch,
+    ) -> PersistenceRecoveryEvidence:
+        if type(snapshot) is not ExchangeReconciliationObservationBatch:
+            raise TypeError("recovery service requires a concrete observation batch")
+        snapshot.require_fresh()
         evidence = AuditRepository.collect_persistence_recovery_evidence(
             self.audit_repository,
             intent_ledger=self.intent_ledger,

@@ -3,11 +3,12 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
-from app.strategy.models import SignalCandidate
+from app.strategy.models import SignalCandidate, StrategyLineage
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateGateContext:
+    expected_lineage: StrategyLineage
     risk_allows: bool
     data_is_fresh: bool
     estimated_cost: Decimal
@@ -16,6 +17,8 @@ class CandidateGateContext:
     evaluated_at_ms: int
 
     def __post_init__(self) -> None:
+        if type(self.expected_lineage) is not StrategyLineage:
+            raise TypeError("candidate gate requires exact verified strategy lineage")
         if self.estimated_cost < Decimal("0") or self.max_estimated_cost < Decimal("0"):
             raise ValueError("cost values must not be negative")
         if self.evaluated_at_ms < 0:
@@ -49,6 +52,8 @@ class CandidateGate:
             reason_codes.append("COST_LIMIT_EXCEEDED")
         if signal is not None and signal.valid_until_ms <= context.evaluated_at_ms:
             reason_codes.append("SIGNAL_EXPIRED")
+        if signal is not None and signal.lineage != context.expected_lineage:
+            reason_codes.append("STRATEGY_LINEAGE_MISMATCH")
         if context.expected_net_value <= Decimal("0"):
             reason_codes.append("NON_POSITIVE_EXPECTED_VALUE")
 

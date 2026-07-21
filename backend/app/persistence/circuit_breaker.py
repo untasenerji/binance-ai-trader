@@ -4,7 +4,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from app.exchange.contracts import ReconciliationOutcome, ReconciliationSnapshot
+from app.exchange.contracts import (
+    ExchangeReconciliationObservationBatch,
+    ReconciliationOutcome,
+)
 
 
 class PersistenceUnavailable(RuntimeError):
@@ -147,7 +150,7 @@ class PersistenceCircuitBreaker:
         *,
         audit_repository: object,
         intent_ledger: object,
-        reconciliation_snapshot: ReconciliationSnapshot,
+        reconciliation_snapshot: ExchangeReconciliationObservationBatch,
     ) -> PersistenceRecoveryEvidence:
         from app.persistence.audit import AuditRepository
         from app.persistence.recovery_service import PersistenceRecoveryService
@@ -157,8 +160,9 @@ class PersistenceCircuitBreaker:
             raise TypeError("audit_repository must be the concrete audit repository")
         if type(intent_ledger) is not DurableIntentLedger:
             raise TypeError("intent_ledger must be the concrete durable intent ledger")
-        if type(reconciliation_snapshot) is not ReconciliationSnapshot:
-            raise TypeError("reconciliation_snapshot must be a typed exchange observation")
+        if type(reconciliation_snapshot) is not ExchangeReconciliationObservationBatch:
+            raise TypeError("reconciliation_snapshot must be an exchange observation batch")
+        reconciliation_snapshot.require_fresh()
         try:
             evidence = PersistenceRecoveryService(
                 audit_repository=audit_repository,

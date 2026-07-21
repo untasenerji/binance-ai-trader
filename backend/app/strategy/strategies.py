@@ -1,9 +1,8 @@
 """Deterministic candidate strategies for research and backtesting only."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
-from hashlib import sha256
 from typing import ClassVar
 
 from app.domain.types import Direction
@@ -14,6 +13,9 @@ from app.strategy.models import (
     Strategy,
     StrategyFitResult,
     StrategyKind,
+    StrategyLineage,
+    StrategySpecification,
+    candle_dataset_fingerprint,
 )
 
 _ONE_HUNDRED = Decimal("100")
@@ -36,13 +38,57 @@ def _freeze(
         raise ValueError("strategy fitting requires at least one training candle")
     if any(candle.timeframe != timeframe for candle in training_candles):
         raise ValueError("strategy fitting timeframe does not match its training candles")
-    return FrozenStrategy(
-        strategy_id=strategy.strategy_id,
-        training_candle_count=len(training_candles),
-        training_end_ms=training_candles[-1].close_time_ms,
-        configuration_fingerprint=sha256(repr(strategy).encode()).hexdigest(),
-        evaluator=strategy.evaluate,
+    specification = _specification_for_strategy(strategy)
+    return frozen_strategy_from_fit(
+        StrategyFitResult(
+            specification=specification,
+            training_data_fingerprint=candle_dataset_fingerprint(training_candles),
+            training_candle_count=len(training_candles),
+            training_end_ms=training_candles[-1].close_time_ms,
+            timeframe=timeframe,
+        )
     )
+
+
+def _specification_for_strategy(strategy: Strategy) -> StrategySpecification:
+    if type(strategy) is NoTradeBaseline:
+        return StrategySpecification.no_trade()
+    if type(strategy) is TrendPullbackStrategy:
+        return StrategySpecification.trend_pullback(
+            lookback=strategy.lookback,
+            validity_ms=strategy.validity_ms,
+        )
+    if type(strategy) is VolatilityBreakoutStrategy:
+        return StrategySpecification.volatility_breakout(
+            lookback=strategy.lookback,
+            validity_ms=strategy.validity_ms,
+        )
+    if type(strategy) is MeanReversionStrategy:
+        return StrategySpecification.mean_reversion(
+            lookback=strategy.lookback,
+            validity_ms=strategy.validity_ms,
+            deviation_percent=strategy.deviation_percent,
+        )
+    raise TypeError("only allowlisted built-in strategies can be frozen")
+
+
+def _evaluation_lineage(
+    strategy: Strategy,
+    candles: Sequence[Candle],
+    *,
+    timeframe: str,
+) -> StrategyLineage:
+    series = tuple(candles)
+    if not series:
+        raise ValueError("strategy candidate lineage requires an observed candle history")
+    fit_result = StrategyFitResult(
+        specification=_specification_for_strategy(strategy),
+        training_data_fingerprint=candle_dataset_fingerprint(series),
+        training_candle_count=len(series),
+        training_end_ms=series[-1].close_time_ms,
+        timeframe=timeframe,
+    )
+    return StrategyLineage.from_fit_result(fit_result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +108,7 @@ class TrendPullbackStrategy:
     strategy_id: ClassVar[str] = "trend_pullback_v1"
     lookback: int = 3
     validity_ms: int = 900_000
+    lineage: StrategyLineage | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.lookback < 2 or self.validity_ms <= 0:
@@ -74,8 +121,8 @@ class TrendPullbackStrategy:
         last = window[-1]
         mean_close = _mean([candle.close_price for candle in window[:-1]])
         if last.close_price > mean_close and last.low_price <= mean_close:
-            return SignalCandidate(
-                strategy_id=self.strategy_id,
+            return SignalCandidate.from_lineage(
+                self.lineage or _evaluation_lineage(self, candles, timeframe=timeframe),
                 symbol=last.symbol,
                 direction=Direction.LONG,
                 reference_price=last.close_price,
@@ -95,6 +142,7 @@ class VolatilityBreakoutStrategy:
     strategy_id: ClassVar[str] = "volatility_breakout_v1"
     lookback: int = 3
     validity_ms: int = 900_000
+    lineage: StrategyLineage | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.lookback < 2 or self.validity_ms <= 0:
@@ -108,8 +156,8 @@ class VolatilityBreakoutStrategy:
         previous_high = max(candle.high_price for candle in previous)
         previous_low = min(candle.low_price for candle in previous)
         if last.close_price > previous_high:
-            return SignalCandidate(
-                strategy_id=self.strategy_id,
+            return SignalCandidate.from_lineage(
+                self.lineage or _evaluation_lineage(self, candles, timeframe=timeframe),
                 symbol=last.symbol,
                 direction=Direction.LONG,
                 reference_price=last.close_price,
@@ -119,8 +167,8 @@ class VolatilityBreakoutStrategy:
                 reason_codes=("UPSIDE_BREAKOUT",),
             )
         if last.close_price < previous_low:
-            return SignalCandidate(
-                strategy_id=self.strategy_id,
+            return SignalCandidate.from_lineage(
+                self.lineage or _evaluation_lineage(self, candles, timeframe=timeframe),
                 symbol=last.symbol,
                 direction=Direction.SHORT,
                 reference_price=last.close_price,
@@ -141,6 +189,7 @@ class MeanReversionStrategy:
     lookback: int = 3
     deviation_percent: Decimal = Decimal("2")
     validity_ms: int = 900_000
+    lineage: StrategyLineage | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.lookback < 2 or self.deviation_percent <= Decimal("0") or self.validity_ms <= 0:
@@ -155,8 +204,8 @@ class MeanReversionStrategy:
         lower_band = mean_close * (_ONE_HUNDRED - self.deviation_percent) / _ONE_HUNDRED
         upper_band = mean_close * (_ONE_HUNDRED + self.deviation_percent) / _ONE_HUNDRED
         if last.close_price < lower_band:
-            return SignalCandidate(
-                strategy_id=self.strategy_id,
+            return SignalCandidate.from_lineage(
+                self.lineage or _evaluation_lineage(self, candles, timeframe=timeframe),
                 symbol=last.symbol,
                 direction=Direction.LONG,
                 reference_price=last.close_price,
@@ -166,8 +215,8 @@ class MeanReversionStrategy:
                 reason_codes=("LOWER_BAND_DEVIATION",),
             )
         if last.close_price > upper_band:
-            return SignalCandidate(
-                strategy_id=self.strategy_id,
+            return SignalCandidate.from_lineage(
+                self.lineage or _evaluation_lineage(self, candles, timeframe=timeframe),
                 symbol=last.symbol,
                 direction=Direction.SHORT,
                 reference_price=last.close_price,
@@ -189,6 +238,7 @@ def frozen_strategy_from_fit(result: StrategyFitResult) -> FrozenStrategy:
     result.verify_fingerprint()
     specification = result.specification
     specification.verify_fingerprint()
+    lineage = StrategyLineage.from_fit_result(result)
     if specification.kind is StrategyKind.NO_TRADE_BASELINE:
         trainer: Strategy = NoTradeBaseline()
     elif specification.kind is StrategyKind.TREND_PULLBACK:
@@ -197,6 +247,7 @@ def frozen_strategy_from_fit(result: StrategyFitResult) -> FrozenStrategy:
         trainer = TrendPullbackStrategy(
             lookback=specification.lookback,
             validity_ms=specification.validity_ms,
+            lineage=lineage,
         )
     elif specification.kind is StrategyKind.VOLATILITY_BREAKOUT:
         assert specification.lookback is not None
@@ -204,6 +255,7 @@ def frozen_strategy_from_fit(result: StrategyFitResult) -> FrozenStrategy:
         trainer = VolatilityBreakoutStrategy(
             lookback=specification.lookback,
             validity_ms=specification.validity_ms,
+            lineage=lineage,
         )
     else:
         assert specification.kind is StrategyKind.MEAN_REVERSION
@@ -214,11 +266,8 @@ def frozen_strategy_from_fit(result: StrategyFitResult) -> FrozenStrategy:
             lookback=specification.lookback,
             validity_ms=specification.validity_ms,
             deviation_percent=specification.deviation_percent,
+            lineage=lineage,
         )
-    return FrozenStrategy(
-        strategy_id=trainer.strategy_id,
-        training_candle_count=result.training_candle_count,
-        training_end_ms=result.training_end_ms,
-        configuration_fingerprint=specification.fingerprint,
-        evaluator=trainer.evaluate,
-    )
+    if trainer.strategy_id != result.strategy_id:
+        raise ValueError("fit result strategy identity does not match the registry evaluator")
+    return FrozenStrategy(fit_result=result, evaluator=trainer.evaluate)

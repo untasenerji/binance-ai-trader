@@ -30,7 +30,13 @@ from app.persistence.models import (
     DurableOrderIntent,
 )
 from app.persistence.replay import ReplayRunner
-from app.planning.fills import AccountPortfolioEnvelope, ActualRiskPolicy, FillEvent
+from app.planning.fills import (
+    AccountPortfolioEnvelope,
+    ActualRiskPolicy,
+    FillEvent,
+    FillObservationSource,
+    FillSide,
+)
 from app.simulation.intent_ledger import (
     BoundedAbsenceEvidenceError,
     ClientOrderNamespace,
@@ -60,6 +66,8 @@ from app.strategy.backtest import (
     WalkForwardTrainingError,
 )
 from app.strategy.models import Candle, FrozenStrategy, SignalCandidate
+from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.strategy_factory import make_frozen_strategy, make_strategy_lineage
 
 
 def _policy(
@@ -130,14 +138,19 @@ def _fill(
     price: Decimal,
 ) -> FillEvent:
     return FillEvent(
+        account_id="v1-primary",
         trade_id=trade_id,
         client_order_id=client_order_id,
+        symbol="BTCUSDT",
+        side=FillSide.BUY,
         last_quantity=quantity,
         cumulative_quantity=quantity,
         fill_price=price,
         fee=Decimal("0"),
         fee_asset="USDT",
         occurred_at=datetime(2026, 7, 15, tzinfo=UTC),
+        observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+        observation_reference=f"test:{trade_id}",
     )
 
 
@@ -415,8 +428,8 @@ class _GlobalsBypassTrainer:
             last = evaluation_candles[-1]
             if last.close_price <= threshold:
                 return None
-            return SignalCandidate(
-                strategy_id=self.strategy_id,
+            return SignalCandidate.from_lineage(
+                make_strategy_lineage(self.strategy_id),
                 symbol=last.symbol,
                 direction=Direction.LONG,
                 reference_price=last.close_price,
@@ -426,13 +439,7 @@ class _GlobalsBypassTrainer:
                 reason_codes=("UNSAFE_GLOBAL",),
             )
 
-        return FrozenStrategy(
-            strategy_id=self.strategy_id,
-            training_candle_count=len(candles),
-            training_end_ms=candles[-1].close_time_ms,
-            configuration_fingerprint="unsafe-global",
-            evaluator=evaluate,
-        )
+        return make_frozen_strategy(candles, evaluate)
 
 
 def _candles() -> tuple[Candle, ...]:
@@ -519,6 +526,7 @@ def test_reconciliation_matches_durable_expected_algo_stop(
         server_time=observed_at,
         freshness_window=timedelta(seconds=30),
         correlation_id=f"{plan_id}-reconciliation-query",
+        query_epoch=1,
         client_algo_id=contract.client_algo_id,
         symbol=contract.symbol,
         direction=contract.position_side,
@@ -657,10 +665,12 @@ def _assert_populated_0008_upgrade(
         evidence = breaker.reset_after_verified_reconciliation(
             audit_repository=repository,
             intent_ledger=ledger,
-            reconciliation_snapshot=ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
+            reconciliation_snapshot=exchange_reconciliation_batch(
+                ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                )
             ),
         )
         assert evidence.is_complete
@@ -701,10 +711,12 @@ def test_sqlite_populated_0008_null_query_provenance_stays_quarantined(tmp_path:
             breaker.reset_after_verified_reconciliation(
                 audit_repository=repository,
                 intent_ledger=ledger,
-                reconciliation_snapshot=ReconciliationSnapshot(
-                    positions_by_symbol={},
-                    normal_order_client_ids=frozenset(),
-                    algo_order_client_ids=frozenset(),
+                reconciliation_snapshot=exchange_reconciliation_batch(
+                    ReconciliationSnapshot(
+                        positions_by_symbol={},
+                        normal_order_client_ids=frozenset(),
+                        algo_order_client_ids=frozenset(),
+                    )
                 ),
             )
     finally:
@@ -785,10 +797,12 @@ def test_postgresql_populated_0008_null_query_provenance_stays_quarantined(
             breaker.reset_after_verified_reconciliation(
                 audit_repository=repository,
                 intent_ledger=ledger,
-                reconciliation_snapshot=ReconciliationSnapshot(
-                    positions_by_symbol={},
-                    normal_order_client_ids=frozenset(),
-                    algo_order_client_ids=frozenset(),
+                reconciliation_snapshot=exchange_reconciliation_batch(
+                    ReconciliationSnapshot(
+                        positions_by_symbol={},
+                        normal_order_client_ids=frozenset(),
+                        algo_order_client_ids=frozenset(),
+                    )
                 ),
             )
     finally:

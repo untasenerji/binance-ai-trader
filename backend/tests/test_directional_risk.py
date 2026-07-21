@@ -17,6 +17,7 @@ from app.planning.risk import (
     solve_ladder,
     worst_case_price_projection,
 )
+from tests.strategy_factory import make_strategy_lineage
 
 
 @pytest.fixture
@@ -120,6 +121,7 @@ def test_rounding_that_crosses_the_stop_fails_closed(
     filters: SymbolFilters, costs: CostAssumptions
 ) -> None:
     plan = solve_ladder(
+        strategy_lineage=make_strategy_lineage("directional-risk"),
         direction=Direction.LONG,
         blueprints=(StageBlueprint(index=1, entry_price=Decimal("100.01"), weight=Decimal("1")),),
         stop_price=Decimal("100.11"),

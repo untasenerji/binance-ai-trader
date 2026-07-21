@@ -12,6 +12,7 @@ from app.strategy.models import (
     StrategySpecification,
     TrainableStrategy,
 )
+from tests.strategy_factory import make_frozen_strategy, make_strategy_lineage
 
 
 def _candle(index: int, close_price: Decimal | None = None) -> Candle:
@@ -30,8 +31,8 @@ def _candle(index: int, close_price: Decimal | None = None) -> Candle:
 
 
 def _signal(candle: Candle) -> SignalCandidate:
-    return SignalCandidate(
-        strategy_id="stateful",
+    return SignalCandidate.from_lineage(
+        make_strategy_lineage("stateful"),
         symbol=candle.symbol,
         direction=Direction.LONG,
         reference_price=candle.close_price,
@@ -64,13 +65,7 @@ class StatefulPoisonStrategy:
         return None
 
     def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
-        return FrozenStrategy(
-            strategy_id=self.strategy_id,
-            training_candle_count=len(candles),
-            training_end_ms=candles[-1].close_time_ms,
-            configuration_fingerprint="stateful-poison-v1",
-            evaluator=self.evaluate,
-        )
+        return make_frozen_strategy(candles, self.evaluate)
 
 
 class ExternalMutationStrategy:
@@ -88,13 +83,7 @@ class ExternalMutationStrategy:
 
     def fit(self, candles: Sequence[Candle], *, timeframe: str) -> FrozenStrategy:
         del timeframe
-        return FrozenStrategy(
-            strategy_id=self.strategy_id,
-            training_candle_count=len(candles),
-            training_end_ms=candles[-1].close_time_ms,
-            configuration_fingerprint="external-mutation-v1",
-            evaluator=self.evaluate,
-        )
+        return make_frozen_strategy(candles, self.evaluate)
 
 
 def test_walk_forward_uses_one_frozen_specification_and_global_entry_indexes() -> None:

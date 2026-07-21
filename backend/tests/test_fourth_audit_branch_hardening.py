@@ -33,6 +33,8 @@ from app.persistence.recovery_service import PersistenceRecoveryService
 from app.planning.fills import (
     FillEvent,
     FillLedgerError,
+    FillObservationSource,
+    FillSide,
     PositionQuantityMismatch,
     evaluate_simulated_position_risk,
 )
@@ -43,6 +45,7 @@ from app.simulation.intent_ledger import (
     DurableIntentLedger,
     UnknownIntentObservation,
 )
+from tests.reconciliation_factory import exchange_reconciliation_batch
 
 
 def _normal_order(**overrides: object) -> NormalOrderIntent:
@@ -126,6 +129,7 @@ def _exchange_algo(**overrides: object) -> ExchangeAlgoOrderObservation:
         "server_time": now,
         "freshness_window": timedelta(seconds=30),
         "correlation_id": "branch-reconciliation-query",
+        "query_epoch": 1,
         "client_algo_id": "algo-branch",
         "symbol": "BTCUSDT",
         "direction": Direction.LONG,
@@ -322,14 +326,19 @@ def test_reconciliation_records_reject_ambiguous_or_untyped_content() -> None:
 
 def _fill(**overrides: object) -> FillEvent:
     values: dict[str, object] = {
+        "account_id": "v1-primary",
         "trade_id": "fill-branch",
         "client_order_id": "entry-branch",
+        "symbol": "BTCUSDT",
+        "side": FillSide.BUY,
         "last_quantity": Decimal("0.01"),
         "cumulative_quantity": Decimal("0.01"),
         "fill_price": Decimal("100"),
         "fee": Decimal("0"),
         "fee_asset": "USDT",
         "occurred_at": datetime(2026, 7, 15, tzinfo=UTC),
+        "observation_source": FillObservationSource.SIMULATED_EXCHANGE,
+        "observation_reference": "test:fill-branch",
     }
     values.update(overrides)
     return FillEvent(**cast(Any, values))
@@ -458,7 +467,7 @@ def test_recovery_service_rejects_substituted_inputs_and_output(
         audit_repository=repository,
         intent_ledger=durable_intent_ledger,
     )
-    with pytest.raises(TypeError, match="concrete reconciliation snapshot"):
+    with pytest.raises(TypeError, match="concrete observation batch"):
         service.collect(cast(Any, object()))
 
     def invalid_evidence(*args: object, **kwargs: object) -> object:
@@ -471,9 +480,11 @@ def test_recovery_service_rejects_substituted_inputs_and_output(
     )
     with pytest.raises(TypeError, match="invalid persistence evidence"):
         service.collect(
-            ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
+            exchange_reconciliation_batch(
+                ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                )
             )
         )

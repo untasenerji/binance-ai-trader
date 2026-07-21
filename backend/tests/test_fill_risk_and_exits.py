@@ -17,6 +17,8 @@ from app.planning.exits import build_exit_plan
 from app.planning.fills import (
     FillEvent,
     FillLedger,
+    FillObservationSource,
+    FillSide,
     PositionQuantityMismatch,
     evaluate_confirmed_position_risk,
 )
@@ -46,14 +48,19 @@ def _fill(
     occurred_at: datetime,
 ) -> FillEvent:
     return FillEvent(
+        account_id="v1-primary",
         trade_id=trade_id,
         client_order_id="entry-1",
+        symbol="BTCUSDT",
+        side=FillSide.BUY,
         last_quantity=last_quantity,
         cumulative_quantity=cumulative_quantity,
         fill_price=price,
         fee=fee,
         fee_asset="USDT",
         occurred_at=occurred_at,
+        observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+        observation_reference=f"test:{trade_id}",
     )
 
 

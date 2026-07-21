@@ -21,6 +21,7 @@ from app.persistence.audit import AuditDeliveryStatus, AuditRepository
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner, WalkForwardTrainingError
 from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, TrainableStrategy
+from tests.strategy_factory import make_frozen_strategy, make_strategy_lineage
 
 _POSTGRES_ADMIN_URL = "postgresql+psycopg://postgres@127.0.0.1:5432/uta"
 _POSTGRES_RUNTIME_URL = "postgresql+psycopg://uta_runtime@127.0.0.1:5432/uta"
@@ -67,8 +68,8 @@ class HeldOutDataTrainer:
             last = evaluation_candles[-1]
             if last.close_price <= future_threshold:
                 return None
-            return SignalCandidate(
-                strategy_id=self.strategy_id,
+            return SignalCandidate.from_lineage(
+                make_strategy_lineage(self.strategy_id),
                 symbol=last.symbol,
                 direction=Direction.LONG,
                 reference_price=last.close_price,
@@ -78,13 +79,7 @@ class HeldOutDataTrainer:
                 reason_codes=("ILLEGAL_HELD_OUT_THRESHOLD",),
             )
 
-        return FrozenStrategy(
-            strategy_id=self.strategy_id,
-            training_candle_count=len(candles),
-            training_end_ms=candles[-1].close_time_ms,
-            configuration_fingerprint=f"future-threshold:{future_threshold}",
-            evaluator=evaluate,
-        )
+        return make_frozen_strategy(candles, evaluate)
 
 
 def test_walk_forward_rejects_a_trainer_that_retains_held_out_market_data() -> None:

@@ -13,6 +13,7 @@ from app.strategy.models import (
     StrategySpecification,
     TrainableStrategy,
 )
+from tests.strategy_factory import make_frozen_strategy
 
 
 def _candle(index: int) -> Candle:
@@ -44,13 +45,8 @@ def _frozen(
         del evaluation_candles, timeframe
         return None
 
-    return FrozenStrategy(
-        strategy_id=strategy_id,
-        training_candle_count=len(candles),
-        training_end_ms=candles[-1].close_time_ms,
-        configuration_fingerprint=fingerprint,
-        evaluator=evaluate,
-    )
+    del strategy_id, fingerprint
+    return make_frozen_strategy(candles, evaluate)
 
 
 def _costs() -> BacktestCosts:

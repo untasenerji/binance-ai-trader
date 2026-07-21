@@ -1,7 +1,6 @@
 from decimal import Decimal
 
 import pytest
-from conftest import actual_risk_policy_for
 
 from app.domain.types import Direction
 from app.simulation.failure import FailureAction, FailureCoordinator
@@ -25,6 +24,7 @@ from app.simulation.simulator import (
     SpreadSlippageModel,
     UnknownOrderOutcome,
 )
+from tests.conftest import actual_risk_policy_for
 
 
 def _intent(

@@ -32,6 +32,8 @@ from app.planning.fills import (
     ExposureSourceState,
     FillEvent,
     FillLedgerError,
+    FillObservationSource,
+    FillSide,
     PortfolioExposureSlice,
 )
 from app.simulation.intent_ledger import (
@@ -59,6 +61,7 @@ from app.simulation.simulator import (
     SimulatedUnknownRemoteState,
     UnknownOrderOutcome,
 )
+from tests.reconciliation_factory import exchange_reconciliation_batch
 
 
 @pytest.fixture
@@ -259,14 +262,19 @@ def _fill(
     fee: Decimal,
 ) -> FillEvent:
     return FillEvent(
+        account_id="v1-primary",
         trade_id=trade_id,
         client_order_id=client_order_id,
+        symbol="BTCUSDT",
+        side=FillSide.BUY,
         last_quantity=last_quantity,
         cumulative_quantity=cumulative_quantity,
         fill_price=fill_price,
         fee=fee,
         fee_asset="USDT",
         occurred_at=datetime(2026, 7, 14, tzinfo=UTC),
+        observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+        observation_reference=f"test:{trade_id}",
     )
 
 
@@ -401,10 +409,12 @@ def test_breaker_derives_reconciliation_from_repository_ledger_and_algo_stop_rec
     evidence = breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
     )
 
@@ -659,10 +669,12 @@ def test_postgresql_restart_rebuilds_durable_short_risk_and_blocks_follow_on_ent
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
     )
     plan_id = "postgresql-short-restart"

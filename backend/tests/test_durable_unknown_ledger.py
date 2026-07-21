@@ -6,7 +6,6 @@ from threading import Barrier
 from typing import Any
 
 import pytest
-from conftest import actual_risk_policy_for
 from sqlalchemy import event
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.unitofwork import UOWTransaction
@@ -40,6 +39,8 @@ from app.simulation.simulator import (
     SimulatedUnknownRemoteState,
     UnknownOrderOutcome,
 )
+from tests.conftest import actual_risk_policy_for
+from tests.reconciliation_factory import exchange_reconciliation_batch
 
 
 @pytest.fixture
@@ -56,10 +57,12 @@ def _open_ledger(session_factory: sessionmaker[Session]) -> DurableIntentLedger:
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
+        reconciliation_snapshot=exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
         ),
     )
     return ledger

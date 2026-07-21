@@ -101,6 +101,7 @@ def _algo_order(
         server_time=observed_at,
         freshness_window=timedelta(seconds=30),
         correlation_id=f"reconciliation-{client_algo_id}",
+        query_epoch=1,
         client_algo_id=client_algo_id,
         symbol=symbol,
         direction=Direction.LONG,

@@ -329,6 +329,7 @@ def test_exchange_stop_observation_requires_fresh_authenticated_provenance() -> 
         server_time=now,
         freshness_window=timedelta(seconds=30),
         correlation_id="reconciliation-query-1",
+        query_epoch=1,
         client_algo_id=contract.client_algo_id,
         symbol=contract.symbol,
         direction=contract.position_side,
@@ -373,7 +374,7 @@ def test_portfolio_exposure_rejects_an_untyped_direction() -> None:
     (
         ({"source": "operator"}, "durable reconciliation identity"),
         ({"observed_at": datetime(2026, 7, 16, 12, 0)}, "timezone-aware"),
-        ({"observed_at": datetime.now(UTC) + timedelta(minutes=1)}, "future"),
+        ({"observed_at": timedelta(minutes=1)}, "future"),
         ({"fingerprint": "0" * 64}, "fingerprint is invalid"),
     ),
 )
@@ -390,6 +391,8 @@ def test_quarantine_resolution_evidence_rejects_unverifiable_provenance(
         "observed_at": datetime.now(UTC),
     }
     baseline.update(kwargs)
+    if isinstance(baseline["observed_at"], timedelta):
+        baseline["observed_at"] = datetime.now(UTC) + baseline["observed_at"]
 
     with pytest.raises(ValueError, match=message):
         VerifiedQuarantineResolutionEvidence(**baseline)  # type: ignore[arg-type]

@@ -2,7 +2,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from conftest import actual_risk_policy_for
 
 from app.domain.types import Direction
 from app.exchange.contracts import (
@@ -10,7 +9,7 @@ from app.exchange.contracts import (
     ReconciliationSnapshot,
     reconcile_local_state,
 )
-from app.planning.fills import FillEvent, FillLedger
+from app.planning.fills import FillEvent, FillLedger, FillObservationSource, FillSide
 from app.simulation.failure import FailureCoordinator
 from app.simulation.intent_ledger import DurableIntentLedger, DurableIntentStatus
 from app.simulation.models import (
@@ -27,6 +26,7 @@ from app.simulation.simulator import (
     FillSequencePlan,
     UnknownOrderOutcome,
 )
+from tests.conftest import actual_risk_policy_for
 
 
 def _intent(client_order_id: str = "matrix-entry") -> SimulatedOrderIntent:
@@ -46,14 +46,19 @@ def _as_fill(event_trade_id: str, event: SimulatorEvent) -> FillEvent:
     if event.fill_price is None or event.fee_asset is None:
         raise AssertionError("simulated trade event must carry price and fee asset")
     return FillEvent(
+        account_id="v1-primary",
         trade_id=event_trade_id,
         client_order_id=event.client_order_id,
+        symbol="BTCUSDT",
+        side=FillSide.BUY,
         last_quantity=event.last_filled_quantity,
         cumulative_quantity=event.cumulative_filled_quantity,
         fill_price=event.fill_price,
         fee=event.fee,
         fee_asset=event.fee_asset,
         occurred_at=datetime(2026, 7, 12, tzinfo=UTC),
+        observation_source=FillObservationSource.SIMULATED_EXCHANGE,
+        observation_reference=f"test:{event_trade_id}",
     )
 
 
@@ -114,7 +119,7 @@ def test_configurable_fill_sequence_keeps_delta_cumulative_financial_invariants(
     )
 
 
-def test_partial_fill_cancel_keeps_known_partial_quantity_across_restart_boundary(
+def test_partial_fill_restart_fences_remainder_and_keeps_known_quantity(
     durable_intent_ledger: DurableIntentLedger,
 ) -> None:
     simulator = ExchangeSimulator(
@@ -139,7 +144,7 @@ def test_partial_fill_cancel_keeps_known_partial_quantity_across_restart_boundar
     assert order.status is SimulatedOrderStatus.PARTIALLY_FILLED
     assert order.filled_quantity == Decimal("0.005")
     restarted_ledger = durable_intent_ledger.reopen_after_restart()
-    assert restarted_ledger.intent("partial-entry").status is DurableIntentStatus.PARTIALLY_FILLED
+    assert restarted_ledger.intent("partial-entry").status is DurableIntentStatus.CANCEL_REQUIRED
     assert restarted_ledger.intent("partial-entry").filled_quantity == Decimal("0.005")
     cancelled = simulator.cancel("partial-entry")
 

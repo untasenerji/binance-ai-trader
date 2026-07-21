@@ -43,6 +43,7 @@ def _install_audit_append_only_guards(engine: Engine) -> None:
                 "durable_portfolio_envelope_heads",
                 "durable_portfolio_envelope_supersessions",
                 "durable_evidence_quarantines",
+                "durable_evidence_quarantine_sources",
                 "durable_evidence_quarantine_resolutions",
             ):
                 for operation in ("update", "delete"):
@@ -105,6 +106,10 @@ def _install_audit_append_only_guards(engine: Engine) -> None:
                 (
                     "durable_evidence_quarantines",
                     "prevent_durable_evidence_quarantines_mutation",
+                ),
+                (
+                    "durable_evidence_quarantine_sources",
+                    "prevent_durable_evidence_quarantine_sources_mutation",
                 ),
                 (
                     "durable_evidence_quarantine_resolutions",
