@@ -76,3 +76,12 @@
 - Published `0009` and prior forward-only `0011` migrations remain byte-identical to HEAD; new migration behavior is forward-only in `0012_account_scope_safety.py`.
 - Hosted GitHub Actions and external `live_public` remain **NOT VERIFIED**. No API key, signer, authenticated transport, testnet path, test order, or live-order path was added.
 - Phase 14 remains **LOCKED**.
+
+## Eighth Independent Audit Remediation
+
+- Base revision: `6da4819bbf8c0fe3fdbd78977d222f299fcf1bc3`; implementation checkpoint: `7303fc54a44b3337f03599b2d3f8e69d649d84e5` (`fix: remediate eighth independent audit findings`).
+- `docs/EIGHTH_AUDIT_REMEDIATION_REPORT.md` records red-first closure evidence for all reported HIGH, MEDIUM, and migration-hardening findings.
+- Local validation: 474 non-PostgreSQL tests and 50 real-PostgreSQL tests passed; combined coverage is 82.71% and true application branch coverage is 67.72% (`1376/2032`).
+- Published `0009`, `0011`, and `0012` migrations remain byte-identical to their checkpoint HEAD blobs; all new migration behavior is forward-only in `0013_execution_safety_core.py`.
+- Hosted GitHub Actions and external `live_public` remain **NOT VERIFIED**. No API key, signer, authenticated transport, testnet path, test order, or live-order path was added.
+- Phase 14 remains **LOCKED**.
