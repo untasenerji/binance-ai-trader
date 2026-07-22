@@ -22,7 +22,10 @@ from app.persistence.circuit_breaker import (
 )
 from app.persistence.database import create_database_engine, create_schema, create_session_factory
 from app.simulation.intent_ledger import DurableIntentLedger
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 
 @pytest.fixture
@@ -67,6 +70,12 @@ def _clean_reconciliation_snapshot() -> ExchangeReconciliationObservationBatch:
     )
 
 
+def _persisted_clean_reconciliation_snapshot(
+    ledger: DurableIntentLedger,
+) -> ExchangeReconciliationObservationBatch:
+    return persist_reconciliation_query_receipt(ledger, _clean_reconciliation_snapshot())
+
+
 def _clean_reconciliation_outcome() -> ReconciliationOutcome:
     snapshot = _clean_reconciliation_snapshot()
     return reconcile_local_state(
@@ -99,7 +108,7 @@ def _open_breaker(
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=_clean_reconciliation_snapshot(),
+        reconciliation_snapshot=_persisted_clean_reconciliation_snapshot(ledger),
     )
     return breaker, ledger, repository
 
@@ -112,17 +121,21 @@ def test_breaker_starts_fail_closed_and_only_repository_derived_evidence_opens_i
     with pytest.raises(PersistenceUnavailable, match="STARTUP_RECONCILIATION_REQUIRED"):
         breaker.require_new_entries_allowed()
 
+    incomplete_batch = persist_reconciliation_query_receipt(
+        ledger,
+        exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset({"unexpected-normal"}),
+                algo_order_client_ids=frozenset(),
+            )
+        ),
+    )
     with pytest.raises(PersistenceUnavailable, match="RECOVERY_EVIDENCE_INCOMPLETE"):
         breaker.reset_after_verified_reconciliation(
             audit_repository=repository,
             intent_ledger=ledger,
-            reconciliation_snapshot=exchange_reconciliation_batch(
-                ReconciliationSnapshot(
-                    positions_by_symbol={},
-                    normal_order_client_ids=frozenset({"unexpected-normal"}),
-                    algo_order_client_ids=frozenset(),
-                )
-            ),
+            reconciliation_snapshot=incomplete_batch,
         )
 
     with pytest.raises(TypeError):
@@ -133,7 +146,7 @@ def test_breaker_starts_fail_closed_and_only_repository_derived_evidence_opens_i
     evidence = breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=_clean_reconciliation_snapshot(),
+        reconciliation_snapshot=_persisted_clean_reconciliation_snapshot(ledger),
     )
     assert evidence.write_probe_event_id.startswith("persistence-recovery-probe-")
     assert evidence.replay_valid
@@ -201,7 +214,7 @@ def test_breaker_remains_halted_when_repository_recovery_collection_fails(
         breaker.reset_after_verified_reconciliation(
             audit_repository=repository,
             intent_ledger=ledger,
-            reconciliation_snapshot=_clean_reconciliation_snapshot(),
+            reconciliation_snapshot=_persisted_clean_reconciliation_snapshot(ledger),
         )
 
     assert not breaker.new_entries_allowed
@@ -324,7 +337,7 @@ def test_restart_remains_closed_until_repository_evidence_is_recomputed(
     restarted_breaker.reset_after_verified_reconciliation(
         audit_repository=restarted_repository,
         intent_ledger=restarted_ledger,
-        reconciliation_snapshot=_clean_reconciliation_snapshot(),
+        reconciliation_snapshot=_persisted_clean_reconciliation_snapshot(restarted_ledger),
     )
 
     assert restarted_breaker.new_entries_allowed

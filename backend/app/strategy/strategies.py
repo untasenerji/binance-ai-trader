@@ -11,6 +11,7 @@ from app.strategy.models import (
     FrozenStrategy,
     SignalCandidate,
     Strategy,
+    StrategyEvaluator,
     StrategyFitResult,
     StrategyKind,
     StrategyLineage,
@@ -236,6 +237,14 @@ def frozen_strategy_from_fit(result: StrategyFitResult) -> FrozenStrategy:
     if type(result) is not StrategyFitResult:
         raise TypeError("walk-forward execution requires an exact fit result")
     result.verify_fingerprint()
+    return FrozenStrategy(fit_result=result)
+
+
+def _registry_evaluator_for_fit(result: StrategyFitResult) -> StrategyEvaluator:
+    """Build the evaluator selected by ``StrategyImplementationRegistry`` only."""
+    if type(result) is not StrategyFitResult:
+        raise TypeError("registry evaluator requires an exact fit result")
+    result.verify_fingerprint()
     specification = result.specification
     specification.verify_fingerprint()
     lineage = StrategyLineage.from_fit_result(result)
@@ -270,4 +279,4 @@ def frozen_strategy_from_fit(result: StrategyFitResult) -> FrozenStrategy:
         )
     if trainer.strategy_id != result.strategy_id:
         raise ValueError("fit result strategy identity does not match the registry evaluator")
-    return FrozenStrategy(fit_result=result, evaluator=trainer.evaluate)
+    return trainer.evaluate

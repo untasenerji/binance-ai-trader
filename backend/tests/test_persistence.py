@@ -15,7 +15,10 @@ from app.persistence.database import create_database_engine, create_schema, crea
 from app.persistence.models import AppendOnlyViolation, AuditEvent
 from app.persistence.replay import ReplayRunner, reconcile_projection
 from app.simulation.intent_ledger import DurableIntentLedger
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 
 @pytest.fixture
@@ -117,16 +120,20 @@ def test_database_failure_blocks_new_entries_until_reconciliation(
     with pytest.raises(PersistenceUnavailable, match="DATABASE_AUDIT_FAILURE"):
         breaker.require_new_entries_allowed()
 
-    breaker.reset_after_verified_reconciliation(
-        audit_repository=repository,
-        intent_ledger=ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
+    batch = persist_reconciliation_query_receipt(
+        ledger,
+        exchange_reconciliation_batch(
             ReconciliationSnapshot(
                 positions_by_symbol={},
                 normal_order_client_ids=frozenset(),
                 algo_order_client_ids=frozenset(),
             )
         ),
+    )
+    breaker.reset_after_verified_reconciliation(
+        audit_repository=repository,
+        intent_ledger=ledger,
+        reconciliation_snapshot=batch,
     )
     breaker.require_new_entries_allowed()
 

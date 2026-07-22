@@ -34,7 +34,10 @@ from app.planning.fills import (
 )
 from app.simulation.intent_ledger import DurableIntentLedger, DurableIntentStatus
 from app.simulation.models import OrderRole, SimulatedOrderIntent
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 ACCOUNT_ID = "v1-primary"
 
@@ -224,10 +227,9 @@ def test_revocation_append_failure_still_fences_the_old_grant_after_restart(
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
-    breaker.reset_after_verified_reconciliation(
-        audit_repository=repository,
-        intent_ledger=ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
+    snapshot = persist_reconciliation_query_receipt(
+        ledger,
+        exchange_reconciliation_batch(
             ReconciliationSnapshot(
                 account_id=ACCOUNT_ID,
                 positions_by_symbol={},
@@ -235,6 +237,11 @@ def test_revocation_append_failure_still_fences_the_old_grant_after_restart(
                 algo_order_client_ids=frozenset(),
             )
         ),
+    )
+    breaker.reset_after_verified_reconciliation(
+        audit_repository=repository,
+        intent_ledger=ledger,
+        reconciliation_snapshot=snapshot,
     )
 
     def fail_revocation_append(phase: str) -> None:

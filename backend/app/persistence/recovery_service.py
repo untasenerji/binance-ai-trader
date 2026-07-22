@@ -25,6 +25,7 @@ class PersistenceRecoveryService:
     ) -> PersistenceRecoveryEvidence:
         if type(snapshot) is not ExchangeReconciliationObservationBatch:
             raise TypeError("recovery service requires a concrete observation batch")
+        self.intent_ledger.validate_reconciliation_observation(snapshot)
         snapshot.require_fresh()
         evidence = AuditRepository.collect_persistence_recovery_evidence(
             self.audit_repository,

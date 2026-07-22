@@ -45,7 +45,10 @@ from app.simulation.intent_ledger import (
     DurableIntentLedger,
     UnknownIntentObservation,
 )
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 
 def _normal_order(**overrides: object) -> NormalOrderIntent:
@@ -470,6 +473,17 @@ def test_recovery_service_rejects_substituted_inputs_and_output(
     with pytest.raises(TypeError, match="concrete observation batch"):
         service.collect(cast(Any, object()))
 
+    batch = persist_reconciliation_query_receipt(
+        durable_intent_ledger,
+        exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
+        ),
+    )
+
     def invalid_evidence(*args: object, **kwargs: object) -> object:
         return object()
 
@@ -479,12 +493,4 @@ def test_recovery_service_rejects_substituted_inputs_and_output(
         invalid_evidence,
     )
     with pytest.raises(TypeError, match="invalid persistence evidence"):
-        service.collect(
-            exchange_reconciliation_batch(
-                ReconciliationSnapshot(
-                    positions_by_symbol={},
-                    normal_order_client_ids=frozenset(),
-                    algo_order_client_ids=frozenset(),
-                )
-            )
-        )
+        service.collect(batch)

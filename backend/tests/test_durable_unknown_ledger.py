@@ -40,7 +40,10 @@ from app.simulation.simulator import (
     UnknownOrderOutcome,
 )
 from tests.conftest import actual_risk_policy_for
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 
 @pytest.fixture
@@ -54,16 +57,20 @@ def _open_ledger(session_factory: sessionmaker[Session]) -> DurableIntentLedger:
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
-    breaker.reset_after_verified_reconciliation(
-        audit_repository=repository,
-        intent_ledger=ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
+    batch = persist_reconciliation_query_receipt(
+        ledger,
+        exchange_reconciliation_batch(
             ReconciliationSnapshot(
                 positions_by_symbol={},
                 normal_order_client_ids=frozenset(),
                 algo_order_client_ids=frozenset(),
             )
         ),
+    )
+    breaker.reset_after_verified_reconciliation(
+        audit_repository=repository,
+        intent_ledger=ledger,
+        reconciliation_snapshot=batch,
     )
     return ledger
 
@@ -199,7 +206,30 @@ def test_unknown_absence_requires_bounded_evidence_before_a_retry_is_possible(
     restarted.resolve_unknown_as_absent(intent.client_order_id)
     assert restarted.intent(intent.client_order_id).status is DurableIntentStatus.ABSENT
 
-    replacement = simulator.submit(_intent(client_order_id="UTA1-plan-1-EN-2"))
+    restarted_breaker = restarted._persistence_breaker  # noqa: SLF001 - restart proof
+    restarted_repository = AuditRepository(
+        restarted._session_factory,  # noqa: SLF001 - restart proof
+        persistence_breaker=restarted_breaker,
+    )
+    batch = persist_reconciliation_query_receipt(
+        restarted,
+        exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
+        ),
+    )
+    restarted_breaker.reset_after_verified_reconciliation(
+        audit_repository=restarted_repository,
+        intent_ledger=restarted,
+        reconciliation_snapshot=batch,
+    )
+    replacement = ExchangeSimulator(
+        intent_ledger=restarted,
+        actual_risk_policy=actual_risk_policy_for("plan-1"),
+    ).submit(_intent(client_order_id="UTA1-plan-1-EN-2"))
     assert replacement.status is SimulatedOrderStatus.NEW
 
 
@@ -275,12 +305,14 @@ def test_derived_economic_identity_blocks_modified_client_ids_and_caller_supplie
 def test_concurrent_same_economic_retry_creates_only_one_prepared_intent(
     ledger: DurableIntentLedger,
 ) -> None:
+    ledger.register_actual_risk_policy(actual_risk_policy_for("plan-1"))
     barrier = Barrier(4)
 
     def prepare(client_index: int) -> bool:
         barrier.wait()
         try:
-            ledger.prepare(_intent(client_order_id=f"concurrent-{client_index}"))
+            intent = _intent(client_order_id=f"concurrent-{client_index}")
+            ledger.prepare(intent, admission_decision=ledger.admit_entry(intent))
         except (PersistenceUnavailable, UnresolvedEconomicAction):
             return False
         return True

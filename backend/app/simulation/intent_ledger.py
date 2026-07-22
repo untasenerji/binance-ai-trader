@@ -4,20 +4,22 @@ import hashlib
 import json
 import threading
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import ClassVar
 from uuid import uuid4
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
 from app.exchange.contracts import (
+    AdapterQueryReceipt,
+    AdapterQueryReceiptStatus,
     AlgoOrderStatus,
     AlgoOrderType,
     ExchangeAlgoOrderObservation,
@@ -47,11 +49,13 @@ from app.persistence.models import (
     DurableActualRiskPolicy,
     DurableActualRiskPolicyVersion,
     DurableActualRiskState,
+    DurableAdapterQueryReceipt,
+    DurableEntryAdmissionDecision,
     DurableEntryAuthorizationGrant,
     DurableEntryAuthorizationRevocation,
     DurableEvidenceQuarantine,
-    DurableEvidenceQuarantineResolution,
     DurableEvidenceQuarantineSource,
+    DurableEvidenceQuarantineSourceResolution,
     DurableIntentAbsenceObservation,
     DurableIntentFill,
     DurableOrderIntent,
@@ -59,6 +63,7 @@ from app.persistence.models import (
     DurablePortfolioEnvelopeSupersession,
     DurableRiskReductionRequirement,
     DurableSimulatedProtection,
+    ExchangeFillFactJournal,
     MigrationQuarantineRecord,
     TradePlanProjection,
 )
@@ -137,6 +142,10 @@ _TERMINAL_STATUSES = frozenset(
 )
 _REQUIRED_ABSENCE_SOURCES = frozenset(AbsenceEvidenceSource)
 _SIMULATED_QUERY_WRITE_CAPABILITY = object()
+# A local AdapterQueryReceipt is data, not recovery authority.  The live adapter
+# remains locked in this phase; only its future private integration boundary (and
+# the explicit test fixture) may cross this capability check.
+_ADAPTER_QUERY_RECEIPT_WRITE_CAPABILITY = object()
 _ENTRY_CAPABILITY_TTL = timedelta(minutes=5)
 _ACCOUNT_LOCKS_GUARD = threading.Lock()
 _ACCOUNT_LOCKS: dict[str, threading.RLock] = {}
@@ -162,6 +171,128 @@ class DurableRiskPolicyError(IntentLedgerError):
     pass
 
 
+class FillFactApplyStatus(StrEnum):
+    PENDING = "PENDING"
+    APPLIED = "APPLIED"
+    APPLY_FAILED = "APPLY_FAILED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+
+
+@dataclass(frozen=True, slots=True)
+class EntryAdmissionDecision:
+    """Immutable, centrally persisted permission for one entry intent only."""
+
+    decision_id: str
+    account_id: str
+    client_order_id: str
+    plan_id: str
+    risk_policy_id: str
+    risk_policy_version: int
+    risk_policy_fingerprint: str
+    envelope_version: int
+    envelope_fingerprint: str
+    symbol: str
+    side: Direction
+    max_quantity: Decimal
+    max_notional_usdt: Decimal
+    leverage: int
+    expires_at: datetime
+    grant_generation: int
+    failure_epoch: int
+    recovery_epoch: int
+    query_epoch: int
+    grant_id: str
+    decision_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if not all(
+            (
+                self.decision_id,
+                self.account_id,
+                self.client_order_id,
+                self.plan_id,
+                self.risk_policy_id,
+                self.envelope_fingerprint,
+                self.symbol,
+                self.grant_id,
+            )
+        ):
+            raise ValueError("entry admission decision identity is incomplete")
+        if type(self.side) is not Direction:
+            raise TypeError("entry admission decision side must be Direction")
+        if (
+            not isinstance(self.max_quantity, Decimal)
+            or not self.max_quantity.is_finite()
+            or self.max_quantity <= ZERO
+            or not isinstance(self.max_notional_usdt, Decimal)
+            or not self.max_notional_usdt.is_finite()
+            or self.max_notional_usdt <= ZERO
+            or not isinstance(self.leverage, int)
+            or isinstance(self.leverage, bool)
+            or self.leverage < 1
+        ):
+            raise ValueError("entry admission decision limits are invalid")
+        if self.expires_at.tzinfo is None:
+            raise ValueError("entry admission decision expiry must be timezone-aware")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (
+                self.risk_policy_version,
+                self.envelope_version,
+                self.grant_generation,
+                self.failure_epoch,
+                self.recovery_epoch,
+                self.query_epoch,
+            )
+        ):
+            raise ValueError("entry admission decision fencing values are invalid")
+        for fingerprint in (self.risk_policy_fingerprint, self.envelope_fingerprint):
+            if len(fingerprint) != 64 or any(
+                character not in "0123456789abcdef" for character in fingerprint.lower()
+            ):
+                raise ValueError("entry admission decision fingerprints are invalid")
+        object.__setattr__(self, "expires_at", self.expires_at.astimezone(UTC))
+        expected = self.expected_fingerprint()
+        if self.decision_fingerprint and self.decision_fingerprint != expected:
+            raise ValueError("entry admission decision fingerprint is invalid")
+        object.__setattr__(self, "decision_fingerprint", expected)
+
+    def expected_fingerprint(self) -> str:
+        canonical = json.dumps(
+            {
+                "account_id": self.account_id,
+                "client_order_id": self.client_order_id,
+                "decision_id": self.decision_id,
+                "envelope_fingerprint": self.envelope_fingerprint,
+                "envelope_version": self.envelope_version,
+                "expires_at": self.expires_at.isoformat(),
+                "failure_epoch": self.failure_epoch,
+                "grant_generation": self.grant_generation,
+                "grant_id": self.grant_id,
+                "leverage": self.leverage,
+                "max_notional_usdt": format(self.max_notional_usdt, "f"),
+                "max_quantity": format(self.max_quantity, "f"),
+                "plan_id": self.plan_id,
+                "query_epoch": self.query_epoch,
+                "recovery_epoch": self.recovery_epoch,
+                "risk_policy_fingerprint": self.risk_policy_fingerprint,
+                "risk_policy_id": self.risk_policy_id,
+                "risk_policy_version": self.risk_policy_version,
+                "side": self.side.value,
+                "symbol": self.symbol,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def require_current(self, now: datetime | None = None) -> None:
+        checked_at = (now or datetime.now(UTC)).astimezone(UTC)
+        if checked_at >= self.expires_at:
+            raise PersistenceUnavailable("ENTRY_ADMISSION_DECISION_EXPIRED")
+
+
 @dataclass(frozen=True, slots=True)
 class VerifiedQuarantineResolutionEvidence:
     """Fresh operator-attested reconciliation evidence for one quarantined action."""
@@ -171,6 +302,8 @@ class VerifiedQuarantineResolutionEvidence:
     client_order_id: str
     query_reference: str
     observed_at: datetime
+    attempt_id: str = "attempt-1"
+    source_row_id: str | None = None
     source: str = "operator_verified_reconciliation"
     fingerprint: str = ""
 
@@ -181,10 +314,13 @@ class VerifiedQuarantineResolutionEvidence:
             or not self.economic_key
             or not self.client_order_id
             or not self.query_reference
+            or not self.attempt_id
         ):
             raise ValueError("verified quarantine evidence needs durable reconciliation identity")
         if self.observed_at.tzinfo is None:
             raise ValueError("verified quarantine evidence timestamp must be timezone-aware")
+        if self.source_row_id is not None and not self.source_row_id:
+            raise ValueError("verified quarantine source row ID cannot be empty")
         if self.observed_at.astimezone(UTC) > datetime.now(UTC) + timedelta(seconds=5):
             raise ValueError("verified quarantine evidence cannot come from the future")
         expected = self.expected_fingerprint()
@@ -196,10 +332,12 @@ class VerifiedQuarantineResolutionEvidence:
         canonical = json.dumps(
             {
                 "account_id": self.account_id,
+                "attempt_id": self.attempt_id,
                 "client_order_id": self.client_order_id,
                 "economic_key": self.economic_key,
                 "observed_at": self.observed_at.astimezone(UTC).isoformat(),
                 "query_reference": self.query_reference,
+                "source_row_id": self.source_row_id,
                 "source": self.source,
             },
             ensure_ascii=True,
@@ -428,6 +566,218 @@ class DurableIntentLedger:
             self._record_entry_authorization_revocation
         )
 
+    def begin_adapter_query_receipt(self, receipt: AdapterQueryReceipt) -> None:
+        """Reject public receipt writes: data construction must not grant recovery authority."""
+        del receipt
+        raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_PUBLIC_WRITE_FORBIDDEN")
+
+    def complete_adapter_query_receipt(self, receipt: AdapterQueryReceipt) -> None:
+        """Reject public receipt writes: a completed local receipt is not adapter provenance."""
+        del receipt
+        raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_PUBLIC_WRITE_FORBIDDEN")
+
+    def record_adapter_query_receipt(self, receipt: AdapterQueryReceipt) -> None:
+        """Reject the former public completion shortcut for the same reason."""
+        del receipt
+        raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_PUBLIC_WRITE_FORBIDDEN")
+
+    def _record_adapter_query_receipt_from_authenticated_adapter(
+        self,
+        receipt: AdapterQueryReceipt,
+        *,
+        capability: object,
+    ) -> None:
+        """Persist a receipt only from the non-public adapter integration boundary."""
+        if capability is not _ADAPTER_QUERY_RECEIPT_WRITE_CAPABILITY:
+            raise TypeError("adapter receipts require the authenticated adapter boundary")
+        if type(receipt) is not AdapterQueryReceipt:
+            raise TypeError("adapter receipt must be an exact AdapterQueryReceipt")
+        if receipt.account_id != self._account_id:
+            raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_ACCOUNT_MISMATCH")
+        if receipt.status is AdapterQueryReceiptStatus.STARTED:
+            self._begin_adapter_query_receipt_from_authenticated_adapter(receipt)
+            return
+        if receipt.status is AdapterQueryReceiptStatus.COMPLETED:
+            self._complete_adapter_query_receipt_from_authenticated_adapter(receipt)
+            return
+        if receipt.status is AdapterQueryReceiptStatus.FAILED:
+            self._fail_adapter_query_receipt_from_authenticated_adapter(receipt)
+            return
+        raise ValueError("adapter query receipt status is unsupported")
+
+    def _begin_adapter_query_receipt_from_authenticated_adapter(
+        self,
+        receipt: AdapterQueryReceipt,
+    ) -> None:
+        """Durably record the pre-query receipt before observations exist."""
+        with self._local_account_lock(self._account_id):
+            with self._session_factory.begin() as session:
+                self._account_safety_state_for_update(session, self._account_id)
+                existing = session.scalar(
+                    select(DurableAdapterQueryReceipt).where(
+                        DurableAdapterQueryReceipt.receipt_id == receipt.receipt_id
+                    )
+                )
+                if existing is not None:
+                    if not self._adapter_receipt_identity_matches(existing, receipt):
+                        raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_SEMANTIC_CONFLICT")
+                    if existing.status not in {
+                        AdapterQueryReceiptStatus.STARTED.value,
+                        AdapterQueryReceiptStatus.COMPLETED.value,
+                    }:
+                        raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_STATUS_INVALID")
+                    return
+                session.add(
+                    DurableAdapterQueryReceipt(
+                        receipt_id=receipt.receipt_id,
+                        account_id=receipt.account_id,
+                        adapter_instance_id=receipt.adapter_instance_id,
+                        query_id=receipt.query_id,
+                        correlation_id=receipt.correlation_id,
+                        query_epoch=receipt.query_epoch,
+                        requested_at=receipt.requested_at,
+                        completed_at=None,
+                        server_time=None,
+                        query_type=receipt.query_type,
+                        response_fingerprint=None,
+                        status=AdapterQueryReceiptStatus.STARTED.value,
+                        receipt_fingerprint=receipt.receipt_fingerprint,
+                    )
+                )
+
+    def _complete_adapter_query_receipt_from_authenticated_adapter(
+        self,
+        receipt: AdapterQueryReceipt,
+    ) -> None:
+        """Complete a pre-existing receipt with the adapter response fingerprint."""
+        receipt.require_completed()
+        with self._local_account_lock(self._account_id):
+            with self._session_factory.begin() as session:
+                self._account_safety_state_for_update(session, self._account_id)
+                row = session.scalar(
+                    select(DurableAdapterQueryReceipt).where(
+                        DurableAdapterQueryReceipt.receipt_id == receipt.receipt_id
+                    )
+                )
+                if row is None:
+                    raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_START_MISSING")
+                if not self._adapter_receipt_identity_matches(row, receipt):
+                    raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_SEMANTIC_CONFLICT")
+                if row.status == AdapterQueryReceiptStatus.COMPLETED.value:
+                    if not self._durable_receipt_matches(row, receipt):
+                        raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_SEMANTIC_CONFLICT")
+                    return
+                if row.status != AdapterQueryReceiptStatus.STARTED.value:
+                    raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_STATUS_INVALID")
+                row.completed_at = receipt.completed_at
+                row.server_time = receipt.server_time
+                row.response_fingerprint = receipt.response_fingerprint
+                row.status = receipt.status.value
+                row.receipt_fingerprint = receipt.receipt_fingerprint
+
+    def _fail_adapter_query_receipt_from_authenticated_adapter(
+        self,
+        receipt: AdapterQueryReceipt,
+    ) -> None:
+        """Retain a failed query lifecycle without allowing it to become evidence."""
+        with self._local_account_lock(self._account_id):
+            with self._session_factory.begin() as session:
+                self._account_safety_state_for_update(session, self._account_id)
+                row = session.scalar(
+                    select(DurableAdapterQueryReceipt).where(
+                        DurableAdapterQueryReceipt.receipt_id == receipt.receipt_id
+                    )
+                )
+                if row is None:
+                    raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_START_MISSING")
+                if not self._adapter_receipt_identity_matches(row, receipt):
+                    raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_SEMANTIC_CONFLICT")
+                if row.status == AdapterQueryReceiptStatus.FAILED.value:
+                    if row.receipt_fingerprint != receipt.receipt_fingerprint:
+                        raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_SEMANTIC_CONFLICT")
+                    return
+                if row.status != AdapterQueryReceiptStatus.STARTED.value:
+                    raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_STATUS_INVALID")
+                row.status = receipt.status.value
+                row.receipt_fingerprint = receipt.receipt_fingerprint
+
+    @staticmethod
+    def _adapter_receipt_identity_matches(
+        row: DurableAdapterQueryReceipt,
+        receipt: AdapterQueryReceipt,
+    ) -> bool:
+        return (
+            row.account_id == receipt.account_id
+            and row.adapter_instance_id == receipt.adapter_instance_id
+            and row.query_id == receipt.query_id
+            and row.correlation_id == receipt.correlation_id
+            and row.query_epoch == receipt.query_epoch
+            and DurableIntentLedger._as_utc(row.requested_at) == receipt.requested_at
+            and row.query_type == receipt.query_type
+        )
+
+    @classmethod
+    def _durable_receipt_matches(
+        cls,
+        row: DurableAdapterQueryReceipt,
+        receipt: AdapterQueryReceipt,
+    ) -> bool:
+        return (
+            cls._adapter_receipt_identity_matches(row, receipt)
+            and row.status == AdapterQueryReceiptStatus.COMPLETED.value
+            and row.completed_at is not None
+            and row.server_time is not None
+            and cls._as_utc(row.completed_at) == receipt.completed_at
+            and cls._as_utc(row.server_time) == receipt.server_time
+            and row.response_fingerprint == receipt.response_fingerprint
+            and row.receipt_fingerprint == receipt.receipt_fingerprint
+        )
+
+    def validate_reconciliation_observation(
+        self,
+        batch: ExchangeReconciliationObservationBatch,
+    ) -> None:
+        if type(batch) is not ExchangeReconciliationObservationBatch:
+            raise TypeError("reconciliation requires an exact observation batch")
+        batch.require_fresh()
+        with self._session_factory() as session:
+            self._validate_durable_adapter_query_receipt(session, batch)
+
+    @classmethod
+    def _validate_durable_adapter_query_receipt(
+        cls,
+        session: Session,
+        batch: ExchangeReconciliationObservationBatch,
+    ) -> DurableAdapterQueryReceipt:
+        receipt = batch.query_receipt
+        if type(receipt) is not AdapterQueryReceipt:
+            raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_MISSING")
+        try:
+            receipt.require_completed()
+        except ValueError as error:
+            raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_INCOMPLETE") from error
+        if (
+            receipt.account_id != batch.account_id
+            or receipt.query_epoch != batch.query_epoch
+            or receipt.correlation_id != batch.correlation_id
+            or receipt.completed_at != batch.fetched_at
+            or receipt.server_time != batch.server_time
+            or receipt.response_fingerprint != batch.response_fingerprint
+            or receipt.query_type != "reconciliation"
+        ):
+            raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_BATCH_MISMATCH")
+        row = session.scalar(
+            select(DurableAdapterQueryReceipt).where(
+                DurableAdapterQueryReceipt.receipt_id == receipt.receipt_id,
+                DurableAdapterQueryReceipt.account_id == batch.account_id,
+            )
+        )
+        if row is None:
+            raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_MISSING")
+        if not cls._durable_receipt_matches(row, receipt):
+            raise PersistenceUnavailable("ADAPTER_QUERY_RECEIPT_TAMPERED")
+        return row
+
     def reopen_after_restart(self) -> "DurableIntentLedger":
         """Return a fresh local ledger instance over the same durable store."""
         reopened = DurableIntentLedger(
@@ -439,7 +789,32 @@ class DurableIntentLedger:
             with self._session_factory.begin() as session:
                 self._account_safety_state_for_update(session, self._account_id)
                 self._fence_filled_active_intents(session, self._account_id)
+        reopened._reapply_unapplied_fill_facts()
         return reopened
+
+    def _reapply_unapplied_fill_facts(self) -> None:
+        """Startup recovery retries durable facts without trusting process memory."""
+        with self._session_factory() as session:
+            facts = tuple(
+                session.scalars(
+                    select(ExchangeFillFactJournal)
+                    .where(
+                        ExchangeFillFactJournal.account_id == self._account_id,
+                        ExchangeFillFactJournal.apply_status != FillFactApplyStatus.APPLIED.value,
+                    )
+                    .order_by(ExchangeFillFactJournal.id.asc())
+                )
+            )
+        for fact in facts:
+            try:
+                self.record_fill(
+                    self._fill_event_from_fact(fact),
+                    materialize_simulated_protection=fact.materialize_simulated_protection,
+                )
+            except Exception:
+                # The fact remains RECOVERY_REQUIRED and the durable entry gate
+                # stays closed; later recovery must not lose it by skipping it.
+                continue
 
     @staticmethod
     def _local_account_lock(account_id: str) -> threading.RLock:
@@ -517,6 +892,7 @@ class DurableIntentLedger:
             ),
             select(DurableOrderIntent).where(DurableOrderIntent.account_id == account_id),
             select(DurableIntentFill).where(DurableIntentFill.account_id == account_id),
+            select(ExchangeFillFactJournal).where(ExchangeFillFactJournal.account_id == account_id),
         )
         for statement in queries:
             if session.get_bind().dialect.name == "postgresql":
@@ -534,14 +910,23 @@ class DurableIntentLedger:
         statement = (
             select(DurableEvidenceQuarantine.id)
             .outerjoin(
-                DurableEvidenceQuarantineResolution,
-                DurableEvidenceQuarantineResolution.quarantine_id
+                DurableEvidenceQuarantineSource,
+                DurableEvidenceQuarantineSource.quarantine_id
                 == DurableEvidenceQuarantine.quarantine_id,
+            )
+            .outerjoin(
+                DurableEvidenceQuarantineSourceResolution,
+                DurableEvidenceQuarantineSourceResolution.source_id
+                == DurableEvidenceQuarantineSource.id,
             )
             .where(
                 DurableEvidenceQuarantine.account_id == account_id,
-                DurableEvidenceQuarantineResolution.id.is_(None),
+                (
+                    DurableEvidenceQuarantineSource.id.is_(None)
+                    | DurableEvidenceQuarantineSourceResolution.id.is_(None)
+                ),
             )
+            .distinct()
         )
         if economic_key is not None:
             statement = statement.where(DurableEvidenceQuarantine.economic_key == economic_key)
@@ -589,6 +974,7 @@ class DurableIntentLedger:
         query_reference: str,
         provenance_fingerprint: str,
         reason: str,
+        attempt_id: str = "attempt-1",
         evidence: dict[str, object] | None = None,
     ) -> str:
         """Persist an immutable deny record without altering original provenance."""
@@ -598,6 +984,7 @@ class DurableIntentLedger:
             or not client_order_id
             or not query_reference
             or not reason
+            or not attempt_id
             or len(provenance_fingerprint) != 64
         ):
             raise ValueError("quarantine requires complete original economic provenance")
@@ -615,6 +1002,7 @@ class DurableIntentLedger:
                     account_id=account_id,
                     economic_key=economic_key,
                     client_order_id=client_order_id,
+                    attempt_id=attempt_id,
                     query_reference=query_reference,
                     provenance_fingerprint=provenance_fingerprint,
                     reason=reason,
@@ -637,7 +1025,9 @@ class DurableIntentLedger:
                                 source_table="runtime_evidence",
                                 source_row_id=source_row_id,
                                 source_identity=client_order_id,
+                                economic_key=economic_key,
                                 client_order_id=client_order_id,
+                                attempt_id=attempt_id,
                                 query_reference=query_reference,
                                 provenance_fingerprint=provenance_fingerprint,
                                 evidence=evidence or {},
@@ -668,7 +1058,9 @@ class DurableIntentLedger:
                         source_table="runtime_evidence",
                         source_row_id=source_row_id,
                         source_identity=client_order_id,
+                        economic_key=economic_key,
                         client_order_id=client_order_id,
+                        attempt_id=attempt_id,
                         query_reference=query_reference,
                         provenance_fingerprint=provenance_fingerprint,
                         evidence=evidence or {},
@@ -685,6 +1077,7 @@ class DurableIntentLedger:
         account_id: str,
         economic_key: str,
         client_order_id: str,
+        attempt_id: str,
         query_reference: str,
         provenance_fingerprint: str,
         reason: str,
@@ -693,6 +1086,7 @@ class DurableIntentLedger:
         canonical = json.dumps(
             {
                 "account_id": account_id,
+                "attempt_id": attempt_id,
                 "client_order_id": client_order_id,
                 "economic_key": economic_key,
                 "evidence": evidence,
@@ -736,29 +1130,51 @@ class DurableIntentLedger:
                 if (
                     verified_evidence.account_id != quarantine.account_id
                     or verified_evidence.economic_key != quarantine.economic_key
-                    or verified_evidence.client_order_id != quarantine.client_order_id
-                    or verified_evidence.fingerprint == quarantine.provenance_fingerprint
-                    or (
-                        quarantine.query_reference is not None
-                        and verified_evidence.query_reference == quarantine.query_reference
-                    )
                 ):
                     raise ValueError(
                         "quarantine resolution requires new verified evidence "
                         "for the original identity"
                     )
+                source_statement = select(DurableEvidenceQuarantineSource).where(
+                    DurableEvidenceQuarantineSource.quarantine_id == quarantine_id,
+                    DurableEvidenceQuarantineSource.account_id == quarantine.account_id,
+                    DurableEvidenceQuarantineSource.economic_key == verified_evidence.economic_key,
+                    DurableEvidenceQuarantineSource.client_order_id
+                    == verified_evidence.client_order_id,
+                    DurableEvidenceQuarantineSource.attempt_id == verified_evidence.attempt_id,
+                )
+                if verified_evidence.source_row_id is not None:
+                    source_statement = source_statement.where(
+                        DurableEvidenceQuarantineSource.source_row_id
+                        == verified_evidence.source_row_id
+                    )
+                sources = tuple(session.scalars(source_statement))
+                if not sources:
+                    raise ValueError("quarantine resolution source identity does not match")
+                if len(sources) != 1:
+                    raise ValueError("quarantine resolution requires one exact source row identity")
+                source = sources[0]
+                if verified_evidence.fingerprint == source.provenance_fingerprint or (
+                    source.query_reference is not None
+                    and verified_evidence.query_reference == source.query_reference
+                ):
+                    raise ValueError(
+                        "quarantine resolution requires new verified evidence "
+                        "for the original source"
+                    )
                 safety_state = self._account_safety_state_for_update(session, quarantine.account_id)
                 existing = session.scalar(
-                    select(DurableEvidenceQuarantineResolution).where(
-                        DurableEvidenceQuarantineResolution.quarantine_id == quarantine_id
+                    select(DurableEvidenceQuarantineSourceResolution).where(
+                        DurableEvidenceQuarantineSourceResolution.source_id == source.id
                     )
                 )
                 if existing is not None:
                     return existing.resolution_id
                 resolution_id = f"quarantine-resolution-{uuid4().hex}"
                 session.add(
-                    DurableEvidenceQuarantineResolution(
+                    DurableEvidenceQuarantineSourceResolution(
                         resolution_id=resolution_id,
+                        source_id=source.id,
                         quarantine_id=quarantine_id,
                         account_id=quarantine.account_id,
                         operator_id=operator_id,
@@ -817,6 +1233,7 @@ class DurableIntentLedger:
             raise TypeError("entry authorization requires typed recovery evidence")
         if type(reconciliation_snapshot) is not ExchangeReconciliationObservationBatch:
             raise TypeError("entry authorization requires an exchange observation batch")
+        self.validate_reconciliation_observation(reconciliation_snapshot)
         reconciliation_snapshot.require_fresh()
         if reconciliation_snapshot.account_id != self._account_id:
             raise PersistenceUnavailable("V1_SECOND_ACCOUNT_UNSUPPORTED")
@@ -829,6 +1246,10 @@ class DurableIntentLedger:
         try:
             with self._session_factory.begin() as session:
                 safety_state = self._account_safety_state_for_update(session, self._account_id)
+                receipt = self._validate_durable_adapter_query_receipt(
+                    session,
+                    reconciliation_snapshot,
+                )
                 self._require_no_unresolved_quarantine(
                     session,
                     account_id=self._account_id,
@@ -908,6 +1329,10 @@ class DurableIntentLedger:
                     "exchange_snapshot_fingerprint": snapshot_fingerprint,
                     "failure_epoch": safety_state.failure_epoch,
                     "grant_generation": safety_state.grant_generation,
+                    "query_correlation_id": reconciliation_snapshot.correlation_id,
+                    "query_epoch": reconciliation_snapshot.query_epoch,
+                    "query_receipt_id": receipt.receipt_id,
+                    "query_response_fingerprint": reconciliation_snapshot.response_fingerprint,
                     "expires_at": expires_at.isoformat(),
                     "grant_id": grant_id,
                     "issued_at": issued_at.isoformat(),
@@ -944,6 +1369,10 @@ class DurableIntentLedger:
                         reconciliation_fingerprint=reconciliation_fingerprint,
                         exchange_snapshot=snapshot_payload,
                         exchange_snapshot_fingerprint=snapshot_fingerprint,
+                        query_receipt_id=receipt.receipt_id,
+                        query_epoch=reconciliation_snapshot.query_epoch,
+                        query_correlation_id=reconciliation_snapshot.correlation_id,
+                        query_response_fingerprint=reconciliation_snapshot.response_fingerprint,
                         local_state_snapshot=local_state_payload,
                         local_state_fingerprint=local_state_fingerprint,
                         capability_fingerprint=capability_fingerprint,
@@ -1001,6 +1430,10 @@ class DurableIntentLedger:
                 or not grant.projection_matches_replay
                 or not grant.reconciliation_clean
                 or grant.unresolved_intent_count != 0
+                or grant.query_receipt_id is None
+                or grant.query_epoch is None
+                or grant.query_correlation_id is None
+                or grant.query_response_fingerprint is None
             ):
                 raise PersistenceUnavailable("DURABLE_RECOVERY_STATUS_INVALID")
 
@@ -1018,6 +1451,10 @@ class DurableIntentLedger:
                     "exchange_snapshot_fingerprint": (grant.exchange_snapshot_fingerprint),
                     "failure_epoch": grant.failure_epoch,
                     "grant_generation": grant.grant_generation,
+                    "query_correlation_id": grant.query_correlation_id,
+                    "query_epoch": grant.query_epoch,
+                    "query_receipt_id": grant.query_receipt_id,
+                    "query_response_fingerprint": grant.query_response_fingerprint,
                     "expires_at": expires_at.isoformat(),
                     "grant_id": grant.grant_id,
                     "issued_at": issued_at.isoformat(),
@@ -1053,6 +1490,15 @@ class DurableIntentLedger:
                 raise PersistenceUnavailable("EXCHANGE_SNAPSHOT_EVIDENCE_TAMPERED")
             observation_batch = self._snapshot_from_payload(snapshot_payload)
             observation_batch.require_fresh()
+            receipt = self._validate_durable_adapter_query_receipt(session, observation_batch)
+            if (
+                observation_batch.query_receipt is None
+                or receipt.receipt_id != grant.query_receipt_id
+                or observation_batch.query_epoch != grant.query_epoch
+                or observation_batch.correlation_id != grant.query_correlation_id
+                or observation_batch.response_fingerprint != grant.query_response_fingerprint
+            ):
+                raise PersistenceUnavailable("DURABLE_QUERY_RECEIPT_CHANGED")
             local_state_payload = dict(grant.local_state_snapshot)
             if self._canonical_fingerprint(local_state_payload) != grant.local_state_fingerprint:
                 raise PersistenceUnavailable("LOCAL_RECONCILIATION_EVIDENCE_TAMPERED")
@@ -1244,7 +1690,7 @@ class DurableIntentLedger:
             )
             if len(orders) != len(raw_orders):
                 raise ValueError("all Algo observations must be structured")
-            return ExchangeReconciliationObservationBatch(
+            provisional = ExchangeReconciliationObservationBatch(
                 source=source,
                 account_id=account_id,
                 query_epoch=query_epoch,
@@ -1267,6 +1713,25 @@ class DurableIntentLedger:
                 ),
                 algo_orders=orders,
             )
+            raw_receipt = payload.get("query_receipt")
+            if not isinstance(raw_receipt, dict):
+                raise ValueError("exchange snapshot has no durable query receipt identity")
+            receipt = AdapterQueryReceipt(
+                receipt_id=str(raw_receipt["receipt_id"]),
+                account_id=account_id,
+                adapter_instance_id=str(raw_receipt["adapter_instance_id"]),
+                query_id=str(raw_receipt["query_id"]),
+                correlation_id=correlation_id,
+                query_epoch=query_epoch,
+                requested_at=requested_at,
+                completed_at=fetched_at,
+                server_time=server_time,
+                query_type="reconciliation",
+                response_fingerprint=provisional.response_fingerprint,
+                status=AdapterQueryReceiptStatus(str(raw_receipt["status"])),
+                receipt_fingerprint=str(raw_receipt["receipt_fingerprint"]),
+            )
+            return replace(provisional, query_receipt=receipt)
         except (KeyError, TypeError, ValueError) as error:
             raise PersistenceUnavailable("EXCHANGE_SNAPSHOT_EVIDENCE_INVALID") from error
 
@@ -1765,11 +2230,185 @@ class DurableIntentLedger:
                 )
             return self._projected_portfolio_risk(session, policy, proposed_intent=intent)
 
-    def prepare(self, intent: SimulatedOrderIntent) -> DurableIntentRecord:
+    def admit_entry(self, intent: SimulatedOrderIntent) -> EntryAdmissionDecision:
+        """Create the sole durable admission authority for one entry intent."""
+        if type(intent) is not SimulatedOrderIntent or intent.role is not OrderRole.ENTRY:
+            raise TypeError("entry admission requires an exact ENTRY simulated intent")
+        self._require_v1_account(intent.account_id)
+        issued_at = datetime.now(UTC)
+        try:
+            with self._local_account_lock(self._account_id):
+                with self._session_factory.begin() as session:
+                    safety_state = self._account_safety_state_for_update(session, self._account_id)
+                    self._lock_account_risk_rows(session, self._account_id)
+                    self._require_no_unresolved_quarantine(
+                        session,
+                        account_id=self._account_id,
+                        economic_key=intent.economic_key,
+                    )
+                    latest = self._latest_for_economic_key(session, intent.economic_key)
+                    if (
+                        latest is not None
+                        and DurableIntentStatus(latest.status) is not DurableIntentStatus.ABSENT
+                    ):
+                        raise UnresolvedEconomicAction(
+                            "an existing economic action must be reconciled before admission"
+                        )
+                    duplicate_client = session.scalar(
+                        select(DurableOrderIntent).where(
+                            DurableOrderIntent.client_order_id == intent.client_order_id
+                        )
+                    )
+                    if duplicate_client is not None:
+                        raise UnresolvedEconomicAction(
+                            "client order ID already has a durable intent"
+                        )
+                    capability = self._entry_gate.authorize_new_entry_intent()
+                    grant = session.scalar(
+                        select(DurableEntryAuthorizationGrant).where(
+                            DurableEntryAuthorizationGrant.grant_id == capability.grant_id,
+                            DurableEntryAuthorizationGrant.account_id == self._account_id,
+                        )
+                    )
+                    if (
+                        grant is None
+                        or grant.query_epoch is None
+                        or grant.query_response_fingerprint is None
+                        or grant.query_receipt_id is None
+                    ):
+                        raise PersistenceUnavailable("ENTRY_ADMISSION_QUERY_EVIDENCE_MISSING")
+                    policy, policy_version, policy_fingerprint = self._current_policy_version(
+                        session,
+                        intent.plan_id,
+                    )
+                    if policy.symbol != intent.symbol or policy.direction is not intent.direction:
+                        raise PersistenceUnavailable("ENTRY_ADMISSION_POLICY_PLAN_MISMATCH")
+                    if (
+                        safety_state.recovery_required
+                        or safety_state.failure_epoch != capability.failure_epoch
+                        or safety_state.recovery_epoch != capability.recovery_epoch
+                        or safety_state.grant_generation != capability.grant_generation
+                        or safety_state.envelope_version != capability.envelope_version
+                        or not safety_state.envelope_fingerprint
+                    ):
+                        raise PersistenceUnavailable("ENTRY_ADMISSION_EPOCH_STALE")
+                    envelope_head = session.scalar(
+                        select(DurablePortfolioEnvelopeHead)
+                        .where(DurablePortfolioEnvelopeHead.account_id == self._account_id)
+                        .order_by(DurablePortfolioEnvelopeHead.version.desc())
+                        .limit(1)
+                    )
+                    if (
+                        envelope_head is None
+                        or envelope_head.version != safety_state.envelope_version
+                        or envelope_head.envelope_fingerprint != safety_state.envelope_fingerprint
+                    ):
+                        raise PersistenceUnavailable("ENTRY_ADMISSION_ENVELOPE_STALE")
+                    self._require_no_durable_entry_risk_block(session, self._account_id)
+                    projected = self._projected_portfolio_risk(
+                        session,
+                        policy,
+                        proposed_intent=intent,
+                    )
+                    if projected.blocked:
+                        raise PersistenceUnavailable(
+                            f"ENTRY_ADMISSION_RISK_BLOCKED:{projected.reason or 'UNKNOWN'}"
+                        )
+                    decision = EntryAdmissionDecision(
+                        decision_id=f"entry-admission-{uuid4().hex}",
+                        account_id=self._account_id,
+                        client_order_id=intent.client_order_id,
+                        plan_id=intent.plan_id,
+                        risk_policy_id=intent.plan_id,
+                        risk_policy_version=policy_version,
+                        risk_policy_fingerprint=policy_fingerprint,
+                        envelope_version=safety_state.envelope_version,
+                        envelope_fingerprint=safety_state.envelope_fingerprint,
+                        symbol=intent.symbol,
+                        side=intent.direction,
+                        max_quantity=intent.quantity,
+                        max_notional_usdt=intent.quantity * intent.price,
+                        leverage=policy.effective_leverage,
+                        expires_at=min(capability.expires_at, issued_at + timedelta(seconds=30)),
+                        grant_generation=safety_state.grant_generation,
+                        failure_epoch=safety_state.failure_epoch,
+                        recovery_epoch=safety_state.recovery_epoch,
+                        query_epoch=grant.query_epoch,
+                        grant_id=capability.grant_id,
+                    )
+                    session.add(
+                        DurableEntryAdmissionDecision(
+                            decision_id=decision.decision_id,
+                            account_id=decision.account_id,
+                            client_order_id=decision.client_order_id,
+                            plan_id=decision.plan_id,
+                            risk_policy_id=decision.risk_policy_id,
+                            risk_policy_version=decision.risk_policy_version,
+                            risk_policy_fingerprint=decision.risk_policy_fingerprint,
+                            envelope_version=decision.envelope_version,
+                            envelope_fingerprint=decision.envelope_fingerprint,
+                            symbol=decision.symbol,
+                            side=decision.side.value,
+                            max_quantity=format(decision.max_quantity, "f"),
+                            max_notional_usdt=format(decision.max_notional_usdt, "f"),
+                            leverage=decision.leverage,
+                            expires_at=decision.expires_at,
+                            grant_generation=decision.grant_generation,
+                            failure_epoch=decision.failure_epoch,
+                            recovery_epoch=decision.recovery_epoch,
+                            query_epoch=decision.query_epoch,
+                            grant_id=decision.grant_id,
+                            decision_fingerprint=decision.decision_fingerprint,
+                        )
+                    )
+                    return decision
+        except PersistenceUnavailable:
+            raise
+        except Exception as error:
+            self._persistence_breaker.record_write_failure(error)
+            raise
+
+    @classmethod
+    def _current_policy_version(
+        cls,
+        session: Session,
+        plan_id: str,
+    ) -> tuple[ActualRiskPolicy, int, str]:
+        base = session.get(DurableActualRiskPolicy, plan_id)
+        if base is None:
+            raise PersistenceUnavailable("ENTRY_ADMISSION_POLICY_MISSING")
+        policy = cls._validated_policy_lineage(session, base)
+        latest = session.scalar(
+            select(DurableActualRiskPolicyVersion)
+            .where(
+                DurableActualRiskPolicyVersion.plan_id == plan_id,
+                DurableActualRiskPolicyVersion.account_id == cls._account_id_from_policy_row(base),
+            )
+            .order_by(DurableActualRiskPolicyVersion.version.desc())
+            .limit(1)
+        )
+        return (
+            policy,
+            (1 if latest is None else latest.version),
+            (base.policy_fingerprint if latest is None else latest.policy_fingerprint),
+        )
+
+    @staticmethod
+    def _account_id_from_policy_row(row: DurableActualRiskPolicy) -> str:
+        if row.account_id != V1_DEFAULT_ACCOUNT_ID:
+            raise DurableRiskPolicyError("V1_SECOND_ACCOUNT_UNSUPPORTED")
+        return row.account_id
+
+    def prepare(
+        self,
+        intent: SimulatedOrderIntent,
+        *,
+        admission_decision: EntryAdmissionDecision | None = None,
+    ) -> DurableIntentRecord:
         self._require_v1_account(intent.account_id)
         try:
             with self._session_factory.begin() as session:
-                self._account_safety_state_for_update(session, self._account_id)
+                safety_state = self._account_safety_state_for_update(session, self._account_id)
                 self._require_no_unresolved_quarantine(
                     session,
                     account_id=self._account_id,
@@ -1792,7 +2431,14 @@ class DurableIntentLedger:
                 if duplicate_client is not None:
                     raise UnresolvedEconomicAction("client order ID already has a durable intent")
                 if intent.role is OrderRole.ENTRY:
-                    self._entry_gate.authorize_new_entry_intent()
+                    if admission_decision is None:
+                        raise PersistenceUnavailable("ENTRY_ADMISSION_DECISION_REQUIRED")
+                    self._validate_entry_admission_decision(
+                        session,
+                        intent=intent,
+                        decision=admission_decision,
+                        safety_state=safety_state,
+                    )
                 record = DurableOrderIntent(
                     account_id=self._account_id,
                     economic_key=intent.economic_key,
@@ -1822,6 +2468,108 @@ class DurableIntentLedger:
         except Exception as error:
             self._persistence_breaker.record_write_failure(error)
             raise
+
+    def _validate_entry_admission_decision(
+        self,
+        session: Session,
+        *,
+        intent: SimulatedOrderIntent,
+        decision: EntryAdmissionDecision,
+        safety_state: DurableAccountSafetyState,
+    ) -> None:
+        if type(decision) is not EntryAdmissionDecision:
+            raise PersistenceUnavailable("ENTRY_ADMISSION_DECISION_INVALID")
+        decision.require_current()
+        self._entry_gate.authorize_new_entry_intent()
+        row = session.scalar(
+            select(DurableEntryAdmissionDecision).where(
+                DurableEntryAdmissionDecision.decision_id == decision.decision_id,
+                DurableEntryAdmissionDecision.account_id == self._account_id,
+            )
+        )
+        if row is None or row.decision_fingerprint != decision.decision_fingerprint:
+            raise PersistenceUnavailable("ENTRY_ADMISSION_DECISION_UNVERIFIED")
+        if (
+            row.client_order_id != intent.client_order_id
+            or row.plan_id != intent.plan_id
+            or row.symbol != intent.symbol
+            or row.side != intent.direction.value
+            or row.risk_policy_id != decision.risk_policy_id
+            or row.risk_policy_version != decision.risk_policy_version
+            or row.risk_policy_fingerprint != decision.risk_policy_fingerprint
+            or row.envelope_version != decision.envelope_version
+            or row.envelope_fingerprint != decision.envelope_fingerprint
+            or Decimal(row.max_quantity) != decision.max_quantity
+            or Decimal(row.max_notional_usdt) != decision.max_notional_usdt
+            or row.leverage != decision.leverage
+            or self._as_utc(row.expires_at) != decision.expires_at
+            or row.grant_generation != decision.grant_generation
+            or row.failure_epoch != decision.failure_epoch
+            or row.recovery_epoch != decision.recovery_epoch
+            or row.query_epoch != decision.query_epoch
+            or row.grant_id != decision.grant_id
+        ):
+            raise PersistenceUnavailable("ENTRY_ADMISSION_DECISION_TAMPERED")
+        policy, version, fingerprint = self._current_policy_version(session, intent.plan_id)
+        if (
+            policy.symbol != intent.symbol
+            or policy.direction is not intent.direction
+            or version != decision.risk_policy_version
+            or fingerprint != decision.risk_policy_fingerprint
+            or policy.effective_leverage != decision.leverage
+        ):
+            raise PersistenceUnavailable("ENTRY_ADMISSION_POLICY_STALE")
+        if (
+            safety_state.recovery_required
+            or safety_state.failure_epoch != decision.failure_epoch
+            or safety_state.recovery_epoch != decision.recovery_epoch
+            or safety_state.grant_generation != decision.grant_generation
+            or safety_state.envelope_version != decision.envelope_version
+            or safety_state.envelope_fingerprint != decision.envelope_fingerprint
+        ):
+            raise PersistenceUnavailable("ENTRY_ADMISSION_EPOCH_STALE")
+        if (
+            intent.quantity > decision.max_quantity
+            or intent.quantity * intent.price > decision.max_notional_usdt
+        ):
+            raise PersistenceUnavailable("ENTRY_ADMISSION_LIMIT_EXCEEDED")
+        self._require_no_durable_entry_risk_block(session, self._account_id)
+        projected = self._projected_portfolio_risk(session, policy, proposed_intent=intent)
+        if projected.blocked:
+            raise PersistenceUnavailable(
+                f"ENTRY_ADMISSION_RISK_BLOCKED:{projected.reason or 'UNKNOWN'}"
+            )
+
+    @classmethod
+    def _require_no_durable_entry_risk_block(cls, session: Session, account_id: str) -> None:
+        """Make durable risk blocks account-wide admission facts, including after restart."""
+        blocked_state = session.scalar(
+            select(DurableActualRiskState)
+            .where(
+                DurableActualRiskState.account_id == account_id,
+                or_(
+                    DurableActualRiskState.pending_entries_blocked.is_(True),
+                    DurableActualRiskState.hard_halted.is_(True),
+                ),
+            )
+            .order_by(DurableActualRiskState.updated_at.desc())
+            .limit(1)
+        )
+        if blocked_state is not None:
+            raise PersistenceUnavailable(
+                "ENTRY_ADMISSION_RISK_BLOCKED:"
+                f"{blocked_state.reason or 'DURABLE_RISK_STATE_BLOCKED'}"
+            )
+        open_requirement = session.scalar(
+            select(DurableRiskReductionRequirement)
+            .where(
+                DurableRiskReductionRequirement.account_id == account_id,
+                DurableRiskReductionRequirement.status == RiskReductionStatus.OPEN.value,
+            )
+            .limit(1)
+        )
+        if open_requirement is not None:
+            raise PersistenceUnavailable("ENTRY_ADMISSION_RISK_BLOCKED:RISK_REDUCTION_REQUIRED")
 
     def mark_submitting(
         self,
@@ -1857,12 +2605,196 @@ class DurableIntentLedger:
         *,
         materialize_simulated_protection: bool = False,
     ) -> FillLedgerReceipt:
-        """Serialize local SQLite account fills before using the durable lock protocol."""
+        """Ingest an exchange fact before attempting its idempotent application."""
         with self._local_account_lock(self._account_id):
-            return self._record_fill_locked(
+            fact = self._ingest_exchange_fill_fact(
                 event,
                 materialize_simulated_protection=materialize_simulated_protection,
             )
+            if fact.last_apply_error == "SEMANTIC_CONFLICT":
+                raise FillLedgerError(
+                    "exchange fill trade ID was redelivered with a semantic conflict"
+                )
+            if fact.apply_status == FillFactApplyStatus.APPLIED.value:
+                return self._receipt_for_applied_fill_fact(fact, duplicate=True)
+            try:
+                self._claim_fill_fact_application(fact.id)
+                receipt = self._record_fill_locked(
+                    event,
+                    materialize_simulated_protection=materialize_simulated_protection,
+                )
+                self._mark_fill_fact_applied(fact.id)
+            except Exception as error:
+                self._mark_fill_fact_recovery_required(fact.id, error)
+                self._persistence_breaker.record_write_failure(error)
+                raise
+            return receipt
+
+    def _ingest_exchange_fill_fact(
+        self,
+        event: FillEvent,
+        *,
+        materialize_simulated_protection: bool,
+    ) -> ExchangeFillFactJournal:
+        """Stage A: commit immutable exchange data before any risk-side effects."""
+        try:
+            self._require_v1_account(event.account_id)
+        except DurableRiskPolicyError as error:
+            raise FillLedgerError(
+                "exchange fill account does not match the durable intent scope"
+            ) from error
+        fingerprint = self._fill_fingerprint(event)
+        provenance_fingerprint = self._fill_provenance_fingerprint(event)
+        try:
+            with self._session_factory.begin() as session:
+                safety_state = self._account_safety_state_for_update(session, self._account_id)
+                existing_intent = session.scalar(
+                    select(DurableOrderIntent).where(
+                        DurableOrderIntent.client_order_id == event.client_order_id
+                    )
+                )
+                # A known local intent lets us reject a fabricated fact before it
+                # reaches the durable journal. An unknown intent remains a fact
+                # that must be held for recovery rather than silently discarded.
+                if existing_intent is not None:
+                    self._validate_fill_identity(event, existing_intent)
+                existing = session.scalar(
+                    select(ExchangeFillFactJournal).where(
+                        ExchangeFillFactJournal.account_id == self._account_id,
+                        ExchangeFillFactJournal.exchange_trade_id == event.trade_id,
+                    )
+                )
+                if existing is not None:
+                    if existing.semantic_fingerprint != fingerprint:
+                        safety_state.failure_epoch += 1
+                        safety_state.grant_generation += 1
+                        safety_state.recovery_required = True
+                        safety_state.updated_at = datetime.now(UTC)
+                        self._cancel_known_active_entry_intents(session, self._account_id)
+                        existing.apply_status = FillFactApplyStatus.RECOVERY_REQUIRED.value
+                        existing.last_apply_error = "SEMANTIC_CONFLICT"
+                        return existing
+                    return existing
+                fact = ExchangeFillFactJournal(
+                    account_id=self._account_id,
+                    exchange_trade_id=event.trade_id,
+                    client_order_id=event.client_order_id,
+                    intent_id=(
+                        None if existing_intent is None else existing_intent.client_order_id
+                    ),
+                    symbol=event.symbol,
+                    side=event.side.value,
+                    quantity=format(event.last_quantity, "f"),
+                    cumulative_quantity=format(event.cumulative_quantity, "f"),
+                    price=format(event.fill_price, "f"),
+                    fee=format(event.fee, "f"),
+                    fee_asset=event.fee_asset,
+                    exchange_timestamp=event.occurred_at.astimezone(UTC),
+                    observation_source=event.observation_source.value,
+                    observation_reference=event.observation_reference,
+                    observation_correlation=event.observation_correlation,
+                    provenance_fingerprint=provenance_fingerprint,
+                    semantic_fingerprint=fingerprint,
+                    materialize_simulated_protection=materialize_simulated_protection,
+                    apply_status=FillFactApplyStatus.PENDING.value,
+                    apply_attempt_count=0,
+                    last_apply_error=None,
+                )
+                session.add(fact)
+                session.flush()
+                return fact
+        except (DurableRiskPolicyError, FillLedgerError):
+            raise
+        except Exception as error:
+            self._persistence_breaker.record_write_failure(error)
+            raise
+
+    def _claim_fill_fact_application(self, fact_id: int) -> None:
+        with self._session_factory.begin() as session:
+            self._account_safety_state_for_update(session, self._account_id)
+            fact = session.get(ExchangeFillFactJournal, fact_id)
+            if fact is None or fact.account_id != self._account_id:
+                raise PersistenceUnavailable("EXCHANGE_FILL_FACT_MISSING")
+            if fact.apply_status == FillFactApplyStatus.APPLIED.value:
+                return
+            fact.apply_status = FillFactApplyStatus.PENDING.value
+            fact.apply_attempt_count += 1
+            fact.last_apply_error = None
+
+    def _mark_fill_fact_applied(self, fact_id: int) -> None:
+        with self._session_factory.begin() as session:
+            fact = session.get(ExchangeFillFactJournal, fact_id)
+            if fact is None or fact.account_id != self._account_id:
+                raise PersistenceUnavailable("EXCHANGE_FILL_FACT_MISSING")
+            fact.apply_status = FillFactApplyStatus.APPLIED.value
+            fact.last_apply_error = None
+            fact.applied_at = datetime.now(UTC)
+
+    def _mark_fill_fact_recovery_required(self, fact_id: int, error: Exception) -> None:
+        """Keep the fact and durably close every new-entry route after failure."""
+        try:
+            with self._session_factory.begin() as session:
+                safety_state = self._account_safety_state_for_update(session, self._account_id)
+                self._lock_account_risk_rows(session, self._account_id)
+                fact = session.get(ExchangeFillFactJournal, fact_id)
+                if fact is None or fact.account_id != self._account_id:
+                    return
+                if fact.apply_status == FillFactApplyStatus.APPLIED.value:
+                    return
+                fact.apply_status = FillFactApplyStatus.RECOVERY_REQUIRED.value
+                fact.last_apply_error = f"{type(error).__name__}: {error}"[:4096]
+                safety_state.failure_epoch += 1
+                safety_state.grant_generation += 1
+                safety_state.recovery_required = True
+                safety_state.updated_at = datetime.now(UTC)
+                intent = session.scalar(
+                    select(DurableOrderIntent).where(
+                        DurableOrderIntent.client_order_id == fact.client_order_id
+                    )
+                )
+                if intent is not None and DurableIntentStatus(intent.status) in {
+                    DurableIntentStatus.PREPARED,
+                    DurableIntentStatus.SUBMITTING,
+                    DurableIntentStatus.UNKNOWN,
+                    DurableIntentStatus.NEW,
+                    DurableIntentStatus.PARTIALLY_FILLED,
+                }:
+                    intent.status = DurableIntentStatus.CANCEL_REQUIRED.value
+                    intent.updated_at = datetime.now(UTC)
+                self._cancel_known_active_entry_intents(session, self._account_id)
+        except Exception as mark_error:
+            self._persistence_breaker.record_write_failure(mark_error)
+
+    def _receipt_for_applied_fill_fact(
+        self,
+        fact: ExchangeFillFactJournal,
+        *,
+        duplicate: bool,
+    ) -> FillLedgerReceipt:
+        with self._session_factory() as session:
+            ledger = self._intent_fill_ledger(session, fact.client_order_id)
+            if ledger.filled_quantity <= ZERO:
+                raise PersistenceUnavailable("EXCHANGE_FILL_FACT_APPLY_PROJECTION_MISSING")
+            return FillLedgerReceipt(
+                is_duplicate=duplicate,
+                filled_quantity=ledger.filled_quantity,
+                average_fill_price=ledger.average_fill_price,
+                total_fee=ledger.total_fee,
+            )
+
+    @staticmethod
+    def _fill_provenance_fingerprint(event: FillEvent) -> str:
+        if event.provenance_fingerprint is not None:
+            return event.provenance_fingerprint
+        return DurableIntentLedger._canonical_fingerprint(
+            {
+                "account_id": event.account_id,
+                "correlation": event.observation_correlation,
+                "observation_reference": event.observation_reference,
+                "observation_source": event.observation_source.value,
+                "trade_id": event.trade_id,
+            }
+        )
 
     def _record_fill_locked(
         self,
@@ -2634,6 +3566,31 @@ class DurableIntentLedger:
         )
 
     @staticmethod
+    def _fill_event_from_fact(row: ExchangeFillFactJournal) -> FillEvent:
+        occurred_at = row.exchange_timestamp
+        if occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=UTC)
+        else:
+            occurred_at = occurred_at.astimezone(UTC)
+        return FillEvent(
+            account_id=row.account_id,
+            trade_id=row.exchange_trade_id,
+            client_order_id=row.client_order_id,
+            symbol=row.symbol,
+            side=FillSide(row.side),
+            last_quantity=Decimal(row.quantity),
+            cumulative_quantity=Decimal(row.cumulative_quantity),
+            fill_price=Decimal(row.price),
+            fee=Decimal(row.fee),
+            fee_asset=row.fee_asset,
+            occurred_at=occurred_at,
+            observation_source=FillObservationSource(row.observation_source),
+            observation_reference=row.observation_reference,
+            observation_correlation=row.observation_correlation,
+            provenance_fingerprint=row.provenance_fingerprint,
+        )
+
+    @staticmethod
     def _validate_fill_identity(
         event: FillEvent,
         intent: DurableOrderIntent,
@@ -2666,6 +3623,7 @@ class DurableIntentLedger:
                 "fee_asset": event.fee_asset,
                 "fill_price": format(event.fill_price, "f"),
                 "last_quantity": format(event.last_quantity, "f"),
+                "observation_correlation": event.observation_correlation,
                 "observation_reference": event.observation_reference,
                 "observation_source": event.observation_source.value,
                 "occurred_at": event.occurred_at.astimezone(UTC).isoformat(),

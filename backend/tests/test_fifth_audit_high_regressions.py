@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import MetaData, Table, create_engine, text
+from sqlalchemy import MetaData, Table, create_engine, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -28,6 +28,7 @@ from app.persistence.models import (
     DurableActualRiskPolicyVersion,
     DurableIntentAbsenceObservation,
     DurableOrderIntent,
+    ExchangeFillFactJournal,
 )
 from app.persistence.replay import ReplayRunner
 from app.planning.fills import (
@@ -43,6 +44,7 @@ from app.simulation.intent_ledger import (
     DurableIntentLedger,
     DurableIntentStatus,
     DurableRiskPolicyError,
+    FillFactApplyStatus,
     IntentLifecycleError,
 )
 from app.simulation.models import (
@@ -66,7 +68,10 @@ from app.strategy.backtest import (
     WalkForwardTrainingError,
 )
 from app.strategy.models import Candle, FrozenStrategy, SignalCandidate
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 from tests.strategy_factory import make_frozen_strategy, make_strategy_lineage
 
 
@@ -261,7 +266,7 @@ def test_fill_risk_block_and_pending_stage_cancellation_commit_atomically(
     assert restarted.risk_reduction_requirement(plan_id).reason
 
 
-def test_fill_transaction_rolls_back_before_any_partial_durable_state(
+def test_fill_application_failure_preserves_durable_fact_and_fences_entries(
     durable_intent_ledger: DurableIntentLedger,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -286,10 +291,21 @@ def test_fill_transaction_rolls_back_before_any_partial_durable_state(
             )
         )
 
+    with durable_intent_ledger._session_factory() as session:  # noqa: SLF001 - durable proof
+        fact = session.scalar(
+            select(ExchangeFillFactJournal).where(
+                ExchangeFillFactJournal.exchange_trade_id == "rolled-back-fill"
+            )
+        )
+    assert fact is not None
+    assert fact.apply_status == FillFactApplyStatus.RECOVERY_REQUIRED.value
+    assert fact.apply_attempt_count >= 1
+    assert "transaction-boundary crash" in (fact.last_apply_error or "")
+
     restarted = durable_intent_ledger.reopen_after_restart()
     assert restarted.fill_ledger_for_plan(plan_id).filled_quantity == Decimal("0")
-    assert restarted.intent(f"{plan_id}-stage-1").status is DurableIntentStatus.NEW
-    assert restarted.intent(f"{plan_id}-stage-2").status is DurableIntentStatus.NEW
+    assert restarted.intent(f"{plan_id}-stage-1").status is DurableIntentStatus.CANCEL_REQUIRED
+    assert restarted.intent(f"{plan_id}-stage-2").status is DurableIntentStatus.CANCEL_REQUIRED
 
 
 def test_breaker_cannot_be_opened_by_constructor_or_attribute_assignment() -> None:
@@ -306,7 +322,11 @@ def test_unknown_timestamp_must_not_precede_submission(
     durable_intent_ledger: DurableIntentLedger,
 ) -> None:
     intent = _entry("unknown-clock-reversal", "unknown-clock-plan")
-    durable_intent_ledger.prepare(intent)
+    durable_intent_ledger.register_actual_risk_policy(_policy(intent.plan_id))
+    durable_intent_ledger.prepare(
+        intent,
+        admission_decision=durable_intent_ledger.admit_entry(intent),
+    )
     durable_intent_ledger.mark_submitting(intent.client_order_id, submitted_at_ms=1_000_000)
 
     with pytest.raises(IntentLifecycleError, match="timestamp|UNKNOWN|submission"):
@@ -662,16 +682,20 @@ def _assert_populated_0008_upgrade(
             .replay(repository.list_audit_events(), repository.audit_chain_head())
             .is_valid
         )
-        evidence = breaker.reset_after_verified_reconciliation(
-            audit_repository=repository,
-            intent_ledger=ledger,
-            reconciliation_snapshot=exchange_reconciliation_batch(
+        batch = persist_reconciliation_query_receipt(
+            ledger,
+            exchange_reconciliation_batch(
                 ReconciliationSnapshot(
                     positions_by_symbol={},
                     normal_order_client_ids=frozenset(),
                     algo_order_client_ids=frozenset(),
                 )
             ),
+        )
+        evidence = breaker.reset_after_verified_reconciliation(
+            audit_repository=repository,
+            intent_ledger=ledger,
+            reconciliation_snapshot=batch,
         )
         assert evidence.is_complete
         with engine.begin() as connection, pytest.raises(DBAPIError):
@@ -707,17 +731,21 @@ def test_sqlite_populated_0008_null_query_provenance_stays_quarantined(tmp_path:
         ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
         repository = AuditRepository(session_factory, persistence_breaker=breaker)
         assert ledger.list_absence_observations("legacy-0008-client") == ()
+        batch = persist_reconciliation_query_receipt(
+            ledger,
+            exchange_reconciliation_batch(
+                ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                )
+            ),
+        )
         with pytest.raises(PersistenceUnavailable, match="UNRESOLVED_QUARANTINE"):
             breaker.reset_after_verified_reconciliation(
                 audit_repository=repository,
                 intent_ledger=ledger,
-                reconciliation_snapshot=exchange_reconciliation_batch(
-                    ReconciliationSnapshot(
-                        positions_by_symbol={},
-                        normal_order_client_ids=frozenset(),
-                        algo_order_client_ids=frozenset(),
-                    )
-                ),
+                reconciliation_snapshot=batch,
             )
     finally:
         engine.dispose()
@@ -793,17 +821,21 @@ def test_postgresql_populated_0008_null_query_provenance_stays_quarantined(
         ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
         repository = AuditRepository(session_factory, persistence_breaker=breaker)
         assert ledger.list_absence_observations("legacy-0008-client") == ()
+        batch = persist_reconciliation_query_receipt(
+            ledger,
+            exchange_reconciliation_batch(
+                ReconciliationSnapshot(
+                    positions_by_symbol={},
+                    normal_order_client_ids=frozenset(),
+                    algo_order_client_ids=frozenset(),
+                )
+            ),
+        )
         with pytest.raises(PersistenceUnavailable, match="UNRESOLVED_QUARANTINE"):
             breaker.reset_after_verified_reconciliation(
                 audit_repository=repository,
                 intent_ledger=ledger,
-                reconciliation_snapshot=exchange_reconciliation_batch(
-                    ReconciliationSnapshot(
-                        positions_by_symbol={},
-                        normal_order_client_ids=frozenset(),
-                        algo_order_client_ids=frozenset(),
-                    )
-                ),
+                reconciliation_snapshot=batch,
             )
     finally:
         engine.dispose()

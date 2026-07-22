@@ -74,7 +74,10 @@ from app.strategy.backtest import (
 )
 from app.strategy.models import Candle, StrategySpecification
 from app.strategy.strategies import VolatilityBreakoutStrategy
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 
 def _policy(
@@ -930,16 +933,20 @@ def test_postgresql_risk_reduction_requirement_survives_restart(
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(postgresql_session_factory, persistence_breaker=breaker)
     repository = AuditRepository(postgresql_session_factory, persistence_breaker=breaker)
-    breaker.reset_after_verified_reconciliation(
-        audit_repository=repository,
-        intent_ledger=ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
+    reconciliation_batch = persist_reconciliation_query_receipt(
+        ledger,
+        exchange_reconciliation_batch(
             ReconciliationSnapshot(
                 positions_by_symbol={},
                 normal_order_client_ids=frozenset(),
                 algo_order_client_ids=frozenset(),
             )
         ),
+    )
+    breaker.reset_after_verified_reconciliation(
+        audit_repository=repository,
+        intent_ledger=ledger,
+        reconciliation_snapshot=reconciliation_batch,
     )
     ledger.register_actual_risk_policy(
         _policy(

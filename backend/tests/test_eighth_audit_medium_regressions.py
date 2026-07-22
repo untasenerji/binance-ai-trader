@@ -28,7 +28,6 @@ from app.strategy.backtest import BacktestCosts, WalkForwardRunner
 from app.strategy.gate import CandidateGate, CandidateGateContext
 from app.strategy.models import (
     Candle,
-    FrozenStrategy,
     SignalCandidate,
     StrategyFitResult,
     StrategySpecification,
@@ -47,7 +46,7 @@ def _migration_config(database_url: str) -> Config:
     return config
 
 
-def test_duplicate_legacy_quarantines_keep_every_source_and_resolve_as_one_case(
+def test_duplicate_legacy_quarantines_keep_every_source_and_require_each_resolution(
     tmp_path: Path,
 ) -> None:
     database_url = f"sqlite:///{tmp_path / 'many-to-one-quarantine.sqlite'}"
@@ -113,22 +112,43 @@ def test_duplicate_legacy_quarantines_keep_every_source_and_resolve_as_one_case(
             )
         assert unresolved_before == 1
         assert isinstance(quarantine_id, str)
-        evidence = VerifiedQuarantineResolutionEvidence(
+        first_evidence = VerifiedQuarantineResolutionEvidence(
             account_id=ACCOUNT_ID,
             economic_key=economic_key,
             client_order_id="legacy-many-to-one-entry",
+            attempt_id="attempt-1",
+            source_row_id=source_rows[0].source_row_id,
             query_reference="fresh-verified-query",
             observed_at=datetime.now(UTC),
         )
-        resolution_id = ledger.resolve_evidence_quarantine(
+        first_resolution_id = ledger.resolve_evidence_quarantine(
             quarantine_id,
             operator_id="operator-eight",
-            verified_evidence=evidence,
+            verified_evidence=first_evidence,
         )
-        duplicate_resolution_id = ledger.resolve_evidence_quarantine(
+        duplicate_first_resolution_id = ledger.resolve_evidence_quarantine(
             quarantine_id,
             operator_id="operator-eight",
-            verified_evidence=evidence,
+            verified_evidence=first_evidence,
+        )
+        with session_factory() as session:
+            unresolved_after_first = ledger._unresolved_quarantine_count(  # noqa: SLF001
+                session,
+                account_id=ACCOUNT_ID,
+            )
+        second_evidence = VerifiedQuarantineResolutionEvidence(
+            account_id=ACCOUNT_ID,
+            economic_key=economic_key,
+            client_order_id="legacy-many-to-one-entry",
+            attempt_id="attempt-1",
+            source_row_id=source_rows[1].source_row_id,
+            query_reference="fresh-verified-query-two",
+            observed_at=datetime.now(UTC),
+        )
+        second_resolution_id = ledger.resolve_evidence_quarantine(
+            quarantine_id,
+            operator_id="operator-eight",
+            verified_evidence=second_evidence,
         )
         with session_factory() as session:
             unresolved = ledger._unresolved_quarantine_count(  # noqa: SLF001
@@ -141,7 +161,9 @@ def test_duplicate_legacy_quarantines_keep_every_source_and_resolve_as_one_case(
                 account_id=ACCOUNT_ID,
             )
 
-        assert resolution_id == duplicate_resolution_id
+        assert first_resolution_id == duplicate_first_resolution_id
+        assert second_resolution_id != first_resolution_id
+        assert unresolved_after_first == 1
         assert unresolved == restart_unresolved == 0
     finally:
         engine.dispose()
@@ -221,15 +243,28 @@ def _verified_candidate() -> tuple[StrategySpecification, StrategyFitResult, Sig
 def test_frozen_strategy_rejects_candidate_lineage_substitution(
     mutation: dict[str, str],
 ) -> None:
-    _, fit_result, candidate = _verified_candidate()
-    forged = replace(candidate, **mutation)  # type: ignore[arg-type]
-    frozen = FrozenStrategy(
-        fit_result=fit_result,
-        evaluator=lambda candles, *, timeframe: forged,
+    _, _, candidate = _verified_candidate()
+    try:
+        forged = replace(candidate, **mutation)  # type: ignore[arg-type]
+    except ValueError as error:
+        assert "lineage" in str(error) or "implementation" in str(error)
+        return
+
+    decision = CandidateGate().evaluate(
+        forged,
+        context=CandidateGateContext(
+            expected_lineage=candidate.lineage,
+            risk_allows=True,
+            data_is_fresh=True,
+            estimated_cost=Decimal("0.01"),
+            max_estimated_cost=Decimal("0.02"),
+            expected_net_value=Decimal("0.03"),
+            evaluated_at_ms=1_000,
+        ),
     )
 
-    with pytest.raises(ValueError, match="lineage"):
-        frozen.evaluate((_candle(0, "100"), _candle(1, "103")), timeframe="1m")
+    assert not decision.accepted
+    assert "STRATEGY_LINEAGE_MISMATCH" in decision.reason_codes
 
 
 def test_frozen_strategy_rechecks_specification_and_fit_after_construction() -> None:

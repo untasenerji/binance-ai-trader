@@ -61,7 +61,10 @@ from app.simulation.simulator import (
     SimulatedUnknownRemoteState,
     UnknownOrderOutcome,
 )
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 
 @pytest.fixture
@@ -146,6 +149,17 @@ def _policy(
             exposure_slices=exposure_slices,
         ),
     )
+
+
+def _prepare_admitted_entry(
+    ledger: DurableIntentLedger,
+    intent: SimulatedOrderIntent,
+    *,
+    policy: ActualRiskPolicy | None = None,
+) -> None:
+    if policy is not None:
+        ledger.register_actual_risk_policy(policy)
+    ledger.prepare(intent, admission_decision=ledger.admit_entry(intent))
 
 
 def test_short_better_fill_revalidates_exposure_and_margin_after_fill(
@@ -248,7 +262,7 @@ def test_entry_without_a_matching_durable_policy_fails_closed(
 ) -> None:
     simulator = ExchangeSimulator(intent_ledger=durable_intent_ledger)
 
-    with pytest.raises(EntryRiskBlocked, match="RISK_POLICY_MISSING"):
+    with pytest.raises(EntryRiskBlocked, match="POLICY_MISSING"):
         simulator.submit(_intent(client_order_id="missing-policy-entry", plan_id="missing-policy"))
 
 
@@ -282,7 +296,16 @@ def test_cancelled_intent_accepts_late_fill_and_exact_duplicate_idempotently(
     durable_intent_ledger: DurableIntentLedger,
 ) -> None:
     intent = _intent(client_order_id="late-fill-cancelled", plan_id="late-fill-plan")
-    durable_intent_ledger.prepare(intent)
+    _prepare_admitted_entry(
+        durable_intent_ledger,
+        intent,
+        policy=_policy(
+            plan_id=intent.plan_id,
+            direction=intent.direction,
+            worst_stop_exit_price=Decimal("90"),
+            risk_budget=Decimal("10"),
+        ),
+    )
     durable_intent_ledger.mark_submitting(intent.client_order_id)
     durable_intent_ledger.record_fill(
         _fill(
@@ -327,7 +350,16 @@ def test_filled_intent_accepts_only_an_exact_duplicate_fill(
     durable_intent_ledger: DurableIntentLedger,
 ) -> None:
     intent = _intent(client_order_id="late-fill-filled", plan_id="late-fill-filled-plan")
-    durable_intent_ledger.prepare(intent)
+    _prepare_admitted_entry(
+        durable_intent_ledger,
+        intent,
+        policy=_policy(
+            plan_id=intent.plan_id,
+            direction=intent.direction,
+            worst_stop_exit_price=Decimal("90"),
+            risk_budget=Decimal("10"),
+        ),
+    )
     durable_intent_ledger.mark_submitting(intent.client_order_id)
     fill = _fill(
         trade_id="filled-exact-duplicate",
@@ -406,16 +438,18 @@ def test_breaker_derives_reconciliation_from_repository_ledger_and_algo_stop_rec
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
 
+    batch = exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        )
+    )
+    persist_reconciliation_query_receipt(ledger, batch)
     evidence = breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
-            ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-            )
-        ),
+        reconciliation_snapshot=batch,
     )
 
     assert evidence.reconciliation_outcome.is_clean
@@ -584,7 +618,7 @@ def test_durable_policy_protection_and_fill_conflict_fail_closed(
         )
 
     intent = _intent(client_order_id="durable-policy-fill", plan_id=plan_id)
-    durable_intent_ledger.prepare(intent)
+    _prepare_admitted_entry(durable_intent_ledger, intent)
     durable_intent_ledger.mark_submitting(intent.client_order_id)
     fill = _fill(
         trade_id="durable-policy-trade",
@@ -623,7 +657,16 @@ def test_durable_outcomes_reject_unproven_or_invalid_fill_quantities(
     durable_intent_ledger: DurableIntentLedger,
 ) -> None:
     intent = _intent(client_order_id="invalid-durable-outcome", plan_id="invalid-outcome-plan")
-    durable_intent_ledger.prepare(intent)
+    _prepare_admitted_entry(
+        durable_intent_ledger,
+        intent,
+        policy=_policy(
+            plan_id=intent.plan_id,
+            direction=intent.direction,
+            worst_stop_exit_price=Decimal("90"),
+            risk_budget=Decimal("10"),
+        ),
+    )
     durable_intent_ledger.mark_submitting(intent.client_order_id)
 
     with pytest.raises(ValueError, match="known exchange outcome"):
@@ -650,7 +693,16 @@ def test_absence_recording_rejects_missing_timestamps_before_persisting(
     durable_intent_ledger: DurableIntentLedger,
 ) -> None:
     intent = _intent(client_order_id="absence-missing-times", plan_id="absence-times-plan")
-    durable_intent_ledger.prepare(intent)
+    _prepare_admitted_entry(
+        durable_intent_ledger,
+        intent,
+        policy=_policy(
+            plan_id=intent.plan_id,
+            direction=intent.direction,
+            worst_stop_exit_price=Decimal("90"),
+            risk_budget=Decimal("10"),
+        ),
+    )
     durable_intent_ledger.mark_submitting(intent.client_order_id)
 
     with pytest.raises(IntentLifecycleError, match="timestamps"):
@@ -666,16 +718,18 @@ def test_postgresql_restart_rebuilds_durable_short_risk_and_blocks_follow_on_ent
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(postgresql_session_factory, persistence_breaker=breaker)
     repository = AuditRepository(postgresql_session_factory, persistence_breaker=breaker)
+    batch = exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        )
+    )
+    persist_reconciliation_query_receipt(ledger, batch)
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
-            ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-            )
-        ),
+        reconciliation_snapshot=batch,
     )
     plan_id = "postgresql-short-restart"
     simulator = ExchangeSimulator(

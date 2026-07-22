@@ -18,7 +18,8 @@ from app.simulation.intent_ledger import (
     VerifiedQuarantineResolutionEvidence,
 )
 
-HEAD = "0013_execution_safety_core"
+HEAD = "0014_durable_execution_facts"
+PREVIOUS_HEAD = "0013_execution_safety_core"
 START_REVISIONS = (
     "0008_processed_events_temp",
     "0009_evidence_risk_hardening",
@@ -35,12 +36,18 @@ def _config(database_url: str) -> Config:
     return config
 
 
-def _assert_0013_postconditions(database_url: str) -> None:
+def _assert_0014_postconditions(database_url: str) -> None:
     engine = create_database_engine(database_url)
     try:
         inspector = inspect(engine)
         tables = set(inspector.get_table_names())
-        assert "durable_evidence_quarantine_sources" in tables
+        assert {
+            "durable_evidence_quarantine_sources",
+            "durable_evidence_quarantine_source_resolutions",
+            "durable_adapter_query_receipts",
+            "durable_entry_admission_decisions",
+            "exchange_fill_fact_journal",
+        } <= tables
         fill_columns = {
             str(column["name"]): column for column in inspector.get_columns("durable_intent_fills")
         }
@@ -63,6 +70,8 @@ def _assert_0013_postconditions(database_url: str) -> None:
             for name, column in source_columns.items()
             if name != "query_reference"
         )
+        assert not source_columns["economic_key"]["nullable"]
+        assert not source_columns["attempt_id"]["nullable"]
         index_names = {str(index["name"]) for index in inspector.get_indexes(source_table)}
         assert {
             f"ix_{source_table}_quarantine_id",
@@ -80,6 +89,20 @@ def _assert_0013_postconditions(database_url: str) -> None:
         )
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == HEAD
+            previous_markers = set(
+                connection.scalars(
+                    text(
+                        "SELECT checkpoint FROM migration_execution_markers "
+                        "WHERE migration_revision = :revision"
+                    ),
+                    {"revision": PREVIOUS_HEAD},
+                )
+            )
+            assert {
+                "fill_fact_identity",
+                "quarantine_source_links",
+                "runtime_policy_acl",
+            } <= previous_markers
             markers = set(
                 connection.scalars(
                     text(
@@ -90,9 +113,11 @@ def _assert_0013_postconditions(database_url: str) -> None:
                 )
             )
             assert {
-                "fill_fact_identity",
-                "quarantine_source_links",
-                "runtime_policy_acl",
+                "execution_tables",
+                "source_identity",
+                "grant_receipts",
+                "fill_guards",
+                "execution_evidence_guards",
             } <= markers
             if engine.dialect.name == "sqlite":
                 triggers = set(
@@ -123,7 +148,7 @@ def _assert_0013_postconditions(database_url: str) -> None:
 
 
 @pytest.mark.parametrize("start_revision", START_REVISIONS)
-def test_sqlite_each_supported_revision_upgrades_to_0013(
+def test_sqlite_each_supported_revision_upgrades_to_0014(
     tmp_path: Path,
     start_revision: str,
 ) -> None:
@@ -132,7 +157,7 @@ def test_sqlite_each_supported_revision_upgrades_to_0013(
     command.upgrade(config, start_revision)
     command.upgrade(config, "head")
 
-    _assert_0013_postconditions(database_url)
+    _assert_0014_postconditions(database_url)
 
 
 @pytest.mark.parametrize(
@@ -168,7 +193,7 @@ def test_sqlite_0013_retries_every_checkpoint_and_mid_operation_failure(
 
     monkeypatch.delenv(environment_name)
     command.upgrade(config, "head")
-    _assert_0013_postconditions(database_url)
+    _assert_0014_postconditions(database_url)
 
 
 def test_sqlite_0013_repairs_marker_ahead_missing_index_and_missing_guard(
@@ -186,7 +211,7 @@ def test_sqlite_0013_repairs_marker_ahead_missing_index_and_missing_guard(
                     "(migration_revision, checkpoint) "
                     "VALUES (:revision, 'quarantine_source_links')"
                 ),
-                {"revision": HEAD},
+                {"revision": PREVIOUS_HEAD},
             )
     finally:
         engine.dispose()
@@ -205,7 +230,7 @@ def test_sqlite_0013_repairs_marker_ahead_missing_index_and_missing_guard(
         engine.dispose()
 
     command.upgrade(config, "head")
-    _assert_0013_postconditions(database_url)
+    _assert_0014_postconditions(database_url)
 
 
 @pytest.fixture
@@ -228,7 +253,7 @@ def eighth_postgresql_database() -> Iterator[str]:
 
 @pytest.mark.postgresql
 @pytest.mark.parametrize("start_revision", START_REVISIONS)
-def test_postgresql_each_supported_revision_upgrades_to_0013(
+def test_postgresql_each_supported_revision_upgrades_to_0014(
     eighth_postgresql_database: str,
     start_revision: str,
 ) -> None:
@@ -236,7 +261,7 @@ def test_postgresql_each_supported_revision_upgrades_to_0013(
     command.upgrade(config, start_revision)
     command.upgrade(config, "head")
 
-    _assert_0013_postconditions(eighth_postgresql_database)
+    _assert_0014_postconditions(eighth_postgresql_database)
 
 
 @pytest.mark.postgresql
@@ -263,11 +288,11 @@ def test_postgresql_0013_failure_is_retryable(
 
     monkeypatch.delenv(environment_name)
     command.upgrade(config, "head")
-    _assert_0013_postconditions(eighth_postgresql_database)
+    _assert_0014_postconditions(eighth_postgresql_database)
 
 
 @pytest.mark.postgresql
-def test_postgresql_many_to_one_quarantine_sources_resolve_as_one_case(
+def test_postgresql_many_to_one_quarantine_sources_require_independent_resolution(
     eighth_postgresql_database: str,
 ) -> None:
     config = _config(eighth_postgresql_database)
@@ -312,7 +337,16 @@ def test_postgresql_many_to_one_quarantine_sources_resolve_as_one_case(
             quarantine_id = connection.scalar(
                 text("SELECT quarantine_id FROM durable_evidence_quarantines")
             )
+            source_row_ids = tuple(
+                connection.scalars(
+                    text(
+                        "SELECT source_row_id FROM durable_evidence_quarantine_sources "
+                        "ORDER BY source_row_id"
+                    )
+                )
+            )
         assert isinstance(quarantine_id, str)
+        assert len(source_row_ids) == 2
         with session_factory() as session:
             assert (
                 ledger._unresolved_quarantine_count(  # noqa: SLF001
@@ -321,22 +355,59 @@ def test_postgresql_many_to_one_quarantine_sources_resolve_as_one_case(
                 )
                 == 1
             )
-        evidence = VerifiedQuarantineResolutionEvidence(
+        ambiguous_evidence = VerifiedQuarantineResolutionEvidence(
             account_id="v1-primary",
             economic_key=economic_key,
             client_order_id="postgres-many-to-one-entry",
             query_reference="postgres-fresh-query",
             observed_at=datetime.now(UTC),
         )
+        with pytest.raises(ValueError, match="one exact source row identity"):
+            ledger.resolve_evidence_quarantine(
+                quarantine_id,
+                operator_id="postgres-operator-eight",
+                verified_evidence=ambiguous_evidence,
+            )
+        first_evidence = VerifiedQuarantineResolutionEvidence(
+            account_id="v1-primary",
+            economic_key=economic_key,
+            client_order_id="postgres-many-to-one-entry",
+            attempt_id="attempt-1",
+            source_row_id=source_row_ids[0],
+            query_reference="postgres-fresh-query-one",
+            observed_at=datetime.now(UTC),
+        )
         resolution_id = ledger.resolve_evidence_quarantine(
             quarantine_id,
             operator_id="postgres-operator-eight",
-            verified_evidence=evidence,
+            verified_evidence=first_evidence,
         )
         assert resolution_id == ledger.resolve_evidence_quarantine(
             quarantine_id,
             operator_id="postgres-operator-eight",
-            verified_evidence=evidence,
+            verified_evidence=first_evidence,
+        )
+        with session_factory() as session:
+            assert (
+                ledger._unresolved_quarantine_count(  # noqa: SLF001
+                    session,
+                    account_id="v1-primary",
+                )
+                == 1
+            )
+        second_evidence = VerifiedQuarantineResolutionEvidence(
+            account_id="v1-primary",
+            economic_key=economic_key,
+            client_order_id="postgres-many-to-one-entry",
+            attempt_id="attempt-1",
+            source_row_id=source_row_ids[1],
+            query_reference="postgres-fresh-query-two",
+            observed_at=datetime.now(UTC),
+        )
+        ledger.resolve_evidence_quarantine(
+            quarantine_id,
+            operator_id="postgres-operator-eight",
+            verified_evidence=second_evidence,
         )
         restarted = ledger.reopen_after_restart()
         with session_factory() as session:

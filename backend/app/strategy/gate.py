@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from app.strategy.models import SignalCandidate, StrategyLineage
+from app.strategy.registry import StrategyImplementationRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +57,12 @@ class CandidateGate:
             reason_codes.append("STRATEGY_LINEAGE_MISMATCH")
         if context.expected_net_value <= Decimal("0"):
             reason_codes.append("NON_POSITIVE_EXPECTED_VALUE")
+        if not StrategyImplementationRegistry.is_verified_lineage(context.expected_lineage):
+            reason_codes.append("EXPECTED_STRATEGY_IMPLEMENTATION_UNVERIFIED")
+        if signal is not None and not StrategyImplementationRegistry.is_verified_lineage(
+            signal.lineage
+        ):
+            reason_codes.append("STRATEGY_IMPLEMENTATION_UNVERIFIED")
 
         if reason_codes:
             return CandidateDecision(

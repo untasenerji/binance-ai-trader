@@ -31,6 +31,7 @@ from app.persistence.models import (
     DurableIntentFill,
     DurableOrderIntent,
     DurableRiskReductionRequirement,
+    ExchangeFillFactJournal,
 )
 from app.planning.fills import (
     AccountPortfolioEnvelope,
@@ -47,7 +48,10 @@ from app.simulation.intent_ledger import (
 )
 from app.simulation.models import OrderRole, SimulatedOrderIntent
 from app.simulation.simulator import ExchangeSimulator
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 ACCOUNT_ID = "v1-primary"
 
@@ -458,6 +462,7 @@ def test_restart_rejects_an_expired_durable_reconciliation_batch(
             algo_order_client_ids=frozenset(),
         )
     )
+    persist_reconciliation_query_receipt(ledger, batch)
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
@@ -605,7 +610,7 @@ def test_postgresql_stale_envelope_late_fill_is_durable_and_fenced(
         "after_pending_cancel",
     ),
 )
-def test_postgresql_fill_uow_rolls_back_every_checkpoint_atomically(
+def test_postgresql_fill_crash_retains_the_journal_and_fences_every_entry(
     postgresql_session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
     crash_phase: str,
@@ -675,12 +680,23 @@ def test_postgresql_fill_uow_rolls_back_every_checkpoint_atomically(
                 )
             ).all()
         )
+        fill_facts = tuple(
+            session.scalars(
+                select(ExchangeFillFactJournal).where(
+                    ExchangeFillFactJournal.exchange_trade_id == f"{plan_id}-fill"
+                )
+            ).all()
+        )
 
+    # Stage B is atomic, but a fill accepted by the exchange remains durable
+    # evidence after any crash and closes all entry paths until recovery.
     assert not fills
-    assert {row.status for row in records} == {DurableIntentStatus.NEW.value}
+    assert {row.status for row in records} == {DurableIntentStatus.CANCEL_REQUIRED.value}
     assert {row.filled_quantity for row in records} == {"0"}
     assert risk is not None and Decimal(risk.position_quantity) == Decimal("0")
     assert not reductions
+    assert len(fill_facts) == 1
+    assert fill_facts[0].apply_status == "RECOVERY_REQUIRED"
 
 
 def _assert_narrowed_envelope_rechecks_concurrent_fills(

@@ -9,6 +9,7 @@ from enum import StrEnum
 
 from app.domain.decimal_math import ZERO
 from app.domain.types import Direction
+from app.persistence.circuit_breaker import PersistenceUnavailable
 from app.planning.fills import (
     ActualRiskPolicy,
     FillEvent,
@@ -23,6 +24,7 @@ from app.simulation.intent_ledger import (
     DurableIntentLedger,
     DurableIntentRecord,
     DurableIntentStatus,
+    EntryAdmissionDecision,
 )
 from app.simulation.models import (
     OrderRole,
@@ -187,9 +189,10 @@ class ExchangeSimulator:
             raise DurableIntentLedgerRequired(
                 "simulated submission requires a durable intent ledger"
             )
-        if intent.role is OrderRole.ENTRY:
-            self._authorize_entry_risk(intent)
-        self.intent_ledger.prepare(intent)
+        admission_decision = (
+            self._authorize_entry_risk(intent) if intent.role is OrderRole.ENTRY else None
+        )
+        self.intent_ledger.prepare(intent, admission_decision=admission_decision)
         self.intent_ledger.mark_submitting(
             intent.client_order_id,
             submitted_at_ms=self.now_ms,
@@ -529,23 +532,15 @@ class ExchangeSimulator:
             materialize_simulated_protection=order.intent.role is OrderRole.ENTRY,
         )
 
-    def _authorize_entry_risk(self, intent: SimulatedOrderIntent) -> None:
+    def _authorize_entry_risk(self, intent: SimulatedOrderIntent) -> EntryAdmissionDecision:
         if self.intent_ledger is None:
             raise DurableIntentLedgerRequired(
                 "simulated entry authorization requires a durable intent ledger"
             )
-        policy = self._risk_policy_for(intent.plan_id)
-        if policy is None:
-            raise EntryRiskBlocked("RISK_POLICY_MISSING")
-        if policy.symbol != intent.symbol or policy.direction is not intent.direction:
-            raise EntryRiskBlocked("RISK_POLICY_PLAN_MISMATCH")
-        result = self._evaluate_actual_risk(policy)
-        self._actual_risk_by_plan[intent.plan_id] = result
-        if result.pending_entries_blocked:
-            raise EntryRiskBlocked(result.reason or "ACTUAL_ENTRY_RISK_BLOCKED")
-        projected = self.intent_ledger.projected_entry_risk(intent)
-        if projected.blocked:
-            raise EntryRiskBlocked(projected.reason or "PROJECTED_ENTRY_RISK_BLOCKED")
+        try:
+            return self.intent_ledger.admit_entry(intent)
+        except PersistenceUnavailable as error:
+            raise EntryRiskBlocked(str(error)) from error
 
     def _enforce_actual_entry_risk(
         self,

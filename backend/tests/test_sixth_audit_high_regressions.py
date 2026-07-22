@@ -54,7 +54,10 @@ from app.simulation.simulator import (
     FillSequencePlan,
     SimulatorError,
 )
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 
 def _policy(
@@ -388,16 +391,18 @@ def test_mixed_portfolio_margin_and_exposure_are_order_independent(
         durable_intent_ledger._session_factory,  # noqa: SLF001
         persistence_breaker=breaker,
     )
+    reconciliation_batch = exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        )
+    )
+    persist_reconciliation_query_receipt(durable_intent_ledger, reconciliation_batch)
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=durable_intent_ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
-            ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-            )
-        ),
+        reconciliation_snapshot=reconciliation_batch,
     )
 
     for plan_id in registration_order:
@@ -603,13 +608,19 @@ def test_fill_protection_and_pending_cancel_crash_as_one_unit_of_work(
             )
         )
 
+    # Stage A must survive every application-side crash. Restoring the crash seam
+    # simulates a fresh process whose recovery worker can apply the retained fact.
+    monkeypatch.setattr(
+        DurableIntentLedger,
+        "_fill_uow_checkpoint",
+        staticmethod(lambda _phase: None),
+    )
     restarted = durable_intent_ledger.reopen_after_restart()
-    assert restarted.fill_ledger_for_plan(plan_id).filled_quantity == Decimal("0")
-    assert restarted.intent(f"{plan_id}-stage-1").status is DurableIntentStatus.NEW
-    assert restarted.intent(f"{plan_id}-stage-2").status is DurableIntentStatus.NEW
-    assert restarted.actual_risk_state(plan_id).position_quantity == Decimal("0")
-    with pytest.raises(KeyError):
-        restarted.risk_reduction_requirement(plan_id)
+    assert restarted.fill_ledger_for_plan(plan_id).filled_quantity == Decimal("0.05")
+    assert restarted.intent(f"{plan_id}-stage-1").status is DurableIntentStatus.FILLED
+    assert restarted.intent(f"{plan_id}-stage-2").status is DurableIntentStatus.CANCEL_REQUIRED
+    assert restarted.actual_risk_state(plan_id).position_quantity == Decimal("0.05")
+    assert restarted.risk_reduction_requirement(plan_id).reason == "SIMULATED_PROTECTION_MISSING"
 
 
 def test_published_0009_matches_current_head_bytes() -> None:
@@ -750,7 +761,7 @@ def _assert_published_0009_upgrade(database_url: str) -> None:
                 )
             )
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0013_execution_safety_core"
+                "0014_durable_execution_facts"
             )
         assert reasons == (
             "LEGACY_DUPLICATE_QUERY_EVIDENCE",
@@ -778,17 +789,19 @@ def _assert_published_0009_upgrade(database_url: str) -> None:
             session_factory,
             persistence_breaker=breaker,
         )
+        reconciliation_batch = exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
+        )
+        persist_reconciliation_query_receipt(authorized_ledger, reconciliation_batch)
         with pytest.raises(PersistenceUnavailable, match="UNRESOLVED_QUARANTINE"):
             breaker.reset_after_verified_reconciliation(
                 audit_repository=authorized_repository,
                 intent_ledger=authorized_ledger,
-                reconciliation_snapshot=exchange_reconciliation_batch(
-                    ReconciliationSnapshot(
-                        positions_by_symbol={},
-                        normal_order_client_ids=frozenset(),
-                        algo_order_client_ids=frozenset(),
-                    )
-                ),
+                reconciliation_snapshot=reconciliation_batch,
             )
     finally:
         engine.dispose()
@@ -820,7 +833,7 @@ def _head_schema_signature(database_url: str) -> dict[str, object]:
         engine.dispose()
 
 
-def test_forward_migration_0013_is_the_only_current_head(tmp_path: Path) -> None:
+def test_forward_migration_0014_is_the_only_current_head(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'sixth-head.sqlite'}"
     config = _migration_config(database_url)
     command.upgrade(config, "head")
@@ -828,7 +841,7 @@ def test_forward_migration_0013_is_the_only_current_head(tmp_path: Path) -> None
     try:
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0013_execution_safety_core"
+                "0014_durable_execution_facts"
             )
     finally:
         engine.dispose()
@@ -999,16 +1012,18 @@ def test_breaker_reset_rejects_correct_stop_id_with_wrong_trigger(tmp_path: Path
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
+    initial_batch = exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        )
+    )
+    persist_reconciliation_query_receipt(ledger, initial_batch)
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
-            ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-            )
-        ),
+        reconciliation_snapshot=initial_batch,
     )
     plan_id = "wrong-stop-trigger"
     simulator = ExchangeSimulator(
@@ -1032,34 +1047,36 @@ def test_breaker_reset_rejects_correct_stop_id_with_wrong_trigger(tmp_path: Path
     simulator.submit(_entry("wrong-stop-trigger-entry", plan_id))
     breaker.record_write_failure(RuntimeError("force re-verification"))
 
+    invalid_batch = exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={"BTCUSDT": Decimal("0.01")},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset({f"{plan_id}-expected-stop"}),
+            algo_orders=(
+                ExchangeAlgoOrderObservation(
+                    source="authenticated_exchange_adapter",
+                    account_id="v1-primary",
+                    fetched_at=datetime.now(UTC),
+                    server_time=datetime.now(UTC),
+                    freshness_window=timedelta(seconds=30),
+                    correlation_id="wrong-stop-trigger-observation",
+                    query_epoch=1,
+                    client_algo_id=f"{plan_id}-expected-stop",
+                    symbol="BTCUSDT",
+                    direction=Direction.LONG,
+                    algo_type=AlgoOrderType.STOP_MARKET,
+                    trigger_price=Decimal("50"),
+                    close_position=True,
+                ),
+            ),
+        )
+    )
+    persist_reconciliation_query_receipt(ledger, invalid_batch)
     with pytest.raises(PersistenceUnavailable):
         breaker.reset_after_verified_reconciliation(
             audit_repository=repository,
             intent_ledger=ledger,
-            reconciliation_snapshot=exchange_reconciliation_batch(
-                ReconciliationSnapshot(
-                    positions_by_symbol={"BTCUSDT": Decimal("0.01")},
-                    normal_order_client_ids=frozenset(),
-                    algo_order_client_ids=frozenset({f"{plan_id}-expected-stop"}),
-                    algo_orders=(
-                        ExchangeAlgoOrderObservation(
-                            source="authenticated_exchange_adapter",
-                            account_id="v1-primary",
-                            fetched_at=datetime.now(UTC),
-                            server_time=datetime.now(UTC),
-                            freshness_window=timedelta(seconds=30),
-                            correlation_id="wrong-stop-trigger-observation",
-                            query_epoch=1,
-                            client_algo_id=f"{plan_id}-expected-stop",
-                            symbol="BTCUSDT",
-                            direction=Direction.LONG,
-                            algo_type=AlgoOrderType.STOP_MARKET,
-                            trigger_price=Decimal("50"),
-                            close_position=True,
-                        ),
-                    ),
-                )
-            ),
+            reconciliation_snapshot=invalid_batch,
         )
     engine.dispose()
 

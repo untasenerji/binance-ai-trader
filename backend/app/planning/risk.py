@@ -10,6 +10,7 @@ from app.domain.risk import DEFAULT_HARD_CAPS, PilotHardCaps, RiskSettings, appl
 from app.domain.types import Direction
 from app.planning.ladder import StageBlueprint
 from app.strategy.models import SignalCandidate, StrategyLineage
+from app.strategy.registry import StrategyImplementationRegistry
 
 _BPS_DENOMINATOR = Decimal("10000")
 
@@ -174,6 +175,12 @@ class LadderPlan:
     def __post_init__(self) -> None:
         if type(self.strategy_lineage) is not StrategyLineage:
             raise TypeError("ladder plan requires exact strategy lineage")
+        try:
+            StrategyImplementationRegistry.verify_lineage(self.strategy_lineage)
+        except ValueError as error:
+            raise RiskPlanningError(
+                "ladder plan strategy lineage is not registry-verified"
+            ) from error
 
     @property
     def is_skipped(self) -> bool:
@@ -182,6 +189,13 @@ class LadderPlan:
     def verify_candidate_lineage(self, candidate: SignalCandidate) -> None:
         if type(candidate) is not SignalCandidate:
             raise TypeError("ladder plan lineage check requires an exact candidate")
+        try:
+            StrategyImplementationRegistry.verify_lineage(candidate.lineage)
+            StrategyImplementationRegistry.verify_lineage(self.strategy_lineage)
+        except ValueError as error:
+            raise RiskPlanningError(
+                "candidate or ladder plan lineage is not registry-verified"
+            ) from error
         if candidate.lineage != self.strategy_lineage:
             raise RiskPlanningError("candidate and ladder plan lineage do not match")
 

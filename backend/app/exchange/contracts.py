@@ -50,6 +50,12 @@ class AlgoOrderStatus(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+class AdapterQueryReceiptStatus(StrEnum):
+    STARTED = "STARTED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
 class StopQuantitySemantics(StrEnum):
     CLOSE_POSITION_FULL = "CLOSE_POSITION_FULL"
 
@@ -653,6 +659,118 @@ class ReconciliationSnapshot:
 
 @final
 @dataclass(frozen=True, slots=True)
+class AdapterQueryReceipt:
+    """Typed adapter query evidence that must also exist in durable storage."""
+
+    receipt_id: str
+    account_id: str
+    adapter_instance_id: str
+    query_id: str
+    correlation_id: str
+    query_epoch: int
+    requested_at: datetime
+    completed_at: datetime | None
+    server_time: datetime | None
+    query_type: str
+    response_fingerprint: str | None
+    status: AdapterQueryReceiptStatus
+    receipt_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if not all(
+            (
+                self.receipt_id,
+                self.account_id,
+                self.adapter_instance_id,
+                self.query_id,
+                self.correlation_id,
+                self.query_type,
+            )
+        ):
+            raise ValueError("adapter query receipt identity is incomplete")
+        if (
+            not isinstance(self.query_epoch, int)
+            or isinstance(self.query_epoch, bool)
+            or self.query_epoch < 1
+        ):
+            raise ValueError("adapter query receipt query epoch is invalid")
+        if self.requested_at.tzinfo is None:
+            raise ValueError("adapter query receipt request time must be timezone-aware")
+        requested_at = self.requested_at.astimezone(UTC)
+        completed_at = None if self.completed_at is None else self.completed_at.astimezone(UTC)
+        server_time = None if self.server_time is None else self.server_time.astimezone(UTC)
+        if self.status is AdapterQueryReceiptStatus.COMPLETED:
+            if completed_at is None or server_time is None or not self.response_fingerprint:
+                raise ValueError("completed adapter query receipt is incomplete")
+            if completed_at < requested_at:
+                raise ValueError("adapter query receipt completion predates request")
+        elif (
+            completed_at is not None
+            or server_time is not None
+            or self.response_fingerprint is not None
+        ):
+            raise ValueError("non-completed adapter query receipt carries response evidence")
+        if self.response_fingerprint is not None and (
+            len(self.response_fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in self.response_fingerprint.lower())
+        ):
+            raise ValueError("adapter query response fingerprint is invalid")
+        object.__setattr__(self, "requested_at", requested_at)
+        object.__setattr__(self, "completed_at", completed_at)
+        object.__setattr__(self, "server_time", server_time)
+        expected = self.expected_fingerprint()
+        if self.receipt_fingerprint and self.receipt_fingerprint != expected:
+            raise ValueError("adapter query receipt fingerprint is invalid")
+        object.__setattr__(self, "receipt_fingerprint", expected)
+
+    def expected_fingerprint(self) -> str:
+        canonical = json.dumps(
+            {
+                "account_id": self.account_id,
+                "adapter_instance_id": self.adapter_instance_id,
+                "completed_at": None
+                if self.completed_at is None
+                else self.completed_at.isoformat(),
+                "correlation_id": self.correlation_id,
+                "query_epoch": self.query_epoch,
+                "query_id": self.query_id,
+                "query_type": self.query_type,
+                "receipt_id": self.receipt_id,
+                "requested_at": self.requested_at.isoformat(),
+                "response_fingerprint": self.response_fingerprint,
+                "server_time": None if self.server_time is None else self.server_time.isoformat(),
+                "status": self.status.value,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def require_completed(self) -> None:
+        if self.status is not AdapterQueryReceiptStatus.COMPLETED:
+            raise ValueError("adapter query receipt is not complete")
+
+    def started_record(self) -> "AdapterQueryReceipt":
+        """Return the durable pre-query receipt for this completed adapter result."""
+        return AdapterQueryReceipt(
+            receipt_id=self.receipt_id,
+            account_id=self.account_id,
+            adapter_instance_id=self.adapter_instance_id,
+            query_id=self.query_id,
+            correlation_id=self.correlation_id,
+            query_epoch=self.query_epoch,
+            requested_at=self.requested_at,
+            completed_at=None,
+            server_time=None,
+            query_type=self.query_type,
+            response_fingerprint=None,
+            status=AdapterQueryReceiptStatus.STARTED,
+        )
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class ExchangeReconciliationObservationBatch:
     """One bounded, adapter-attested exchange reconciliation query result.
 
@@ -674,6 +792,8 @@ class ExchangeReconciliationObservationBatch:
     normal_order_client_ids: frozenset[str]
     algo_order_client_ids: frozenset[str]
     algo_orders: tuple[ExchangeAlgoOrderObservation, ...] = ()
+    query_receipt: AdapterQueryReceipt | None = None
+    response_fingerprint: str = field(init=False)
     observation_fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -753,6 +873,23 @@ class ExchangeReconciliationObservationBatch:
         object.__setattr__(self, "algo_order_client_ids", observed_algo_ids)
         object.__setattr__(self, "algo_orders", orders)
         self.require_fresh()
+        response_fingerprint = hashlib.sha256(self._response_canonical_json().encode()).hexdigest()
+        receipt = self.query_receipt
+        if receipt is not None:
+            if type(receipt) is not AdapterQueryReceipt:
+                raise TypeError("reconciliation batch receipt must be an exact adapter receipt")
+            receipt.require_completed()
+            if (
+                receipt.account_id != self.account_id
+                or receipt.correlation_id != self.correlation_id
+                or receipt.query_epoch != self.query_epoch
+                or receipt.requested_at != requested_at
+                or receipt.completed_at != fetched_at
+                or receipt.server_time != server_time
+                or receipt.response_fingerprint != response_fingerprint
+            ):
+                raise ValueError("reconciliation batch does not match its adapter query receipt")
+        object.__setattr__(self, "response_fingerprint", response_fingerprint)
         object.__setattr__(
             self,
             "observation_fingerprint",
@@ -792,7 +929,31 @@ class ExchangeReconciliationObservationBatch:
         return cast(dict[str, object], json.loads(self._canonical_json()))
 
     def _canonical_json(self) -> str:
-        payload = {
+        payload = self._response_payload()
+        receipt = self.query_receipt
+        payload["query_receipt"] = (
+            None
+            if receipt is None
+            else {
+                "adapter_instance_id": receipt.adapter_instance_id,
+                "query_id": receipt.query_id,
+                "receipt_fingerprint": receipt.receipt_fingerprint,
+                "receipt_id": receipt.receipt_id,
+                "status": receipt.status.value,
+            }
+        )
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+    def _response_canonical_json(self) -> str:
+        return json.dumps(
+            self._response_payload(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def _response_payload(self) -> dict[str, object]:
+        return {
             "account_id": self.account_id,
             "algo_order_client_ids": sorted(self.algo_order_client_ids),
             "algo_orders": [
@@ -829,7 +990,6 @@ class ExchangeReconciliationObservationBatch:
             "server_time": self.server_time.isoformat(),
             "source": self.source,
         }
-        return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
 
 
 @dataclass(frozen=True, slots=True)

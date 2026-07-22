@@ -5,28 +5,20 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable, Sequence
 
-from app.strategy.models import (
-    Candle,
-    FrozenStrategy,
-    SignalCandidate,
-    StrategyFitResult,
-    StrategyLineage,
-    StrategySpecification,
-    candle_dataset_fingerprint,
-)
+from app.strategy.models import Candle, FrozenStrategy, SignalCandidate, StrategyLineage
 
 
 def make_strategy_lineage(strategy_id: str = "test_strategy") -> StrategyLineage:
-    def fingerprint(label: str) -> str:
-        return hashlib.sha256(f"{strategy_id}:{label}".encode()).hexdigest()
+    from app.strategy.models import StrategyFitResult, StrategySpecification
 
-    return StrategyLineage(
-        strategy_id=strategy_id,
-        strategy_version="test-v1",
-        strategy_specification_fingerprint=fingerprint("specification"),
-        fit_result_fingerprint=fingerprint("fit"),
-        train_dataset_fingerprint=fingerprint("train"),
-        trainer_version="test-registry-v1",
+    return StrategyLineage.from_fit_result(
+        StrategyFitResult(
+            specification=StrategySpecification.volatility_breakout(lookback=2),
+            training_data_fingerprint=hashlib.sha256(f"{strategy_id}:train".encode()).hexdigest(),
+            training_candle_count=2,
+            training_end_ms=119_999,
+            timeframe="1m",
+        )
     )
 
 
@@ -34,12 +26,5 @@ def make_frozen_strategy(
     candles: Sequence[Candle],
     evaluator: Callable[..., SignalCandidate | None],
 ) -> FrozenStrategy:
-    series = tuple(candles)
-    result = StrategyFitResult(
-        specification=StrategySpecification.no_trade(),
-        training_data_fingerprint=candle_dataset_fingerprint(series),
-        training_candle_count=len(series),
-        training_end_ms=series[-1].close_time_ms,
-        timeframe=series[-1].timeframe,
-    )
-    return FrozenStrategy(fit_result=result, evaluator=evaluator)
+    del candles, evaluator
+    raise TypeError("custom frozen strategy evaluators are not registry-allowed")

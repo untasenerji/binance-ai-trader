@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
@@ -24,6 +24,11 @@ class StrategyLineage:
     fit_result_fingerprint: str
     train_dataset_fingerprint: str
     trainer_version: str
+    trainer_implementation_fingerprint: str = ""
+    evaluator_implementation_fingerprint: str = ""
+    parameter_schema_fingerprint: str = ""
+    source_package_fingerprint: str = ""
+    registry_version: str = ""
 
     def __post_init__(self) -> None:
         if not self.strategy_id or not self.strategy_version or not self.trainer_version:
@@ -39,6 +44,38 @@ class StrategyLineage:
             for value in fingerprints
         ):
             raise ValueError("strategy lineage fingerprints must be SHA-256 hex")
+        from app.strategy.registry import StrategyImplementationRegistry
+
+        record = StrategyImplementationRegistry.maybe_record_for(
+            strategy_id=self.strategy_id,
+            implementation_version=self.strategy_version,
+        )
+        implementation_fields = (
+            ("trainer_implementation_fingerprint", "trainer_implementation_fingerprint"),
+            ("evaluator_implementation_fingerprint", "evaluator_implementation_fingerprint"),
+            ("parameter_schema_fingerprint", "parameter_schema_fingerprint"),
+            ("source_package_fingerprint", "source_package_fingerprint"),
+        )
+        if record is not None:
+            if self.trainer_version != record.trainer_version:
+                raise ValueError("strategy lineage trainer version is invalid")
+            for field_name, record_field_name in implementation_fields:
+                supplied = getattr(self, field_name)
+                expected = getattr(record, record_field_name)
+                if supplied and supplied != expected:
+                    raise ValueError("strategy lineage implementation fingerprint is invalid")
+                object.__setattr__(self, field_name, expected)
+            if (
+                self.registry_version
+                and self.registry_version != StrategyImplementationRegistry.version
+            ):
+                raise ValueError("strategy lineage registry version is invalid")
+            object.__setattr__(self, "registry_version", StrategyImplementationRegistry.version)
+        elif (
+            any(getattr(self, field_name) for field_name, _ in implementation_fields)
+            or self.registry_version
+        ):
+            raise ValueError("strategy lineage implementation is not allowlisted")
 
     @classmethod
     def from_fit_result(cls, fit_result: StrategyFitResult) -> StrategyLineage:
@@ -52,6 +89,11 @@ class StrategyLineage:
             fit_result_fingerprint=fit_result.fingerprint,
             train_dataset_fingerprint=fit_result.training_data_fingerprint,
             trainer_version=fit_result.trainer_version,
+            trainer_implementation_fingerprint=(fit_result.trainer_implementation_fingerprint),
+            evaluator_implementation_fingerprint=(fit_result.evaluator_implementation_fingerprint),
+            parameter_schema_fingerprint=fit_result.parameter_schema_fingerprint,
+            source_package_fingerprint=fit_result.source_package_fingerprint,
+            registry_version=fit_result.registry_version,
         )
 
 
@@ -116,6 +158,11 @@ class SignalCandidate:
     fit_result_fingerprint: str
     train_dataset_fingerprint: str
     trainer_version: str
+    trainer_implementation_fingerprint: str
+    evaluator_implementation_fingerprint: str
+    parameter_schema_fingerprint: str
+    source_package_fingerprint: str
+    registry_version: str
     symbol: str
     direction: Direction
     reference_price: Decimal
@@ -132,14 +179,34 @@ class SignalCandidate:
             or not self.timeframe
         ):
             raise ValueError("strategy identity, symbol, and timeframe are required")
-        StrategyLineage(
+        lineage = StrategyLineage(
             strategy_id=self.strategy_id,
             strategy_version=self.strategy_version,
             strategy_specification_fingerprint=self.strategy_specification_fingerprint,
             fit_result_fingerprint=self.fit_result_fingerprint,
             train_dataset_fingerprint=self.train_dataset_fingerprint,
             trainer_version=self.trainer_version,
+            trainer_implementation_fingerprint=self.trainer_implementation_fingerprint,
+            evaluator_implementation_fingerprint=self.evaluator_implementation_fingerprint,
+            parameter_schema_fingerprint=self.parameter_schema_fingerprint,
+            source_package_fingerprint=self.source_package_fingerprint,
+            registry_version=self.registry_version,
         )
+        object.__setattr__(
+            self,
+            "trainer_implementation_fingerprint",
+            lineage.trainer_implementation_fingerprint,
+        )
+        object.__setattr__(
+            self,
+            "evaluator_implementation_fingerprint",
+            lineage.evaluator_implementation_fingerprint,
+        )
+        object.__setattr__(
+            self, "parameter_schema_fingerprint", lineage.parameter_schema_fingerprint
+        )
+        object.__setattr__(self, "source_package_fingerprint", lineage.source_package_fingerprint)
+        object.__setattr__(self, "registry_version", lineage.registry_version)
         if self.reference_price <= ZERO or self.invalidation_price <= ZERO:
             raise ValueError("candidate prices must be positive")
         if self.direction is Direction.LONG and self.invalidation_price >= self.reference_price:
@@ -158,6 +225,11 @@ class SignalCandidate:
             fit_result_fingerprint=self.fit_result_fingerprint,
             train_dataset_fingerprint=self.train_dataset_fingerprint,
             trainer_version=self.trainer_version,
+            trainer_implementation_fingerprint=self.trainer_implementation_fingerprint,
+            evaluator_implementation_fingerprint=self.evaluator_implementation_fingerprint,
+            parameter_schema_fingerprint=self.parameter_schema_fingerprint,
+            source_package_fingerprint=self.source_package_fingerprint,
+            registry_version=self.registry_version,
         )
 
     @classmethod
@@ -182,6 +254,11 @@ class SignalCandidate:
             fit_result_fingerprint=lineage.fit_result_fingerprint,
             train_dataset_fingerprint=lineage.train_dataset_fingerprint,
             trainer_version=lineage.trainer_version,
+            trainer_implementation_fingerprint=lineage.trainer_implementation_fingerprint,
+            evaluator_implementation_fingerprint=lineage.evaluator_implementation_fingerprint,
+            parameter_schema_fingerprint=lineage.parameter_schema_fingerprint,
+            source_package_fingerprint=lineage.source_package_fingerprint,
+            registry_version=lineage.registry_version,
             symbol=symbol,
             direction=direction,
             reference_price=reference_price,
@@ -192,14 +269,17 @@ class SignalCandidate:
         )
 
 
-FrozenStrategyEvaluator = Callable[..., SignalCandidate | None]
-
-
 class Strategy(Protocol):
     @property
     def strategy_id(self) -> str: ...
 
     def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None: ...
+
+
+class StrategyEvaluator(Protocol):
+    """The reviewed callable signature used by frozen strategy evaluation."""
+
+    def __call__(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None: ...
 
 
 class TrainableStrategy(Protocol):
@@ -367,6 +447,12 @@ class StrategyFitResult:
     strategy_id: str = ""
     strategy_version: str = ""
     trainer_version: str = "builtin-registry-v1"
+    implementation_version: str = ""
+    trainer_implementation_fingerprint: str = ""
+    evaluator_implementation_fingerprint: str = ""
+    parameter_schema_fingerprint: str = ""
+    source_package_fingerprint: str = ""
+    registry_version: str = ""
     fingerprint: str = ""
 
     def __post_init__(self) -> None:
@@ -381,10 +467,38 @@ class StrategyFitResult:
             raise ValueError("fit result strategy version does not match its specification")
         object.__setattr__(self, "strategy_id", expected_strategy_id)
         object.__setattr__(self, "strategy_version", expected_strategy_version)
+        from app.strategy.registry import StrategyImplementationRegistry
+
+        record = StrategyImplementationRegistry.record_for(
+            strategy_id=expected_strategy_id,
+            implementation_version=expected_strategy_version,
+        )
+        if (
+            self.implementation_version
+            and self.implementation_version != record.implementation_version
+        ):
+            raise ValueError("fit result implementation version is invalid")
+        object.__setattr__(self, "implementation_version", record.implementation_version)
+        for field_name, expected in (
+            ("trainer_implementation_fingerprint", record.trainer_implementation_fingerprint),
+            ("evaluator_implementation_fingerprint", record.evaluator_implementation_fingerprint),
+            ("parameter_schema_fingerprint", record.parameter_schema_fingerprint),
+            ("source_package_fingerprint", record.source_package_fingerprint),
+        ):
+            supplied = getattr(self, field_name)
+            if supplied and supplied != expected:
+                raise ValueError("fit result implementation fingerprint is invalid")
+            object.__setattr__(self, field_name, expected)
+        if (
+            self.registry_version
+            and self.registry_version != StrategyImplementationRegistry.version
+        ):
+            raise ValueError("fit result registry version is invalid")
+        object.__setattr__(self, "registry_version", StrategyImplementationRegistry.version)
         if (
             len(self.training_data_fingerprint) != 64
             or not self.timeframe
-            or self.trainer_version != "builtin-registry-v1"
+            or self.trainer_version != record.trainer_version
         ):
             raise ValueError("fit result provenance is invalid")
         if (
@@ -409,11 +523,17 @@ class StrategyFitResult:
                 "specification_fingerprint": self.specification.fingerprint,
                 "strategy_id": self.strategy_id,
                 "strategy_version": self.strategy_version,
+                "implementation_version": self.implementation_version,
                 "timeframe": self.timeframe,
                 "training_candle_count": self.training_candle_count,
                 "training_data_fingerprint": self.training_data_fingerprint,
                 "training_end_ms": self.training_end_ms,
                 "trainer_version": self.trainer_version,
+                "trainer_implementation_fingerprint": self.trainer_implementation_fingerprint,
+                "evaluator_implementation_fingerprint": self.evaluator_implementation_fingerprint,
+                "parameter_schema_fingerprint": self.parameter_schema_fingerprint,
+                "source_package_fingerprint": self.source_package_fingerprint,
+                "registry_version": self.registry_version,
             },
             ensure_ascii=True,
             separators=(",", ":"),
@@ -431,23 +551,23 @@ class StrategyFitResult:
             or self.strategy_version != expected_strategy_version
         ):
             raise ValueError("strategy fit identity is invalid")
+        from app.strategy.registry import StrategyImplementationRegistry
+
+        StrategyImplementationRegistry.verify_fit_result(self)
         if self.fingerprint != self.expected_fingerprint():
             raise ValueError("strategy fit fingerprint is invalid")
 
 
 @dataclass(frozen=True, slots=True)
 class FrozenStrategy:
-    """An evaluator cryptographically bound to one immutable train-only fit result."""
+    """A registry evaluator cryptographically bound to one immutable train-only fit."""
 
     fit_result: StrategyFitResult
-    evaluator: FrozenStrategyEvaluator = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.fit_result) is not StrategyFitResult:
             raise TypeError("frozen strategy requires an exact fit result")
         self.fit_result.verify_fingerprint()
-        if not callable(self.evaluator):
-            raise TypeError("frozen strategy evaluator must be callable")
 
     @property
     def lineage(self) -> StrategyLineage:
@@ -489,9 +609,32 @@ class FrozenStrategy:
     def trainer_version(self) -> str:
         return self.fit_result.trainer_version
 
+    @property
+    def trainer_implementation_fingerprint(self) -> str:
+        return self.fit_result.trainer_implementation_fingerprint
+
+    @property
+    def evaluator_implementation_fingerprint(self) -> str:
+        return self.fit_result.evaluator_implementation_fingerprint
+
+    @property
+    def parameter_schema_fingerprint(self) -> str:
+        return self.fit_result.parameter_schema_fingerprint
+
+    @property
+    def source_package_fingerprint(self) -> str:
+        return self.fit_result.source_package_fingerprint
+
+    @property
+    def registry_version(self) -> str:
+        return self.fit_result.registry_version
+
     def evaluate(self, candles: Sequence[Candle], *, timeframe: str) -> SignalCandidate | None:
         self.fit_result.verify_fingerprint()
-        candidate = self.evaluator(tuple(candles), timeframe=timeframe)
+        from app.strategy.registry import StrategyImplementationRegistry
+
+        evaluator = StrategyImplementationRegistry.evaluator_for_fit(self.fit_result)
+        candidate = evaluator(tuple(candles), timeframe=timeframe)
         if candidate is None:
             return None
         if type(candidate) is not SignalCandidate:

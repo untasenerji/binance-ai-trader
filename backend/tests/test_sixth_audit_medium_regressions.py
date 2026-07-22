@@ -9,7 +9,7 @@ from urllib.parse import quote
 import pytest
 
 from app.domain.types import Direction
-from app.exchange.contracts import ReconciliationSnapshot
+from app.exchange.contracts import ExchangeReconciliationObservationBatch, ReconciliationSnapshot
 from app.observability.logging import redact_for_log, redact_text
 from app.persistence.audit import AuditRepository
 from app.persistence.circuit_breaker import PersistenceCircuitBreaker, PersistenceUnavailable
@@ -18,7 +18,11 @@ from app.simulation.intent_ledger import DurableIntentLedger
 from app.simulation.models import OrderRole, SimulatedOrderIntent
 from app.strategy.backtest import BacktestCosts, WalkForwardRunner
 from app.strategy.models import Candle, StrategySpecification
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.conftest import actual_risk_policy_for
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 
 def _entry(client_order_id: str, plan_id: str) -> SimulatedOrderIntent:
@@ -31,6 +35,21 @@ def _entry(client_order_id: str, plan_id: str) -> SimulatedOrderIntent:
         stage_index=1,
         quantity=Decimal("0.01"),
         price=Decimal("100"),
+    )
+
+
+def _persisted_clean_snapshot(
+    ledger: DurableIntentLedger,
+) -> ExchangeReconciliationObservationBatch:
+    return persist_reconciliation_query_receipt(
+        ledger,
+        exchange_reconciliation_batch(
+            ReconciliationSnapshot(
+                positions_by_symbol={},
+                normal_order_client_ids=frozenset(),
+                algo_order_client_ids=frozenset(),
+            )
+        ),
     )
 
 
@@ -129,16 +148,13 @@ def test_verified_durable_capability_survives_process_object_restart(tmp_path: P
         persistence_breaker=initial_breaker,
     )
     repository = AuditRepository(session_factory, persistence_breaker=initial_breaker)
+    entry = _entry("durable-capability-entry", "durable-capability-plan")
+    initial_ledger.register_actual_risk_policy(actual_risk_policy_for(entry.plan_id))
+    snapshot = _persisted_clean_snapshot(initial_ledger)
     initial_breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=initial_ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
-            ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-            )
-        ),
+        reconciliation_snapshot=snapshot,
     )
 
     restarted = DurableIntentLedger(
@@ -146,7 +162,7 @@ def test_verified_durable_capability_survives_process_object_restart(tmp_path: P
         persistence_breaker=PersistenceCircuitBreaker(),
     )
 
-    assert restarted.prepare(_entry("durable-capability-entry", "durable-capability-plan"))
+    assert restarted.prepare(entry, admission_decision=restarted.admit_entry(entry))
     engine.dispose()
 
 
@@ -157,13 +173,7 @@ def test_persistence_failure_durably_revokes_existing_capability(tmp_path: Path)
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
-    snapshot = exchange_reconciliation_batch(
-        ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-        )
-    )
+    snapshot = _persisted_clean_snapshot(ledger)
     evidence = breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
@@ -190,13 +200,9 @@ def test_durable_authorization_rejects_audit_head_change_after_grant(tmp_path: P
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
-    snapshot = exchange_reconciliation_batch(
-        ReconciliationSnapshot(
-            positions_by_symbol={},
-            normal_order_client_ids=frozenset(),
-            algo_order_client_ids=frozenset(),
-        )
-    )
+    entry = _entry("changed-head-entry", "changed-head-plan")
+    ledger.register_actual_risk_policy(actual_risk_policy_for(entry.plan_id))
+    snapshot = _persisted_clean_snapshot(ledger)
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
@@ -211,7 +217,7 @@ def test_durable_authorization_rejects_audit_head_change_after_grant(tmp_path: P
     )
 
     with pytest.raises(PersistenceUnavailable, match="AUDIT_REPLAY_CHANGED"):
-        ledger.prepare(_entry("changed-head-entry", "changed-head-plan"))
+        ledger.admit_entry(entry)
     engine.dispose()
 
 
@@ -222,21 +228,20 @@ def test_durable_authorization_rejects_new_unresolved_intent(tmp_path: Path) -> 
     breaker = PersistenceCircuitBreaker()
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
+    first = _entry("first-unresolved-entry", "first-unresolved-plan")
+    second = _entry("second-unresolved-entry", "second-unresolved-plan")
+    ledger.register_actual_risk_policy(actual_risk_policy_for(first.plan_id))
+    ledger.register_actual_risk_policy(actual_risk_policy_for(second.plan_id))
+    snapshot = _persisted_clean_snapshot(ledger)
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
-            ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-            )
-        ),
+        reconciliation_snapshot=snapshot,
     )
-    ledger.prepare(_entry("first-unresolved-entry", "first-unresolved-plan"))
+    ledger.prepare(first, admission_decision=ledger.admit_entry(first))
 
     with pytest.raises(PersistenceUnavailable, match="UNRESOLVED_INTENT_PRESENT"):
-        ledger.prepare(_entry("second-unresolved-entry", "second-unresolved-plan"))
+        ledger.admit_entry(second)
     engine.dispose()
 
 

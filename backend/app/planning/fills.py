@@ -53,6 +53,8 @@ class FillEvent:
     occurred_at: datetime
     observation_source: FillObservationSource
     observation_reference: str
+    observation_correlation: str | None = None
+    provenance_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not all(
@@ -84,6 +86,16 @@ class FillEvent:
             raise FillLedgerError("fill price and fee are invalid")
         if self.occurred_at.tzinfo is None:
             raise FillLedgerError("fill timestamp must be timezone-aware")
+        if self.observation_correlation is not None and not self.observation_correlation:
+            raise FillLedgerError("fill observation correlation cannot be empty")
+        if self.provenance_fingerprint is not None and (
+            len(self.provenance_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.provenance_fingerprint.lower()
+            )
+        ):
+            raise FillLedgerError("fill provenance fingerprint is invalid")
 
 
 @dataclass(frozen=True, slots=True)

@@ -13,6 +13,9 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
 )
+from sqlalchemy import (
+    inspect as sa_inspect,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -141,6 +144,49 @@ class DurableIntentFill(Base):
     fee_asset: Mapped[str] = mapped_column(String(32))
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ExchangeFillFactJournal(Base):
+    """Durable exchange-delivered fill facts, retained even when application fails."""
+
+    __tablename__ = "exchange_fill_fact_journal"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "exchange_trade_id",
+            name="uq_exchange_fill_fact_account_trade",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    exchange_trade_id: Mapped[str] = mapped_column(String(128))
+    client_order_id: Mapped[str] = mapped_column(String(128), index=True)
+    # The exchange fact must survive even when the local intent lookup itself
+    # fails, so this intentionally is not a foreign key.
+    intent_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    side: Mapped[str] = mapped_column(String(8))
+    quantity: Mapped[str] = mapped_column(String(64))
+    cumulative_quantity: Mapped[str] = mapped_column(String(64))
+    price: Mapped[str] = mapped_column(String(64))
+    fee: Mapped[str] = mapped_column(String(64))
+    fee_asset: Mapped[str] = mapped_column(String(32))
+    exchange_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    observation_source: Mapped[str] = mapped_column(String(64))
+    observation_reference: Mapped[str] = mapped_column(String(128))
+    observation_correlation: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    provenance_fingerprint: Mapped[str] = mapped_column(String(64))
+    semantic_fingerprint: Mapped[str] = mapped_column(String(64))
+    materialize_simulated_protection: Mapped[bool] = mapped_column(Boolean, default=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    # Application bookkeeping is the only mutable portion of a fact row. The
+    # database guard installed by migration 0014 rejects every economic-field
+    # mutation and DELETE.
+    apply_status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    apply_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_apply_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class DurableIntentAbsenceObservation(Base):
@@ -323,9 +369,77 @@ class DurableEntryAuthorizationGrant(Base):
     reconciliation_fingerprint: Mapped[str] = mapped_column(String(64))
     exchange_snapshot: Mapped[dict[str, object]] = mapped_column(JSON)
     exchange_snapshot_fingerprint: Mapped[str] = mapped_column(String(64))
+    query_receipt_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    query_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    query_correlation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    query_response_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     local_state_snapshot: Mapped[dict[str, object]] = mapped_column(JSON)
     local_state_fingerprint: Mapped[str] = mapped_column(String(64))
     capability_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableAdapterQueryReceipt(Base):
+    """Durable lifecycle receipt for one authenticated-adapter query."""
+
+    __tablename__ = "durable_adapter_query_receipts"
+    __table_args__ = (
+        UniqueConstraint("account_id", "query_id", name="uq_adapter_receipt_account_query"),
+        UniqueConstraint(
+            "account_id",
+            "adapter_instance_id",
+            "query_epoch",
+            name="uq_adapter_receipt_adapter_epoch",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    receipt_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    adapter_instance_id: Mapped[str] = mapped_column(String(128))
+    query_id: Mapped[str] = mapped_column(String(128))
+    correlation_id: Mapped[str] = mapped_column(String(128))
+    query_epoch: Mapped[int] = mapped_column(Integer)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    server_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    query_type: Mapped[str] = mapped_column(String(64))
+    response_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    receipt_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class DurableEntryAdmissionDecision(Base):
+    """Central, per-intent entry decision that cannot be reconstructed by callers."""
+
+    __tablename__ = "durable_entry_admission_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    decision_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    client_order_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    plan_id: Mapped[str] = mapped_column(String(128), index=True)
+    risk_policy_id: Mapped[str] = mapped_column(String(128))
+    risk_policy_version: Mapped[int] = mapped_column(Integer)
+    risk_policy_fingerprint: Mapped[str] = mapped_column(String(64))
+    envelope_version: Mapped[int] = mapped_column(Integer)
+    envelope_fingerprint: Mapped[str] = mapped_column(String(64))
+    symbol: Mapped[str] = mapped_column(String(32))
+    side: Mapped[str] = mapped_column(String(16))
+    max_quantity: Mapped[str] = mapped_column(String(64))
+    max_notional_usdt: Mapped[str] = mapped_column(String(64))
+    leverage: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    grant_generation: Mapped[int] = mapped_column(Integer)
+    failure_epoch: Mapped[int] = mapped_column(Integer)
+    recovery_epoch: Mapped[int] = mapped_column(Integer)
+    query_epoch: Mapped[int] = mapped_column(Integer)
+    grant_id: Mapped[str] = mapped_column(String(128))
+    decision_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -531,7 +645,9 @@ class DurableEvidenceQuarantineSource(Base):
     source_table: Mapped[str] = mapped_column(String(128))
     source_row_id: Mapped[str] = mapped_column(String(128))
     source_identity: Mapped[str] = mapped_column(String(256))
+    economic_key: Mapped[str] = mapped_column(String(256))
     client_order_id: Mapped[str] = mapped_column(String(128))
+    attempt_id: Mapped[str] = mapped_column(String(128), default="attempt-1")
     query_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
     provenance_fingerprint: Mapped[str] = mapped_column(String(64))
     evidence: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
@@ -546,6 +662,31 @@ class DurableEvidenceQuarantineResolution(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     resolution_id: Mapped[str] = mapped_column(String(128), unique=True)
+    quarantine_id: Mapped[str] = mapped_column(
+        ForeignKey("durable_evidence_quarantines.quarantine_id"), index=True
+    )
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    operator_id: Mapped[str] = mapped_column(String(128))
+    verified_evidence_source: Mapped[str] = mapped_column(String(64))
+    verified_query_reference: Mapped[str] = mapped_column(String(128))
+    verified_evidence_fingerprint: Mapped[str] = mapped_column(String(64))
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class DurableEvidenceQuarantineSourceResolution(Base):
+    """Independent resolution evidence for one immutable quarantine source."""
+
+    __tablename__ = "durable_evidence_quarantine_source_resolutions"
+    __table_args__ = (
+        UniqueConstraint("source_id", name="uq_evidence_quarantine_source_resolution"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    resolution_id: Mapped[str] = mapped_column(String(128), unique=True)
+    source_id: Mapped[int] = mapped_column(
+        ForeignKey("durable_evidence_quarantine_sources.id"), index=True
+    )
     quarantine_id: Mapped[str] = mapped_column(
         ForeignKey("durable_evidence_quarantines.quarantine_id"), index=True
     )
@@ -596,6 +737,44 @@ def _reject_durable_evidence_mutation(*_: object) -> None:
     raise AppendOnlyViolation("durable reconciliation evidence is append-only")
 
 
+@event.listens_for(ExchangeFillFactJournal, "before_update")
+def _reject_exchange_fill_fact_economic_mutation(
+    _mapper: object,
+    _connection: object,
+    target: ExchangeFillFactJournal,
+) -> None:
+    """Stage-B bookkeeping may change; exchange facts themselves never may."""
+    immutable_fields = (
+        "account_id",
+        "exchange_trade_id",
+        "client_order_id",
+        "intent_id",
+        "symbol",
+        "side",
+        "quantity",
+        "cumulative_quantity",
+        "price",
+        "fee",
+        "fee_asset",
+        "exchange_timestamp",
+        "observation_source",
+        "observation_reference",
+        "observation_correlation",
+        "provenance_fingerprint",
+        "semantic_fingerprint",
+        "materialize_simulated_protection",
+        "received_at",
+    )
+    state = sa_inspect(target)
+    if any(state.attrs[field_name].history.has_changes() for field_name in immutable_fields):
+        raise AppendOnlyViolation("exchange fill facts are immutable")
+
+
+@event.listens_for(ExchangeFillFactJournal, "before_delete")
+def _reject_exchange_fill_fact_delete(*_: object) -> None:
+    raise AppendOnlyViolation("exchange fill facts are append-only")
+
+
 @event.listens_for(DurableActualRiskPolicy, "before_update")
 @event.listens_for(DurableActualRiskPolicy, "before_delete")
 @event.listens_for(DurableActualRiskPolicyVersion, "before_update")
@@ -608,6 +787,8 @@ def _reject_durable_evidence_mutation(*_: object) -> None:
 @event.listens_for(DurableEntryAuthorizationGrant, "before_delete")
 @event.listens_for(DurableEntryAuthorizationRevocation, "before_update")
 @event.listens_for(DurableEntryAuthorizationRevocation, "before_delete")
+@event.listens_for(DurableEntryAdmissionDecision, "before_update")
+@event.listens_for(DurableEntryAdmissionDecision, "before_delete")
 @event.listens_for(DurablePortfolioEnvelopeHead, "before_update")
 @event.listens_for(DurablePortfolioEnvelopeHead, "before_delete")
 @event.listens_for(DurablePortfolioEnvelopeSupersession, "before_update")
@@ -618,5 +799,7 @@ def _reject_durable_evidence_mutation(*_: object) -> None:
 @event.listens_for(DurableEvidenceQuarantineSource, "before_delete")
 @event.listens_for(DurableEvidenceQuarantineResolution, "before_update")
 @event.listens_for(DurableEvidenceQuarantineResolution, "before_delete")
+@event.listens_for(DurableEvidenceQuarantineSourceResolution, "before_update")
+@event.listens_for(DurableEvidenceQuarantineSourceResolution, "before_delete")
 def _reject_durable_policy_mutation(*_: object) -> None:
     raise AppendOnlyViolation("durable policy and authorization evidence is append-only")

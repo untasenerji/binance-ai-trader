@@ -3,6 +3,8 @@ from decimal import Decimal
 import pytest
 
 from app.domain.types import Direction
+from app.exchange.contracts import ReconciliationSnapshot
+from app.persistence.audit import AuditRepository
 from app.simulation.failure import FailureAction, FailureCoordinator
 from app.simulation.intent_ledger import (
     AbsenceEvidenceSource,
@@ -25,6 +27,10 @@ from app.simulation.simulator import (
     UnknownOrderOutcome,
 )
 from tests.conftest import actual_risk_policy_for
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 
 def _intent(
@@ -108,6 +114,26 @@ def test_delayed_event_and_unknown_outcome_prevent_duplicate_economic_order(
         for source in AbsenceEvidenceSource:
             unknown.query_unknown_source(unknown_intent.client_order_id, source)
     unknown.resolve_unknown_as_absent(unknown_intent.client_order_id)
+
+    # An UNKNOWN resolution revokes the old admission capability. The replacement
+    # needs a new durable reconciliation, not merely local absence observations.
+    batch = exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset({"UTA1-plan-EN-1-1"}),
+            algo_order_client_ids=frozenset(),
+        )
+    )
+    persist_reconciliation_query_receipt(durable_intent_ledger, batch)
+    breaker = durable_intent_ledger._persistence_breaker  # noqa: SLF001
+    breaker.reset_after_verified_reconciliation(
+        audit_repository=AuditRepository(
+            durable_intent_ledger._session_factory,  # noqa: SLF001
+            persistence_breaker=breaker,
+        ),
+        intent_ledger=durable_intent_ledger,
+        reconciliation_snapshot=batch,
+    )
     replacement = unknown.submit(_intent(client_id="UTA1-plan-EN-2-2", stage_index=2))
     assert replacement.status is SimulatedOrderStatus.NEW
 

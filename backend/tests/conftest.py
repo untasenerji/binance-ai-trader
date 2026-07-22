@@ -15,7 +15,10 @@ from app.persistence.database import create_database_engine, create_schema, crea
 from app.persistence.models import Base
 from app.planning.fills import AccountPortfolioEnvelope, ActualRiskPolicy
 from app.simulation.intent_ledger import DurableIntentLedger
-from tests.reconciliation_factory import exchange_reconciliation_batch
+from tests.reconciliation_factory import (
+    exchange_reconciliation_batch,
+    persist_reconciliation_query_receipt,
+)
 
 LOCAL_POSTGRES_TEST_URL = "postgresql+psycopg://postgres@127.0.0.1:5432/uta"
 
@@ -67,16 +70,18 @@ def durable_intent_ledger(tmp_path: Path) -> Iterator[DurableIntentLedger]:
     session_factory = create_session_factory(engine)
     ledger = DurableIntentLedger(session_factory, persistence_breaker=breaker)
     repository = AuditRepository(session_factory, persistence_breaker=breaker)
+    reconciliation_batch = exchange_reconciliation_batch(
+        ReconciliationSnapshot(
+            positions_by_symbol={},
+            normal_order_client_ids=frozenset(),
+            algo_order_client_ids=frozenset(),
+        )
+    )
+    persist_reconciliation_query_receipt(ledger, reconciliation_batch)
     breaker.reset_after_verified_reconciliation(
         audit_repository=repository,
         intent_ledger=ledger,
-        reconciliation_snapshot=exchange_reconciliation_batch(
-            ReconciliationSnapshot(
-                positions_by_symbol={},
-                normal_order_client_ids=frozenset(),
-                algo_order_client_ids=frozenset(),
-            )
-        ),
+        reconciliation_snapshot=reconciliation_batch,
     )
     try:
         yield ledger
