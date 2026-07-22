@@ -103,3 +103,16 @@
 - Hosted GitHub Actions and external `live_public` remain **NOT VERIFIED**. No API key, signer,
   authenticated transport, testnet path, test order, or live-order path was added.
 - Phase 14 remains **LOCKED**.
+
+## Ninth PostgreSQL Trigger Semantic Follow-up
+
+- Base revision: `4eea4aa77cba98917ef7681b06864792a64aaf02`; implementation checkpoint:
+  `4c53a52511176c287913eb738011759cc8922904`
+  (`fix: verify postgresql fill trigger semantics`).
+- `docs/NINTH_AUDIT_TRIGGER_FOLLOWUP_REPORT.md` records canonical PostgreSQL function fingerprint,
+  trigger-binding, behavioral-probe, crash/retry, and real Docker PostgreSQL evidence for the
+  forward-only `0015_fill_trigger_semantics` revision.
+- Published `0009`, `0011`, `0012`, `0013`, and `0014` migrations remain unchanged; the new
+  trigger semantic repair resides only in `0015_postgresql_fill_trigger_semantics.py`.
+- Phase 14 remains **LOCKED**. No API key, signer, authenticated transport, testnet path, test
+  order, or live-order path was added.
