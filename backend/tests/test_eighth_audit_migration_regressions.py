@@ -18,7 +18,8 @@ from app.simulation.intent_ledger import (
     VerifiedQuarantineResolutionEvidence,
 )
 
-HEAD = "0014_durable_execution_facts"
+HEAD = "0015_fill_trigger_semantics"
+NINTH_HEAD = "0014_durable_execution_facts"
 PREVIOUS_HEAD = "0013_execution_safety_core"
 START_REVISIONS = (
     "0008_processed_events_temp",
@@ -109,7 +110,7 @@ def _assert_0014_postconditions(database_url: str) -> None:
                         "SELECT checkpoint FROM migration_execution_markers "
                         "WHERE migration_revision = :revision"
                     ),
-                    {"revision": HEAD},
+                    {"revision": NINTH_HEAD},
                 )
             )
             assert {

@@ -59,6 +59,8 @@ from tests.reconciliation_factory import (
     persist_reconciliation_query_receipt,
 )
 
+HEAD = "0015_fill_trigger_semantics"
+
 
 def _policy(
     plan_id: str,
@@ -760,9 +762,7 @@ def _assert_published_0009_upgrade(database_url: str) -> None:
                     text("SELECT reason FROM migration_quarantine_records ORDER BY reason")
                 )
             )
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0014_durable_execution_facts"
-            )
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == HEAD
         assert reasons == (
             "LEGACY_DUPLICATE_QUERY_EVIDENCE",
             "LEGACY_PROVENANCE_INVALID",
@@ -833,16 +833,14 @@ def _head_schema_signature(database_url: str) -> dict[str, object]:
         engine.dispose()
 
 
-def test_forward_migration_0014_is_the_only_current_head(tmp_path: Path) -> None:
+def test_forward_migration_0015_is_the_only_current_head(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'sixth-head.sqlite'}"
     config = _migration_config(database_url)
     command.upgrade(config, "head")
     engine = create_database_engine(database_url)
     try:
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0014_durable_execution_facts"
-            )
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == HEAD
     finally:
         engine.dispose()
 
